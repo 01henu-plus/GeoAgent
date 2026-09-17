@@ -405,6 +405,24 @@ class WorkingMemory(StrictModel):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class WorkingMemoryDelta(StrictModel):
+    """SubAgent 本轮执行产生的局部工作状态变化，不直接持久化。"""
+
+    added_dataset_ids: list[str] = Field(default_factory=list)
+    added_artifact_ids: list[str] = Field(default_factory=list)
+    intermediate_results: list[WorkingMemoryItem] = Field(default_factory=list)
+    unresolved_questions: list[str] = Field(default_factory=list)
+    added_assumptions: list[str] = Field(default_factory=list)
+    source_run_id: str | None = None
+
+
+class SubAgentExecutionResult(StrictModel):
+    """SubAgent 的业务结果与局部 WorkingMemory 变化。"""
+
+    result: AgentResult
+    working_memory_delta: WorkingMemoryDelta = Field(default_factory=WorkingMemoryDelta)
+
+
 class Checkpoint(StrictModel):
     id: str = Field(default_factory=lambda: new_id("cp"))
     run_id: str

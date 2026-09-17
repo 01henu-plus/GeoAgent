@@ -10,6 +10,7 @@ from app.core.models import (
     ToolResult,
     ToolStatus,
     WorkingMemory,
+    WorkingMemoryDelta,
     WorkingMemoryItem,
 )
 
@@ -66,42 +67,99 @@ class WorkingMemoryUpdater:
         memory = self.store.get_working_memory(task_id)
         if memory is None:
             return None
+        delta = self.build_delta_from_tool_result(result, run_id=run_id)
+        updated = self.apply_delta(memory, delta)
+        self.store.save_working_memory(updated)
+        return updated
 
+    def build_delta_from_tool_result(self, result: ToolResult, *, run_id: str | None) -> WorkingMemoryDelta:
+        intermediate: list[WorkingMemoryItem] = []
+        if result.status in {ToolStatus.SUCCESS, ToolStatus.PARTIAL_SUCCESS} or result.error is not None:
+            intermediate.append(
+                WorkingMemoryItem(
+                    kind="tool_result",
+                    reference_id=result.call_id,
+                    summary=_result_summary(result),
+                    source_run_id=run_id,
+                )
+            )
+
+        unresolved: list[str] = []
+        if result.status in {ToolStatus.BLOCKED, ToolStatus.FAILED} and result.error is not None:
+            if result.error.category.value in {"INPUT", "DATA", "CRS"}:
+                unresolved.append(f"需要补充工具输入：{result.error.code}")
+
+        return WorkingMemoryDelta(
+            added_dataset_ids=list(dict.fromkeys(result.datasets)),
+            added_artifact_ids=list(dict.fromkeys(result.artifacts)),
+            intermediate_results=intermediate,
+            unresolved_questions=unresolved,
+            source_run_id=run_id,
+        )
+
+    def merge_delta(self, current: WorkingMemoryDelta, incoming: WorkingMemoryDelta) -> WorkingMemoryDelta:
+        """合并同一 SubAgent 的多个工具结果，不写入 StateStore。"""
+
+        datasets = list(current.added_dataset_ids)
+        artifacts = list(current.added_artifact_ids)
+        unresolved = list(current.unresolved_questions)
+        assumptions = list(current.added_assumptions)
+        for dataset_id in incoming.added_dataset_ids:
+            _append_unique(datasets, dataset_id)
+        for artifact_id in incoming.added_artifact_ids:
+            _append_unique(artifacts, artifact_id)
+        for question in incoming.unresolved_questions:
+            _append_text_unique(unresolved, question)
+        for assumption in incoming.added_assumptions:
+            _append_text_unique(assumptions, assumption)
+
+        intermediate = list(current.intermediate_results)
+        for item in incoming.intermediate_results:
+            _append_intermediate_unique(intermediate, item)
+        return WorkingMemoryDelta(
+            added_dataset_ids=datasets,
+            added_artifact_ids=artifacts,
+            intermediate_results=intermediate,
+            unresolved_questions=unresolved,
+            added_assumptions=assumptions,
+            source_run_id=current.source_run_id or incoming.source_run_id,
+        )
+
+    def apply_delta(self, memory: WorkingMemory, delta: WorkingMemoryDelta) -> WorkingMemory:
         dataset_ids = list(memory.active_dataset_ids)
         artifact_ids = list(memory.active_artifact_ids)
-        for dataset_id in result.datasets:
+        for dataset_id in delta.added_dataset_ids:
             _append_unique(dataset_ids, dataset_id)
-        for artifact_id in result.artifacts:
+        for artifact_id in delta.added_artifact_ids:
             _append_unique(artifact_ids, artifact_id)
 
         intermediate = list(memory.intermediate_results)
-        if result.status in {ToolStatus.SUCCESS, ToolStatus.PARTIAL_SUCCESS} or result.error is not None:
-            if not any(item.reference_id == result.call_id for item in intermediate):
-                intermediate.append(
-                    WorkingMemoryItem(
-                        kind="tool_result",
-                        reference_id=result.call_id,
-                        summary=_result_summary(result),
-                        source_run_id=run_id,
-                    )
-                )
-
+        for item in delta.intermediate_results:
+            _append_intermediate_unique(intermediate, item)
         unresolved = list(memory.unresolved_questions)
-        if result.status in {ToolStatus.BLOCKED, ToolStatus.FAILED} and result.error is not None:
-            if result.error.category.value in {"INPUT", "DATA", "CRS"}:
-                _append_text_unique(unresolved, f"需要补充工具输入：{result.error.code}")
-
-        updated = memory.model_copy(
+        for question in delta.unresolved_questions:
+            _append_text_unique(unresolved, question)
+        assumptions = list(memory.assumptions)
+        for assumption in delta.added_assumptions:
+            _append_text_unique(assumptions, assumption)
+        return memory.model_copy(
             update={
                 "active_dataset_ids": dataset_ids,
                 "active_artifact_ids": artifact_ids,
                 "intermediate_results": intermediate,
                 "unresolved_questions": unresolved,
+                "assumptions": assumptions,
                 "updated_at": _now(),
             }
         )
-        self.store.save_working_memory(updated)
-        return updated
+
+    def merge_deltas(self, memory: WorkingMemory, deltas: list[WorkingMemoryDelta]) -> WorkingMemory:
+        """确定性合并多个并行 SubAgent delta，不在此处写库。"""
+
+        merged = memory
+        for delta in sorted(deltas, key=_delta_sort_key):
+            merged = self.apply_delta(merged, delta)
+        return merged
 
 
 def _result_summary(result: ToolResult) -> str:
@@ -126,6 +184,16 @@ def _append_text_unique(values: list[str], value: str) -> None:
     normalized = value.strip()
     if normalized and normalized.casefold() not in {item.casefold() for item in values}:
         values.append(normalized)
+
+
+def _append_intermediate_unique(values: list[WorkingMemoryItem], item: WorkingMemoryItem) -> None:
+    key = (item.reference_id, item.source_run_id, item.summary)
+    if not any((current.reference_id, current.source_run_id, current.summary) == key for current in values):
+        values.append(item)
+
+
+def _delta_sort_key(delta: WorkingMemoryDelta) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    return (delta.source_run_id or "", tuple(delta.added_dataset_ids), tuple(delta.added_artifact_ids))
 
 
 def _now() -> datetime:
