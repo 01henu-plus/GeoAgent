@@ -12,15 +12,54 @@ import re
 from app.core.models import MemoryItem
 from app.state import StateStore
 
+from .models import MemoryCandidate
+from .policy import MemoryWritePolicy
+
 
 class MemoryManager:
-    def __init__(self, store: StateStore) -> None:
+    def __init__(self, store: StateStore, policy: MemoryWritePolicy | None = None) -> None:
         self.store = store
+        self.policy = policy or MemoryWritePolicy()
 
     def set(self, key: str, value: str, *, scope: str = "project", metadata: dict | None = None) -> MemoryItem:
         item = MemoryItem(scope=scope, key=key, value=value, metadata=metadata or {})
         self.store.save_memory(item)
         return item
+
+    def write_candidate(self, candidate: MemoryCandidate) -> MemoryItem | None:
+        """经过 ProjectMemory 策略后写入；显式 API 仍使用 set。"""
+
+        if not self.policy.accepts(candidate):
+            return None
+        existing = self.get(candidate.key, scope="project")
+        metadata = {
+            **candidate.metadata,
+            "category": candidate.category,
+            "confidence": candidate.confidence,
+            "importance": candidate.importance,
+            "durability": candidate.durability,
+            "source_task_id": candidate.source_task_id,
+            "source_run_id": candidate.source_run_id,
+        }
+        if existing is not None and existing.value == candidate.value and existing.metadata == metadata:
+            return existing
+        item = MemoryItem(
+            id=existing.id if existing is not None else MemoryItem(key=candidate.key, value=candidate.value).id,
+            scope="project",
+            key=candidate.key,
+            value=candidate.value,
+            metadata=metadata,
+        )
+        self.store.save_memory(item)
+        return item
+
+    def write_candidates(self, candidates: list[MemoryCandidate]) -> list[MemoryItem]:
+        written: list[MemoryItem] = []
+        for candidate in candidates:
+            item = self.write_candidate(candidate)
+            if item is not None:
+                written.append(item)
+        return written
 
     def get(self, key: str, *, scope: str = "project") -> MemoryItem | None:
         return next((item for item in self.store.list_memories(scope) if item.key == key), None)
