@@ -1,0 +1,100 @@
+"""处理高置信、低复杂度请求的确定性规则门。"""
+
+from __future__ import annotations
+
+import re
+
+from app.core.models import InteractionMode, RequestFrame, StateSnapshot
+from app.understanding.models import ReferenceResolution
+
+_CANCEL_RE = re.compile(r"^(停止|取消|算了|结束任务|终止)(这个任务|当前任务|任务)?[。！!、，,]?$", re.IGNORECASE)
+_CONTINUE_RE = re.compile(r"^(继续|接着做|继续刚才的|继续上一次|沿用刚才的)(吧|做|任务|分析)?[。！!，,]?$", re.IGNORECASE)
+_RETRY_RE = re.compile(r"^(再试一次|重试|重新来|重新执行|再跑一次)[。！!，,]?$", re.IGNORECASE)
+_GREETING_RE = re.compile(r"^(你好|您好|嗨|哈喽|hello|hi|hey|在吗)[。！!，,~～ ]*$", re.IGNORECASE)
+
+_CAPABILITY_TERMS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("raster_analysis", ("栅格", "影像", "ndvi", "坡度", "坡向", "高程", "raster")),
+    ("vector_analysis", ("矢量", "缓冲", "裁剪", "相交", "道路", "边界", "vector")),
+    ("artifact_read", ("读取", "使用", "刚才", "上一个", "结果", "文件", "数据")),
+    ("artifact_write", ("保存", "导出", "生成", "输出", "写入")),
+    ("dataset_inspection", ("检查", "查看属性", "元数据", "字段", "数据质量")),
+    ("crs_transform", ("重投影", "坐标系", "epsg", "投影转换")),
+    ("python_execution", ("python", "脚本", "代码")),
+    ("knowledge_lookup", ("什么是", "如何", "原理", "为什么", "区别")),
+    ("result_query", ("运行状态", "生成了哪些", "有哪些文件", "结果在哪里")),
+)
+
+
+class RuleGate:
+    def match(self, message: str, state: StateSnapshot, resolution: ReferenceResolution) -> RequestFrame | None:
+        compact = message.strip()
+        lowered = compact.casefold()
+        if _GREETING_RE.fullmatch(compact):
+            return self._frame(InteractionMode.CHAT, compact, resolution, capabilities=["conversation"], confidence=0.99)
+        if _CANCEL_RE.fullmatch(compact):
+            if not state.active_task_id:
+                return None
+            return self._frame(InteractionMode.CANCEL_TASK, "取消当前任务", resolution, target_task_id=state.active_task_id, target_run_id=state.active_run_id, confidence=0.99)
+        if _CONTINUE_RE.fullmatch(compact):
+            if not state.active_task_id:
+                return None
+            goal = state.task_goal or compact
+            return self._frame(InteractionMode.CONTINUE_TASK, goal, resolution, target_task_id=state.active_task_id, target_run_id=state.active_run_id, capabilities=_capabilities(f"{compact} {goal}"), confidence=0.98)
+        if _RETRY_RE.fullmatch(compact):
+            if not _has_failed_run(state):
+                return None
+            return self._frame(InteractionMode.RETRY_TASK, state.task_goal or compact, resolution, target_task_id=state.active_task_id, target_run_id=_failed_run_id(state), capabilities=_capabilities(f"{compact} {state.task_goal or ''}"), confidence=0.98)
+        if state.active_task_id and _is_modify_request(lowered):
+            constraint = _strip_modify_prefix(compact)
+            return self._frame(InteractionMode.MODIFY_TASK, compact, resolution, constraints=[constraint] if constraint else [], target_task_id=state.active_task_id, target_run_id=state.active_run_id, capabilities=_capabilities(compact), confidence=0.94)
+        if _is_result_query(lowered):
+            return self._frame(InteractionMode.QUERY, compact, resolution, target_task_id=state.active_task_id, target_run_id=state.active_run_id, capabilities=["result_query", "artifact_read"], confidence=0.95)
+        return None
+
+    @staticmethod
+    def _frame(mode: InteractionMode, goal: str, resolution: ReferenceResolution, *, target_task_id: str | None = None, target_run_id: str | None = None, constraints: list[str] | None = None, capabilities: list[str] | None = None, confidence: float) -> RequestFrame:
+        return RequestFrame(
+            mode=mode,
+            goal=goal,
+            references=resolution.references,
+            constraints=constraints or [],
+            capabilities=capabilities or [],
+            target_task_id=target_task_id,
+            target_run_id=target_run_id,
+            needs_planning=mode in {InteractionMode.NEW_TASK, InteractionMode.CONTINUE_TASK, InteractionMode.MODIFY_TASK, InteractionMode.RETRY_TASK},
+            needs_tool=bool(capabilities and set(capabilities) - {"conversation", "knowledge_lookup", "result_query"}),
+            unresolved_references=resolution.unresolved_references,
+            confidence=confidence,
+        )
+
+
+def _has_failed_run(state: StateSnapshot) -> bool:
+    return bool(state.last_error or (state.last_run_status and state.last_run_status.value == "FAILED"))
+
+
+def _failed_run_id(state: StateSnapshot) -> str | None:
+    for run in state.recent_runs:
+        if run.status.value == "FAILED" or run.error:
+            return run.id
+    return None
+
+
+def _is_modify_request(text: str) -> bool:
+    return text.startswith(("不对", "改成", "换成", "调整", "把")) and any(term in text for term in ("改", "换", "调整", "范围", "条件", "参数"))
+
+
+def _strip_modify_prefix(message: str) -> str:
+    return re.sub(r"^(不对[，, ]*|把|改成|换成|调整[为成]?)[ ]*", "", message, flags=re.IGNORECASE).strip("，,。；; ")
+
+
+def _is_result_query(text: str) -> bool:
+    return any(term in text for term in ("生成了哪些文件", "有哪些文件", "结果在哪里", "运行状态", "查看结果", "刚才生成了什么"))
+
+
+def _capabilities(text: str) -> list[str]:
+    lowered = text.casefold()
+    return [name for name, terms in _CAPABILITY_TERMS if any(term.casefold() in lowered for term in terms)]
+
+
+__all__ = ["RuleGate"]
+
