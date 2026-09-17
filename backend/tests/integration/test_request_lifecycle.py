@@ -70,7 +70,6 @@ def test_request_dataset_has_priority_over_historical_dataset(application):
         application.main_agent.request_understanding.understand(
             "conv-resource",
             "检查这个数据",
-            request=AgentRequest(user_input="检查这个数据", conversation_id="conv-resource", dataset_ids=[new_dataset.id]),
             request_resources=resources,
         )
     )
@@ -91,7 +90,6 @@ def test_request_attachment_has_priority_over_historical_dataset(application):
         application.main_agent.request_understanding.understand(
             task.conversation_id,
             "用这个数据继续",
-            request=AgentRequest(user_input="用这个数据继续", conversation_id=task.conversation_id, attachment_ids=[attachment.id]),
             request_resources=resources,
         )
     )
@@ -110,7 +108,6 @@ def test_recent_dataset_is_used_when_request_has_no_resource(application):
         application.main_agent.request_understanding.understand(
             task.conversation_id,
             "用刚才的数据继续",
-            request=AgentRequest(user_input="用刚才的数据继续", conversation_id=task.conversation_id),
         )
     )
 
@@ -129,7 +126,6 @@ def test_explicit_referenced_run_has_priority_over_recent_run(application):
         application.main_agent.request_understanding.understand(
             task.conversation_id,
             "查看上一轮运行",
-            request=AgentRequest(user_input="查看上一轮运行", conversation_id=task.conversation_id, referenced_run_ids=[selected.id]),
             request_resources=resources,
         )
     )

@@ -34,17 +34,6 @@ class PlanLoopOutcome:
 class AgentLoop:
     """执行有依赖关系的 GIS Plan，不负责猜测用户意图。"""
 
-    def __init__(self, main_agent=None) -> None:
-        # 保留一个很薄的兼容入口；真正的计划循环仍然由本类负责。
-        self.main_agent = main_agent
-
-    async def run(self, request, **kwargs):
-        """兼容旧的 Runtime 门面，避免外部调用者绕过 MainAgent。"""
-
-        if self.main_agent is None:
-            raise RuntimeError("AgentLoop.run 需要注入 MainAgent；计划执行请调用 execute_plan。")
-        return await self.main_agent.run(request, **kwargs)
-
     async def execute_plan(
         self,
         plan: Plan,

@@ -61,6 +61,7 @@ def test_subagent_receives_deep_working_memory_snapshot_without_writing_parent_m
 
     application.sub_agent.context_manager = CaptureContext()
     application.sub_agent._call = fake_call
+    snapshot_input = memory.model_copy(deep=True)
     execution = asyncio.run(
         application.sub_agent.run(
             AgentRequest(user_input="检查这个数据", conversation_id=task.conversation_id),
@@ -68,13 +69,14 @@ def test_subagent_receives_deep_working_memory_snapshot_without_writing_parent_m
             [dataset],
             parent_task_id=task.id,
             parent_run_id=parent_run.id,
-            working_memory_snapshot=memory,
+            working_memory_snapshot=snapshot_input,
         )
     )
 
     snapshot = captured["working_memory"]
     assert isinstance(execution, SubAgentExecutionResult)
     assert isinstance(snapshot, WorkingMemory)
+    assert snapshot is snapshot_input
     assert snapshot is not memory
     assert snapshot.active_dataset_ids == [dataset.id]
     assert snapshot.constraints == ["范围=上海"]

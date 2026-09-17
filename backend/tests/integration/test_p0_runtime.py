@@ -165,7 +165,9 @@ def test_model_profiles_load_from_environment_settings(tmp_path):
 def test_resume_uses_saved_checkpoint_plan(application):
     ids = seed_demo(application)
     request = AgentRequest(user_input="检查 roads", conversation_id="conv_resume", dataset_ids=[ids["roads"]])
-    task, old_run = application.main_agent.prepare(request)
+    prepared = asyncio.run(application.main_agent.prepare_request(request))
+    assert prepared.task is not None and prepared.run is not None
+    old_run = prepared.run
     old_run = old_run.model_copy(update={"status": RunStatus.CANCELLED})
     application.store.save_run(old_run)
     datasets = application.main_agent._resolve_datasets(request)

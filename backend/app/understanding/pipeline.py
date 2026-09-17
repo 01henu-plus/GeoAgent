@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.core.models import AgentRequest, Dataset, RequestFrame, RequestResources
+from app.core.models import Dataset, RequestFrame, RequestResources
 from app.models import ModelAdapter
 from app.state import StateStore
 from app.understanding.interpreter import RequestInterpreter
@@ -37,7 +37,6 @@ class RequestUnderstandingPipeline:
         conversation_id: str,
         message: str,
         *,
-        request: AgentRequest | None = None,
         request_resources: RequestResources | None = None,
         datasets: list[Dataset] | None = None,
         model_adapter: ModelAdapter | None = None,
@@ -57,9 +56,6 @@ class RequestUnderstandingPipeline:
                 datasets=datasets,
             )
         merged = _merge_references(frame, resolution)
-        if request is None:
-            request = AgentRequest(user_input=normalized, conversation_id=conversation_id)
-        _ = request  # 保留参数，便于后续接入附件和请求级上下文。
         return self.validator.validate(merged, state, request_resources)
 
 

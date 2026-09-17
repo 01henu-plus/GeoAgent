@@ -46,9 +46,6 @@ class DatasetResolver:
                 role_selected.append((roots or matches)[0])
         if role_selected:
             return _unique([*explicit, *role_selected])
-        mentioned = [dataset for dataset in datasets if _mentions_dataset(text, dataset)]
-        if mentioned:
-            return _unique([*explicit, *mentioned])
         if explicit:
             return explicit
         if any(term in text for term in _ALL_REFERENCES):
@@ -115,21 +112,6 @@ def _ordinal(text: str) -> int | None:
     value = match.group(1) or match.group(2)
     names = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "first": 1, "second": 2, "third": 3, "1st": 1, "2nd": 2, "3rd": 3}
     return names.get(value, int(value) if value.isdigit() else None)
-
-
-def _mentions_dataset(text: str, dataset: Dataset) -> bool:
-    names = {
-        dataset.name.casefold(),
-        dataset.path.casefold(),
-        dataset.path.replace("/", "\\").rsplit("\\", 1)[-1].casefold(),
-    }
-    if any(value and value in text for value in names):
-        return True
-    candidate = f"{dataset.name} {dataset.path}".casefold()
-    for terms in _ROLE_TERMS.values():
-        if any(term in text for term in terms) and any(term in candidate for term in terms):
-            return True
-    return False
 
 
 def _specific_dataset_reference(text: str, dataset: Dataset) -> bool:

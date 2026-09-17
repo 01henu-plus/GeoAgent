@@ -51,8 +51,6 @@ class AgentManager:
             for value, task in zip(values, batch, strict=True):
                 if isinstance(value, SubAgentExecutionResult):
                     by_id[task.id] = value
-                elif isinstance(value, AgentResult):
-                    by_id[task.id] = SubAgentExecutionResult(result=value, working_memory_delta=WorkingMemoryDelta())
                 else:
                     by_id[task.id] = SubAgentExecutionResult(
                         result=AgentResult(agent_id="scheduler", task_id=parent_task_id, status="FAILED", summary=f"{task.goal} 调度失败", error=str(value), trace_id=parent_run_id),

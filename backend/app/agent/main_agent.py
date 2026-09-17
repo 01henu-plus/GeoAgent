@@ -108,14 +108,6 @@ class MainAgent:
         self.loop = AgentLoop()
         self.lifecycle_binder = RequestLifecycleBinder(store, task_service)
 
-    def prepare(self, request: AgentRequest, *, metadata: dict[str, object] | None = None) -> tuple[Task, Run]:
-        """旧同步 API 兼容入口；正常请求必须走异步 prepare_request。"""
-        frame = RequestFrame(mode=InteractionMode.NEW_TASK, goal=request.user_input, needs_planning=True)
-        prepared = self.lifecycle_binder.bind(request, frame, metadata=metadata)
-        if prepared.task is None or prepared.run is None:
-            raise RuntimeError("无法为兼容调用创建新任务")
-        return prepared.task, prepared.run
-
     async def prepare_request(
         self,
         request: AgentRequest,
@@ -136,7 +128,6 @@ class MainAgent:
             frame = await self.request_understanding.understand(
                 request.conversation_id,
                 request.user_input,
-                request=request,
                 request_resources=request_resources,
                 datasets=datasets,
                 model_adapter=self._model_adapter_for(request),
@@ -168,10 +159,14 @@ class MainAgent:
         working_memory = prepared_request.working_memory
         saved_working_memory = resume_state.get("working_memory")
         if task is not None and isinstance(saved_working_memory, dict):
-            restored = WorkingMemory.model_validate(saved_working_memory)
-            if restored.task_id == task.id:
-                self.store.save_working_memory(restored)
-                working_memory = restored
+            current_memory = self.store.get_working_memory(task.id)
+            if current_memory is not None:
+                working_memory = current_memory
+            else:
+                restored = WorkingMemory.model_validate(saved_working_memory)
+                if restored.task_id == task.id:
+                    self.store.save_working_memory(restored)
+                    working_memory = restored
         if run is None:
             raise RuntimeError("请求没有可执行的 Run")
         intent: IntentResult | None = None
@@ -815,7 +810,6 @@ class MainAgent:
                     "subtask_ids": [item.id for item in tasks],
                     "delegation_result": result.model_dump(mode="json"),
                     "working_memory": parent_memory.model_dump(mode="json") if parent_memory else None,
-                    "working_memory_deltas": [item.model_dump(mode="json") for item in deltas],
                 },
             )
         return result

@@ -70,8 +70,7 @@ class SubAgent:
         selected = _dataset_for_subtask(subtask, datasets)
         local_datasets = [selected] if selected is not None else []
         allowed_tools = _allowed_tools(subtask)
-        snapshot = working_memory_snapshot.model_copy(deep=True) if working_memory_snapshot is not None else None
-        local = self.context_manager.sub_context(request, subtask.model_dump(mode="json"), local_datasets, working_memory=snapshot, allowed_tools=allowed_tools)
+        local = self.context_manager.sub_context(request, subtask.model_dump(mode="json"), local_datasets, working_memory=working_memory_snapshot, allowed_tools=allowed_tools)
         findings: list[Any] = [{"scope": "subtask", "goal": subtask.goal, "context_dataset_count": len(local["datasets"])}]
         result_datasets: list[str] = []
         warnings: list[str] = []

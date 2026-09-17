@@ -103,7 +103,7 @@ class Application:
         self.agent_manager = AgentManager(self.sub_agent, max_parallel=self.settings.max_parallel_agents, max_subagents=self.settings.max_subagents, timeout_seconds=self.settings.max_execution_seconds)
         self.main_agent = MainAgent(store=self.store, trace=self.trace, executor=self.tool_executor, registry=self.registry, task_service=self.task_service, agent_manager=self.agent_manager, settings=self.settings, checkpoint_store=self.checkpoints, memory=self.memory, knowledge=self.knowledge, model_adapter=self.model_adapter, model_adapters=self.model_adapters, default_model_profile=self.default_model_profile, context_manager=self.context_manager, budget=self.budget)
         self.run_manager = RunManager(self.main_agent, self.store, self.metrics)
-        self.conversations = ConversationService(self.store, self.main_agent, self.run_manager)
+        self.conversations = ConversationService(self.store, self.run_manager)
 
     def start(self) -> None:
         self.store.initialize()
