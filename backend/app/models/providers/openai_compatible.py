@@ -20,7 +20,14 @@ class OpenAICompatibleAdapter(ModelAdapter):
         self.client = AsyncOpenAI(api_key=config.api_key or "local", base_url=base_url, timeout=config.timeout_seconds)
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
-        response = await self.client.chat.completions.create(model=self.config.model, messages=request.messages, tools=request.tools or None, temperature=request.temperature if request.temperature is not None else self.config.temperature, max_tokens=request.max_tokens)
+        response = await self.client.chat.completions.create(
+            model=self.config.model,
+            messages=request.messages,
+            tools=request.tools or None,
+            response_format=request.response_format,
+            temperature=request.temperature if request.temperature is not None else self.config.temperature,
+            max_tokens=request.max_tokens,
+        )
         message = response.choices[0].message
         return ModelResponse(content=message.content or "", tool_calls=[call.model_dump() for call in (message.tool_calls or [])], input_tokens=response.usage.prompt_tokens if response.usage else 0, output_tokens=response.usage.completion_tokens if response.usage else 0, model=response.model)
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from app.core.models import InteractionMode, RequestFrame, StateSnapshot
+from app.core.models import InteractionMode, RequestFrame, ResolvedReference, StateSnapshot
 from app.understanding.models import ReferenceResolution
 
 _CANCEL_RE = re.compile(r"^(停止|取消|算了|结束任务|终止)(这个任务|当前任务|任务)?[。！!、，,]?$", re.IGNORECASE)
@@ -39,14 +39,14 @@ class RuleGate:
             if not state.active_task_id:
                 return None
             goal = state.task_goal or compact
-            return self._frame(InteractionMode.CONTINUE_TASK, goal, resolution, target_task_id=state.active_task_id, target_run_id=state.active_run_id, capabilities=_capabilities(f"{compact} {goal}"), confidence=0.98)
+            return self._frame(InteractionMode.CONTINUE_TASK, goal, resolution, target_task_id=state.active_task_id, target_run_id=state.active_run_id, capabilities=infer_capabilities(f"{compact} {goal}", references=resolution.references), confidence=0.98)
         if _RETRY_RE.fullmatch(compact):
             if not _has_failed_run(state):
                 return None
-            return self._frame(InteractionMode.RETRY_TASK, state.task_goal or compact, resolution, target_task_id=state.active_task_id, target_run_id=_failed_run_id(state), capabilities=_capabilities(f"{compact} {state.task_goal or ''}"), confidence=0.98)
+            return self._frame(InteractionMode.RETRY_TASK, state.task_goal or compact, resolution, target_task_id=state.active_task_id, target_run_id=_failed_run_id(state), capabilities=infer_capabilities(f"{compact} {state.task_goal or ''}", references=resolution.references), confidence=0.98)
         if state.active_task_id and _is_modify_request(lowered):
             constraint = _strip_modify_prefix(compact)
-            return self._frame(InteractionMode.MODIFY_TASK, compact, resolution, constraints=[constraint] if constraint else [], target_task_id=state.active_task_id, target_run_id=state.active_run_id, capabilities=_capabilities(compact), confidence=0.94)
+            return self._frame(InteractionMode.MODIFY_TASK, compact, resolution, constraints=[constraint] if constraint else [], target_task_id=state.active_task_id, target_run_id=state.active_run_id, capabilities=infer_capabilities(compact, references=resolution.references), confidence=0.94)
         if _is_result_query(lowered):
             return self._frame(InteractionMode.QUERY, compact, resolution, target_task_id=state.active_task_id, target_run_id=state.active_run_id, capabilities=["result_query", "artifact_read"], confidence=0.95)
         return None
@@ -91,10 +91,20 @@ def _is_result_query(text: str) -> bool:
     return any(term in text for term in ("生成了哪些文件", "有哪些文件", "结果在哪里", "运行状态", "查看结果", "刚才生成了什么"))
 
 
-def _capabilities(text: str) -> list[str]:
+def infer_capabilities(text: str, *, legacy=None, references: list[ResolvedReference] | None = None) -> list[str]:
     lowered = text.casefold()
-    return [name for name, terms in _CAPABILITY_TERMS if any(term.casefold() in lowered for term in terms)]
+    capabilities = [name for name, terms in _CAPABILITY_TERMS if any(term.casefold() in lowered for term in terms)]
+    entities = getattr(legacy, "entities", {}) if legacy is not None else {}
+    operations = set(entities.get("operations", []))
+    if operations.intersection({"slope", "zonal_statistics", "clip"}) and "raster_analysis" not in capabilities:
+        capabilities.append("raster_analysis")
+    if operations.intersection({"buffer", "intersection", "spatial_join", "distance", "dissolve", "repair"}) and "vector_analysis" not in capabilities:
+        capabilities.append("vector_analysis")
+    if "reproject" in operations and "crs_transform" not in capabilities:
+        capabilities.append("crs_transform")
+    if references and "artifact_read" not in capabilities:
+        capabilities.append("artifact_read")
+    return list(dict.fromkeys(capabilities))
 
 
-__all__ = ["RuleGate"]
-
+__all__ = ["RuleGate", "infer_capabilities"]
