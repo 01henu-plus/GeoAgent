@@ -272,8 +272,9 @@ class StateStore:
                 db.execute("DELETE FROM checkpoints WHERE run_id=?", (run_id,))
                 db.execute("DELETE FROM tool_calls WHERE run_id=?", (run_id,))
                 db.execute("DELETE FROM dataset_lineage WHERE run_id=?", (run_id,))
-                db.execute("DELETE FROM subtasks WHERE task_id=?", (run.task_id,))
-                db.execute("DELETE FROM tasks WHERE id=?", (run.task_id,))
+                if run.task_id:
+                    db.execute("DELETE FROM subtasks WHERE task_id=?", (run.task_id,))
+                    db.execute("DELETE FROM tasks WHERE id=?", (run.task_id,))
                 db.execute("DELETE FROM runs WHERE id=?", (run_id,))
                 deleted.append(run_id)
             db.commit()

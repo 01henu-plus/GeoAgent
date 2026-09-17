@@ -69,12 +69,12 @@ class RuleGate:
 
 
 def _has_failed_run(state: StateSnapshot) -> bool:
-    return bool(state.last_error or (state.last_run_status and state.last_run_status.value == "FAILED"))
+    return any(run.status.value == "FAILED" for run in state.recent_runs)
 
 
 def _failed_run_id(state: StateSnapshot) -> str | None:
     for run in state.recent_runs:
-        if run.status.value == "FAILED" or run.error:
+        if run.status.value == "FAILED":
             return run.id
     return None
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 
 from app.core.models import AgentRequest, Dataset, InteractionMode, RequestFrame, StateSnapshot
@@ -10,6 +11,8 @@ from app.decision.intent import IntentResolver
 from app.models import ModelAdapter, ModelRequest
 from app.understanding.models import ReferenceResolution
 from app.understanding.rule_gate import infer_capabilities
+
+logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """
 你是 GeoAgent 的请求理解器，只负责理解用户请求，不负责规划、选工具或执行任务。
@@ -40,9 +43,12 @@ class RequestInterpreter:
         if model_adapter is not None and model_adapter.supports_structured_output:
             try:
                 return await self._interpret_with_model(message, state, resolution, model_adapter)
-            except Exception:
-                # 结构化输出失败时回退到确定性解析，不能让模型异常中断请求入口。
-                pass
+            except Exception as exc:
+                # 保留离线回退，但让调用方能够在日志中发现结构化理解失败。
+                logger.warning(
+                    "结构化 RequestInterpreter 调用失败，回退确定性解析: exception_type=%s fallback_to=deterministic",
+                    type(exc).__name__,
+                )
         return self._interpret_without_model(message, state, resolution, datasets or [])
 
     async def _interpret_with_model(
@@ -94,8 +100,8 @@ class RequestInterpreter:
         lowered = message.casefold()
         mode = InteractionMode.NEW_TASK
         confidence = max(0.35, legacy.confidence)
-        target_task_id = state.active_task_id
-        target_run_id = state.active_run_id
+        target_task_id = None
+        target_run_id = None
         goal = message
 
         if legacy.entities.get("is_greeting"):
@@ -105,6 +111,8 @@ class RequestInterpreter:
             confidence = 0.99
         elif _looks_like_cancel(lowered):
             mode = InteractionMode.CANCEL_TASK
+            target_task_id = state.active_task_id
+            target_run_id = state.active_run_id
             confidence = 0.85 if state.active_task_id else 0.35
         elif _looks_like_retry(lowered):
             mode = InteractionMode.RETRY_TASK
@@ -112,10 +120,14 @@ class RequestInterpreter:
             confidence = 0.85 if target_run_id else 0.35
         elif _looks_like_continue(lowered):
             mode = InteractionMode.CONTINUE_TASK
+            target_task_id = state.active_task_id
+            target_run_id = state.active_run_id
             goal = message if message.strip() != "继续" else (state.task_goal or message)
             confidence = 0.85 if state.active_task_id else 0.35
         elif _looks_like_modify(lowered) and state.active_task_id:
             mode = InteractionMode.MODIFY_TASK
+            target_task_id = state.active_task_id
+            target_run_id = state.active_run_id
             confidence = 0.78
         elif legacy.intent.value in {"KNOWLEDGE_QUERY", "RESULT_INTERPRETATION", "RUN_DIAGNOSIS"} or legacy.entities.get("is_question"):
             mode = InteractionMode.QUERY

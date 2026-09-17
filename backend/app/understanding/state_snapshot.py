@@ -42,11 +42,15 @@ class StateSnapshotLoader:
         if exclude_task_id:
             tasks = [item for item in tasks if item.id != exclude_task_id]
         active_run = next((item for item in runs if item.status in _ACTIVE_RUN_STATUSES), None)
-        active_task = self.store.get_task(active_run.task_id) if active_run else next((item for item in tasks if item.status in _ACTIVE_TASK_STATUSES), None)
+        active_task = self.store.get_task(active_run.task_id) if active_run and active_run.task_id else next((item for item in tasks if item.status in _ACTIVE_TASK_STATUSES), None)
 
         run_ids = {item.id for item in runs}
-        artifacts = [item for item in self.store.list_artifacts() if item.run_id in run_ids or item.run_id is None][: self.limit]
-        datasets = self.store.list_datasets()[: self.limit]
+        artifacts = [item for item in self.store.list_artifacts() if item.run_id in run_ids][: self.limit]
+        datasets = [
+            item
+            for item in self.store.list_datasets()
+            if item.created_by_run_id in run_ids
+        ][: self.limit]
         last_run = runs[0] if runs else None
         last_result = _result_field(last_run, "summary")
         last_error = last_run.error if last_run else None

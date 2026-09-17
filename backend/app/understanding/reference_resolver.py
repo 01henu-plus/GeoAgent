@@ -45,9 +45,23 @@ class ReferenceResolver:
             references.append(self._reference(token, target, confidence=1.0))
 
         lowered = message.casefold()
-        for mention in sorted(_MENTIONS, key=len, reverse=True):
-            if mention.casefold() not in lowered:
+        occupied: list[tuple[int, int]] = []
+        mentions: list[tuple[int, int, str]] = []
+        for mention in _MENTIONS:
+            start = 0
+            token = mention.casefold()
+            while True:
+                index = lowered.find(token, start)
+                if index < 0:
+                    break
+                mentions.append((index, index + len(token), mention))
+                start = index + 1
+
+        # 先按出现位置，再按长度排序；被较长指代占用的区间不会再次匹配短指代。
+        for start, end, mention in sorted(mentions, key=lambda item: (item[0], -(item[1] - item[0]))):
+            if any(start < right and end > left for left, right in occupied):
                 continue
+            occupied.append((start, end))
             if any(item.mention == mention for item in references):
                 continue
             target = self._resolve_mention(mention, lowered, state)

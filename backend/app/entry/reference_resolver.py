@@ -24,8 +24,7 @@ class ReferenceResolver:
                 if exclude_run_id:
                     runs = [item for item in runs if item.id != exclude_run_id]
                 if conversation_id:
-                    scoped = [item for item in runs if item.conversation_id == conversation_id]
-                    runs = scoped or runs
+                    runs = [item for item in runs if item.conversation_id == conversation_id]
                 if runs:
                     result.append(runs[0])
                 continue

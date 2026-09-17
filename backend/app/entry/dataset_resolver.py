@@ -59,8 +59,7 @@ class DatasetResolver:
     @staticmethod
     def _datasets_from_latest_run(conversation_id: str | None, registry, store) -> list[Dataset]:
         runs = store.list_runs()
-        scoped = [item for item in runs if conversation_id and item.conversation_id == conversation_id]
-        candidates = scoped or runs
+        candidates = [item for item in runs if conversation_id and item.conversation_id == conversation_id]
         for run in candidates:
             payload = run.metadata.get("result") if isinstance(run.metadata, dict) else None
             if not isinstance(payload, dict):
