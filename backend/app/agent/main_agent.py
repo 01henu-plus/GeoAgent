@@ -31,6 +31,7 @@ from app.core.models import (
     ToolError,
     ToolResult,
     ToolStatus,
+    WorkingMemory,
     new_id,
 )
 from app.decision import (
@@ -46,6 +47,7 @@ from app.execution.tools import ToolExecutor
 from app.gis.crs.service import CRSService
 from app.knowledge import KnowledgeRetriever
 from app.memory import MemoryManager
+from app.memory.extractor import MemoryExtractor
 from app.models import ModelAdapter, ModelRequest, ModelResponse
 from app.observability import TraceRecorder
 from app.run.lifecycle import PreparedRequest, RequestLifecycleBinder
@@ -53,7 +55,7 @@ from app.runtime.agent_loop import AgentLoop
 from app.runtime.budget import BudgetExceeded, BudgetGuard
 from app.runtime.context_manager import ContextManager
 from app.runtime.lifecycle import finish_run
-from app.state import StateStore
+from app.state import StateStore, WorkingMemoryUpdater
 from app.task.service import TaskService
 from app.understanding.compat import LegacyIntentAdapter
 from app.understanding.interpreter import RequestInterpreter
@@ -96,6 +98,8 @@ class MainAgent:
         self.verifier = ResultVerifier()
         self.checkpoint_store = checkpoint_store
         self.memory = memory
+        self.memory_extractor = MemoryExtractor()
+        self.working_memory_updater = WorkingMemoryUpdater(store)
         self.knowledge = knowledge or KnowledgeRetriever()
         self.model_adapter = model_adapter
         self.model_adapters = model_adapters if model_adapters is not None else {}
@@ -147,7 +151,7 @@ class MainAgent:
                     "needs_planning": True,
                 }
             )
-        return self.lifecycle_binder.bind(request, frame, metadata=metadata)
+        return self.lifecycle_binder.bind(request, frame, request_resources=request_resources, metadata=metadata)
 
     async def run(
         self,
@@ -161,6 +165,7 @@ class MainAgent:
         prepared_request = prepared or await self.prepare_request(request, resume_from=resume_from)
         request = prepared_request.request
         task, run = prepared_request.task, prepared_request.run
+        working_memory = prepared_request.working_memory
         if run is None:
             raise RuntimeError("请求没有可执行的 Run")
         intent: IntentResult | None = None
@@ -231,6 +236,7 @@ class MainAgent:
                     initial_findings=resume_state.get("model_findings") if resume_from and resume_state.get("model_findings") else None,
                     initial_dataset_ids=resume_state.get("model_dataset_ids") if resume_from and resume_state.get("model_dataset_ids") else None,
                     initial_artifact_ids=resume_state.get("model_artifact_ids") if resume_from and resume_state.get("model_artifact_ids") else None,
+                    working_memory=working_memory,
                     on_model_delta=on_model_delta,
                 )
                 if model_result is not None:
@@ -285,8 +291,8 @@ class MainAgent:
             run = finish_run(self.store.get_run(run.id) or run, final_status, error=result.error)
             self.store.save_run(run.model_copy(update={"metadata": {**run.metadata, "result": result.model_dump(mode="json")}}))
             if self.memory:
-                self.memory.set("last_run_id", run.id, metadata={"status": result.status.value})
-                self.memory.set("last_result_summary", result.summary, metadata={"run_id": run.id})
+                candidates = self.memory_extractor.extract(request, request_frame, run, result)
+                self.memory.write_candidates(candidates)
             await self._checkpoint(run.id, "run_completed", {"status": final_status.value, "result": result.model_dump(mode="json")})
             if task is not None and prepared_request.action in {"create_task", "bind_task", "retry_run"}:
                 self.task_service.update(task, status=_task_status_for_result(result.status), result=result.summary)
@@ -332,6 +338,7 @@ class MainAgent:
         initial_findings: list[Any] | None = None,
         initial_dataset_ids: list[str] | None = None,
         initial_artifact_ids: list[str] | None = None,
+        working_memory: WorkingMemory | None = None,
         on_model_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> AgentResult | None:
         model_adapter = self._model_adapter_for(request)
@@ -339,7 +346,7 @@ class MainAgent:
             return None
         messages = initial_messages or [
             {"role": "system", "content": _MODEL_SYSTEM_PROMPT},
-            {"role": "user", "content": self._model_user_message(request, run, datasets, intent, plan, request_frame)},
+            {"role": "user", "content": self._model_user_message(request, run, datasets, intent, plan, request_frame, working_memory=working_memory)},
         ]
         findings: list[Any] = list(initial_findings or [])
         dataset_ids: set[str] = set(initial_dataset_ids or [])
@@ -416,7 +423,7 @@ class MainAgent:
                 return adapter
         return self.model_adapter
 
-    def _model_user_message(self, request: AgentRequest, run: Run, datasets, intent: IntentResult | None, plan: Plan | None, request_frame: RequestFrame | None = None) -> str:
+    def _model_user_message(self, request: AgentRequest, run: Run, datasets, intent: IntentResult | None, plan: Plan | None, request_frame: RequestFrame | None = None, *, working_memory: WorkingMemory | None = None) -> str:
         from app.entry.reference_resolver import ReferenceResolver
 
         history = self.store.list_messages(request.conversation_id, limit=20)
@@ -442,14 +449,7 @@ class MainAgent:
             item.model_dump(mode="json")
             for item in ReferenceResolver(self.store).resolve_runs(request.referenced_run_ids, conversation_id=request.conversation_id, exclude_run_id=run.id)
         ]
-        working_memory = {
-            "run_id": run.id,
-            "turn_count": run.turn_count,
-            "tool_call_count": run.tool_call_count,
-        }
-        request_working_memory = request.context.get("working_memory")
-        if isinstance(request_working_memory, dict):
-            working_memory.update(request_working_memory)
+        working_memory = working_memory or (self.store.get_working_memory(run.task_id) if run.task_id else None)
         context = self.context_manager.main_context(
             request,
             datasets,
@@ -807,7 +807,9 @@ class MainAgent:
         next_run = current.model_copy(update={"tool_call_count": current.tool_call_count + 1, "status": RunStatus.WAITING_TOOL})
         self.store.save_run(next_run)
         call = ToolCall(id=call_id or new_id("call"), name=name, arguments=arguments, run_id=run.id, agent_id="main")
-        return await self.executor.execute(call, agent_id="main", services=self.executor.services)
+        result = await self.executor.execute(call, agent_id="main", services=self.executor.services)
+        self.working_memory_updater.update_from_tool_result(current.task_id, result, run_id=current.id)
+        return result
 
 
 def _set_plan_step_status(plan: Plan, step_id: str, status: TaskStatus) -> None:

@@ -5,7 +5,15 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from app.core.models import AgentRequest, Dataset, IntentResult, MemoryItem, Plan, RequestFrame
+from app.core.models import (
+    AgentRequest,
+    Dataset,
+    IntentResult,
+    MemoryItem,
+    Plan,
+    RequestFrame,
+    WorkingMemory,
+)
 
 
 class ContextManager:
@@ -21,7 +29,7 @@ class ContextManager:
         *,
         conversation: list[dict[str, Any]] | None = None,
         tool_definitions: list[dict[str, Any]] | None = None,
-        working_memory: dict[str, Any] | None = None,
+        working_memory: WorkingMemory | dict[str, Any] | None = None,
         budget: dict[str, Any] | None = None,
         referenced_runs: list[dict[str, Any]] | None = None,
         findings: list[Any] | None = None,
@@ -42,7 +50,7 @@ class ContextManager:
             "datasets": [dataset.model_dump(mode="json") for dataset in datasets],
             "conversation": conversation or [],
             "tool_definitions": tool_definitions or [],
-            "working_memory": working_memory or {},
+            "working_memory": _dump_working_memory(working_memory),
             "project_memory": [memory.model_dump(mode="json") for memory in memories],
             "referenced_runs": referenced_runs or [],
             "findings": findings or [],
@@ -58,7 +66,7 @@ class ContextManager:
         datasets: list[Dataset],
         *,
         parent_findings: list[Any] | None = None,
-        working_memory: dict[str, Any] | None = None,
+        working_memory: WorkingMemory | dict[str, Any] | None = None,
         budget: dict[str, Any] | None = None,
         allowed_tools: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -68,7 +76,7 @@ class ContextManager:
                 "subtask": subtask,
                 "datasets": [item.model_dump(mode="json") for item in datasets],
                 "parent_findings": parent_findings or [],
-                "working_memory": working_memory or {},
+                "working_memory": _dump_working_memory(working_memory),
                 "budget": budget or {},
                 "allowed_tools": allowed_tools or [
                     "dataset.inspect",
@@ -116,3 +124,11 @@ class ContextManager:
 
 def _serialize(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+
+
+def _dump_working_memory(value: WorkingMemory | dict[str, Any] | None) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, WorkingMemory):
+        return value.model_dump(mode="json")
+    return dict(value)
