@@ -81,6 +81,18 @@ class IntentType(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class InteractionMode(StrEnum):
+    """用户与当前任务之间的关系，不表示具体 GIS 能力。"""
+
+    NEW_TASK = "new_task"
+    CONTINUE_TASK = "continue_task"
+    MODIFY_TASK = "modify_task"
+    RETRY_TASK = "retry_task"
+    QUERY = "query"
+    CHAT = "chat"
+    CANCEL_TASK = "cancel_task"
+
+
 class DecisionType(StrEnum):
     TOOL = "TOOL"
     DELEGATE = "DELEGATE"
@@ -397,6 +409,54 @@ class MemoryItem(StrictModel):
     value: str
     metadata: dict[str, Any] = Field(default_factory=dict)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ResolvedReference(StrictModel):
+    """请求中的上下文指代及其已验证的领域对象。"""
+
+    mention: str
+    type: str
+    target_id: str | None = None
+    label: str | None = None
+    confidence: float = Field(default=1.0, ge=0, le=1)
+
+
+class StateSnapshot(StrictModel):
+    """供请求理解读取的轻量状态视图，不替代 Task/Run/Memory。"""
+
+    conversation_id: str
+    active_task_id: str | None = None
+    active_run_id: str | None = None
+    task_goal: str | None = None
+    task_status: TaskStatus | None = None
+    last_run_status: RunStatus | None = None
+    last_action: str | None = None
+    last_result: str | None = None
+    last_error: str | None = None
+    recent_messages: list[Message] = Field(default_factory=list)
+    recent_runs: list[Run] = Field(default_factory=list)
+    recent_artifacts: list[Artifact] = Field(default_factory=list)
+    recent_datasets: list[Dataset] = Field(default_factory=list)
+    known_task_ids: list[str] = Field(default_factory=list)
+    known_run_ids: list[str] = Field(default_factory=list)
+    known_artifact_ids: list[str] = Field(default_factory=list)
+    known_dataset_ids: list[str] = Field(default_factory=list)
+
+
+class RequestFrame(StrictModel):
+    """状态感知的请求表达，供 Router/Planner 继续决策。"""
+
+    mode: InteractionMode
+    goal: str
+    references: list[ResolvedReference] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
+    target_task_id: str | None = None
+    target_run_id: str | None = None
+    needs_planning: bool = False
+    needs_tool: bool = False
+    unresolved_references: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=1.0, ge=0, le=1)
 
 
 class RunBudget(StrictModel):
