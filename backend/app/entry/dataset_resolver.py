@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from app.core.models import AgentRequest, Dataset
+from app.core.models import AgentRequest, Dataset, RequestResources, Run
 
 _LATEST_REFERENCES = ("刚才", "上一轮", "上一次", "刚生成", "上个结果", "上一张图")
 _ALL_REFERENCES = ("全部", "所有", "这些数据", "所有数据集")
@@ -55,6 +55,22 @@ class DatasetResolver:
             return _unique([*explicit, *datasets])
         # 单数据集时可以自然地理解“检查这个文件”；多数据集时不擅自选第一个。
         return datasets if len(datasets) == 1 else []
+
+    @staticmethod
+    def request_resources(request: AgentRequest, registry, store=None) -> RequestResources:
+        """只解析本轮显式传入的资源，不读取历史数据集或全局 latest。"""
+        datasets = _unique(
+            item
+            for identifier in [*request.dataset_ids, *request.attachment_ids]
+            if (item := registry.resolve(identifier))
+        )
+        runs: list[Run] = []
+        if store is not None:
+            for identifier in dict.fromkeys(request.referenced_run_ids):
+                run = store.get_run(identifier)
+                if run and run.conversation_id == request.conversation_id:
+                    runs.append(run)
+        return RequestResources(datasets=datasets, runs=runs)
 
     @staticmethod
     def _datasets_from_latest_run(conversation_id: str | None, registry, store) -> list[Dataset]:

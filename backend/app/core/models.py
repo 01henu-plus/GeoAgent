@@ -375,6 +375,13 @@ class Run(StrictModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class RequestResources(StrictModel):
+    """本轮请求显式带入的真实资源，不写入长期状态。"""
+
+    datasets: list[Dataset] = Field(default_factory=list)
+    runs: list[Run] = Field(default_factory=list)
+
+
 class Checkpoint(StrictModel):
     id: str = Field(default_factory=lambda: new_id("cp"))
     run_id: str
