@@ -166,6 +166,12 @@ class MainAgent:
         request = prepared_request.request
         task, run = prepared_request.task, prepared_request.run
         working_memory = prepared_request.working_memory
+        saved_working_memory = resume_state.get("working_memory")
+        if task is not None and isinstance(saved_working_memory, dict):
+            restored = WorkingMemory.model_validate(saved_working_memory)
+            if restored.task_id == task.id:
+                self.store.save_working_memory(restored)
+                working_memory = restored
         if run is None:
             raise RuntimeError("请求没有可执行的 Run")
         intent: IntentResult | None = None
@@ -275,7 +281,7 @@ class MainAgent:
                     elif decision.type.value == "ASK_USER":
                         result = AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.BLOCKED, summary=decision.final_response or decision.reasoning_summary, error="WAITING_USER", trace_id=run.id)
                     elif decision.type.value == "DELEGATE":
-                        result = await self._delegate(request, run, task, datasets, decision.subtasks, intent=intent, plan=plan, request_frame=request_frame)
+                        result = await self._delegate(request, run, task, datasets, decision.subtasks, intent=intent, plan=plan, request_frame=request_frame, working_memory=working_memory)
                     elif decision.type.value == "TOOL":
                         result = await self._execute_plan(request, run, task, datasets, intent, plan, resume_state, request_frame=request_frame)
                     elif intent.intent.value == "RUN_DIAGNOSIS":
@@ -752,7 +758,7 @@ class MainAgent:
             trace_id=run.id,
         )
 
-    async def _delegate(self, request: AgentRequest, run: Run, task: Task, datasets, tasks=None, *, intent: IntentResult | None = None, plan: Plan | None = None, request_frame: RequestFrame | None = None) -> AgentResult:
+    async def _delegate(self, request: AgentRequest, run: Run, task: Task, datasets, tasks=None, *, intent: IntentResult | None = None, plan: Plan | None = None, request_frame: RequestFrame | None = None, working_memory: WorkingMemory | None = None) -> AgentResult:
         tasks = tasks or self.decomposer.decompose(request, datasets)
         self.guard.check_subagents(len(tasks))
         attached = self.task_service.attach_subtasks(task, tasks)
@@ -775,7 +781,20 @@ class MainAgent:
                 },
             )
         self.store.save_run(run.model_copy(update={"status": RunStatus.WAITING_SUBAGENT}))
-        results = await self.agent_manager.run(request, tasks, datasets, parent_run_id=run.id)
+        parent_memory = working_memory or self.store.get_working_memory(task.id)
+        executions = await self.agent_manager.run(
+            request,
+            tasks,
+            datasets,
+            parent_task_id=task.id,
+            parent_run_id=run.id,
+            working_memory_snapshot=parent_memory,
+        )
+        results = [item.result for item in executions]
+        deltas = [item.working_memory_delta for item in executions]
+        if parent_memory is not None:
+            parent_memory = self.working_memory_updater.merge_deltas(parent_memory, deltas)
+            self.store.save_working_memory(parent_memory)
         findings = [{"agent_id": item.agent_id, "summary": item.summary, "status": item.status.value, "findings": item.findings} for item in results]
         output_ids = sorted({dataset_id for item in results for dataset_id in item.datasets})
         artifacts = sorted({artifact_id for item in results for artifact_id in item.artifacts})
@@ -795,6 +814,8 @@ class MainAgent:
                     "completed_steps": [item.id for item in plan.steps],
                     "subtask_ids": [item.id for item in tasks],
                     "delegation_result": result.model_dump(mode="json"),
+                    "working_memory": parent_memory.model_dump(mode="json") if parent_memory else None,
+                    "working_memory_deltas": [item.model_dump(mode="json") for item in deltas],
                 },
             )
         return result
