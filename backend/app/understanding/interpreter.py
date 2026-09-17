@@ -37,7 +37,7 @@ class RequestInterpreter:
         model_adapter: ModelAdapter | None = None,
         datasets: list[Dataset] | None = None,
     ) -> RequestFrame:
-        if model_adapter is not None:
+        if model_adapter is not None and model_adapter.supports_structured_output:
             try:
                 return await self._interpret_with_model(message, state, resolution, model_adapter)
             except Exception:
@@ -172,4 +172,3 @@ def _failed_run_id(state: StateSnapshot) -> str | None:
         if run.status.value == "FAILED" or run.error:
             return run.id
     return None
-

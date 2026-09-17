@@ -41,9 +41,10 @@ class RequestUnderstandingPipeline:
         datasets: list[Dataset] | None = None,
         model_adapter: ModelAdapter | None = None,
         exclude_run_id: str | None = None,
+        exclude_task_id: str | None = None,
     ) -> RequestFrame:
         normalized = self.normalizer.normalize(message)
-        state = self.state_loader.load(conversation_id, exclude_run_id=exclude_run_id)
+        state = self.state_loader.load(conversation_id, exclude_run_id=exclude_run_id, exclude_task_id=exclude_task_id)
         resolution = self.reference_resolver.resolve(normalized, state)
         frame = self.rule_gate.match(normalized, state, resolution)
         if frame is None:
@@ -74,4 +75,3 @@ def _merge_references(frame: RequestFrame, resolution) -> RequestFrame:
             "unresolved_references": list(dict.fromkeys([*resolution.unresolved_references, *frame.unresolved_references])),
         }
     )
-

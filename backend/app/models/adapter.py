@@ -35,6 +35,8 @@ class ModelStreamChunk(BaseModel):
 
 
 class ModelAdapter(ABC):
+    supports_structured_output = False
+
     @abstractmethod
     async def complete(self, request: ModelRequest) -> ModelResponse:
         """执行一次模型请求。"""

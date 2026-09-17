@@ -18,7 +18,9 @@ from app.core.models import (
     ErrorCategory,
     IntentResult,
     IntentType,
+    InteractionMode,
     Plan,
+    RequestFrame,
     Run,
     RunBudget,
     RunStatus,
@@ -51,6 +53,9 @@ from app.runtime.context_manager import ContextManager
 from app.runtime.lifecycle import finish_run, start_run
 from app.state import StateStore
 from app.task.service import TaskService
+from app.understanding.compat import LegacyIntentAdapter
+from app.understanding.interpreter import RequestInterpreter
+from app.understanding.pipeline import RequestUnderstandingPipeline
 
 _MODEL_SYSTEM_PROMPT = """
 你是 GeoAgent，一个面向 GIS 的中文智能助手。你必须先判断用户的真实目标，再决定本轮动作：
@@ -77,6 +82,11 @@ class MainAgent:
         self.budget = budget or RunBudget()
         self.guard = BudgetGuard(self.budget)
         self.intent_resolver = IntentResolver()
+        self.request_understanding = RequestUnderstandingPipeline(
+            store,
+            interpreter=RequestInterpreter(self.intent_resolver),
+        )
+        self.legacy_intent_adapter = LegacyIntentAdapter(self.intent_resolver)
         self.planner = Planner()
         self.router = AgentRouter()
         self.decomposer = TaskDecomposer()
@@ -112,6 +122,7 @@ class MainAgent:
         task, run = prepared or self.prepare(request)
         intent: IntentResult | None = None
         plan: Plan | None = None
+        request_frame: RequestFrame | None = None
         datasets = []
         phase = "created"
         await self.trace.emit(
@@ -123,11 +134,37 @@ class MainAgent:
         )
         try:
             datasets = self._resolve_datasets(request)
+            if resume_state.get("request_frame"):
+                request_frame = RequestFrame.model_validate(resume_state["request_frame"])
             if resume_from and resume_state.get("intent") and resume_state.get("plan"):
                 intent = IntentResult.model_validate(resume_state["intent"])
                 plan = Plan.model_validate(resume_state["plan"])
                 phase = resume_from.phase
                 await self.trace.emit(run.id, EventType.RESUME_STARTED, f"从 Checkpoint 继续：{resume_from.phase}", payload={"checkpoint_id": resume_from.id, "phase": resume_from.phase}, agent_id="main")
+            if request_frame is None:
+                request_frame = await self.request_understanding.understand(
+                    request.conversation_id,
+                    request.user_input,
+                    request=request,
+                    datasets=datasets,
+                    model_adapter=self._model_adapter_for(request),
+                    exclude_run_id=run.id,
+                    exclude_task_id=task.id,
+                )
+                phase = "request_understood"
+            if intent is None:
+                intent = self.legacy_intent_adapter.to_intent(request_frame, request, datasets)
+            await self.trace.emit(
+                run.id,
+                EventType.INTENT_RESOLVED,
+                "请求理解完成",
+                payload={
+                    "request_frame": request_frame.model_dump(mode="json"),
+                    "legacy_intent": intent.model_dump(mode="json"),
+                    "source": "request_understanding",
+                },
+                agent_id="main",
+            )
             run = run.model_copy(update={"status": RunStatus.PLANNING})
             self.store.save_run(run)
             self.guard.check_execution_time(run)
@@ -144,6 +181,7 @@ class MainAgent:
                     datasets,
                     intent,
                     plan,
+                    request_frame=request_frame,
                     initial_messages=resume_state.get("messages") if resume_from and resume_state.get("messages") else None,
                     initial_findings=resume_state.get("model_findings") if resume_from and resume_state.get("model_findings") else None,
                     initial_dataset_ids=resume_state.get("model_dataset_ids") if resume_from and resume_state.get("model_dataset_ids") else None,
@@ -154,16 +192,7 @@ class MainAgent:
                     result = model_result
                 else:
                     if intent is None or plan is None:
-                        intent = self.intent_resolver.resolve(request, datasets)
-                        phase = "intent_resolved"
-                        await self.trace.emit(
-                            run.id,
-                            EventType.INTENT_RESOLVED,
-                            intent.rationale,
-                            payload={**intent.model_dump(mode="json"), "source": "offline_fallback"},
-                            agent_id="main",
-                        )
-                        plan = self.planner.build(request.user_input, intent, datasets)
+                        plan = self.planner.build(request_frame.goal, intent, datasets)
                         phase = "plan_created"
                         await self.trace.emit(
                             run.id,
@@ -172,23 +201,32 @@ class MainAgent:
                             payload={**plan.model_dump(mode="json"), "source": "offline_fallback"},
                             agent_id="main",
                         )
-                        await self._checkpoint(run.id, "plan_created", self._checkpoint_state(request, intent, plan, datasets))
-                    decision = self.router.route(intent, plan, datasets)
-                    if decision.type.value == "DELEGATE":
+                        await self._checkpoint(run.id, "plan_created", self._checkpoint_state(request, intent, plan, datasets, request_frame))
+                    if request_frame.mode is InteractionMode.CANCEL_TASK:
+                        result = AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.SUCCESS, summary="已识别为取消当前任务的请求。", trace_id=run.id)
+                        decision = None
+                    else:
+                        decision = self.router.route(intent, plan, datasets)
+                    if decision is None:
+                        pass
+                    elif decision.type.value == "DELEGATE":
                         decision = decision.model_copy(update={"subtasks": self.decomposer.decompose(request, datasets)})
-                    await self.trace.emit(
-                        run.id,
-                        EventType.DECISION_MADE,
-                        decision.reasoning_summary,
-                        payload={**decision.model_dump(mode="json"), "source": "offline_fallback"},
-                        agent_id="main",
-                    )
-                    if decision.type.value == "ASK_USER":
+                    if decision is not None:
+                        await self.trace.emit(
+                            run.id,
+                            EventType.DECISION_MADE,
+                            decision.reasoning_summary,
+                            payload={**decision.model_dump(mode="json"), "source": "offline_fallback"},
+                            agent_id="main",
+                        )
+                    if decision is None:
+                        pass
+                    elif decision.type.value == "ASK_USER":
                         result = AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.BLOCKED, summary=decision.final_response or decision.reasoning_summary, error="WAITING_USER", trace_id=run.id)
                     elif decision.type.value == "DELEGATE":
-                        result = await self._delegate(request, run, task, datasets, decision.subtasks, intent=intent, plan=plan)
+                        result = await self._delegate(request, run, task, datasets, decision.subtasks, intent=intent, plan=plan, request_frame=request_frame)
                     elif decision.type.value == "TOOL":
-                        result = await self._execute_plan(request, run, task, datasets, intent, plan, resume_state)
+                        result = await self._execute_plan(request, run, task, datasets, intent, plan, resume_state, request_frame=request_frame)
                     elif intent.intent.value == "RUN_DIAGNOSIS":
                         result = self._diagnose_runs(request, run)
                     elif intent.intent.value == "RESULT_INTERPRETATION":
@@ -212,7 +250,7 @@ class MainAgent:
             run = finish_run(self.store.get_run(run.id) or run, RunStatus.CANCELLED, error="CANCELLED")
             self.store.save_run(run)
             previous_checkpoint = self.checkpoint_store.latest(run.id) if self.checkpoint_store else None
-            state = {**(previous_checkpoint.state if previous_checkpoint else {}), **self._checkpoint_state(request, intent, plan, datasets)}
+            state = {**(previous_checkpoint.state if previous_checkpoint else {}), **self._checkpoint_state(request, intent, plan, datasets, request_frame)}
             state["phase"] = phase
             await self._checkpoint(run.id, "run_cancelled", state)
             self.task_service.update(task, status=TaskStatus.CANCELLED, result="运行已取消")
@@ -240,6 +278,7 @@ class MainAgent:
         intent: IntentResult | None,
         plan: Plan | None,
         *,
+        request_frame: RequestFrame | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
         initial_findings: list[Any] | None = None,
         initial_dataset_ids: list[str] | None = None,
@@ -251,7 +290,7 @@ class MainAgent:
             return None
         messages = initial_messages or [
             {"role": "system", "content": _MODEL_SYSTEM_PROMPT},
-            {"role": "user", "content": self._model_user_message(request, run, datasets, intent, plan)},
+            {"role": "user", "content": self._model_user_message(request, run, datasets, intent, plan, request_frame)},
         ]
         findings: list[Any] = list(initial_findings or [])
         dataset_ids: set[str] = set(initial_dataset_ids or [])
@@ -311,7 +350,7 @@ class MainAgent:
                 run.id,
                 "model_tool_completed",
                 {
-                    **self._checkpoint_state(request, intent, plan, datasets),
+                    **self._checkpoint_state(request, intent, plan, datasets, request_frame),
                     "messages": messages,
                     "model_findings": findings,
                     "model_dataset_ids": sorted(dataset_ids),
@@ -328,7 +367,7 @@ class MainAgent:
                 return adapter
         return self.model_adapter
 
-    def _model_user_message(self, request: AgentRequest, run: Run, datasets, intent: IntentResult | None, plan: Plan | None) -> str:
+    def _model_user_message(self, request: AgentRequest, run: Run, datasets, intent: IntentResult | None, plan: Plan | None, request_frame: RequestFrame | None = None) -> str:
         from app.entry.reference_resolver import ReferenceResolver
 
         history = self.store.list_messages(request.conversation_id, limit=20)
@@ -373,6 +412,7 @@ class MainAgent:
             budget=self.budget.model_dump(mode="json"),
             referenced_runs=referenced_runs,
             intent_hint=intent,
+            request_frame=request_frame,
         )
         return "请先理解用户真正想完成的事情，再决定下一步。以下上下文中的 deterministic_hint 只是离线规则生成的提示，可能不准确，不能当作已经确认的意图或固定流水线。你可以直接用中文回答、询问缺失信息、调用一个或多个工具，并在每次工具返回后重新判断是否继续。只有用户明确需要数据处理或检查时才调用工具；问候、闲聊、解释概念不要调用工具。不要自行挑选不明确的数据集，不要编造工具结果。\n" + json.dumps(context, ensure_ascii=False, default=str)
 
@@ -401,9 +441,10 @@ class MainAgent:
         ]
 
     @staticmethod
-    def _checkpoint_state(request: AgentRequest, intent: IntentResult | None, plan: Plan | None, datasets) -> dict[str, Any]:
+    def _checkpoint_state(request: AgentRequest, intent: IntentResult | None, plan: Plan | None, datasets, request_frame: RequestFrame | None = None) -> dict[str, Any]:
         return {
             "request": request.model_dump(mode="json"),
+            "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
             "intent": intent.model_dump(mode="json") if intent else None,
             "plan": plan.model_dump(mode="json") if plan else None,
             "dataset_ids": [item.id for item in datasets],
@@ -416,18 +457,18 @@ class MainAgent:
         self.checkpoint_store.save(checkpoint)
         await self.trace.emit(run_id, EventType.CHECKPOINT_SAVED, f"保存 Checkpoint：{phase}", payload={"checkpoint_id": checkpoint.id, "phase": phase}, agent_id="main")
 
-    async def _step_checkpoint(self, run_id: str, request: AgentRequest, intent: IntentResult, plan: Plan, datasets, completed_steps: set[str], **state: Any) -> None:
+    async def _step_checkpoint(self, run_id: str, request: AgentRequest, intent: IntentResult, plan: Plan, datasets, completed_steps: set[str], *, request_frame: RequestFrame | None = None, **state: Any) -> None:
         await self._checkpoint(
             run_id,
             "step_completed",
             {
-                **self._checkpoint_state(request, intent, plan, datasets),
+                **self._checkpoint_state(request, intent, plan, datasets, request_frame),
                 "completed_steps": sorted(completed_steps),
                 **state,
             },
         )
 
-    async def _execute_plan(self, request: AgentRequest, run: Run, task: Task, datasets, intent: IntentResult, plan: Plan, resume_state: dict[str, Any]) -> AgentResult:
+    async def _execute_plan(self, request: AgentRequest, run: Run, task: Task, datasets, intent: IntentResult, plan: Plan, resume_state: dict[str, Any], *, request_frame: RequestFrame | None = None) -> AgentResult:
         completed = set(resume_state.get("completed_steps", []))
         findings = list(resume_state.get("findings", []))
         output_ids = list(resume_state.get("output_ids", []))
@@ -449,7 +490,7 @@ class MainAgent:
             return problems
 
         async def checkpoint(completed_steps, state):
-            await self._step_checkpoint(run.id, request, intent, plan, datasets, completed_steps, **state)
+            await self._step_checkpoint(run.id, request, intent, plan, datasets, completed_steps, request_frame=request_frame, **state)
 
         outcome = await self.loop.execute_plan(
             plan,
@@ -657,7 +698,7 @@ class MainAgent:
             trace_id=run.id,
         )
 
-    async def _delegate(self, request: AgentRequest, run: Run, task: Task, datasets, tasks=None, *, intent: IntentResult | None = None, plan: Plan | None = None) -> AgentResult:
+    async def _delegate(self, request: AgentRequest, run: Run, task: Task, datasets, tasks=None, *, intent: IntentResult | None = None, plan: Plan | None = None, request_frame: RequestFrame | None = None) -> AgentResult:
         tasks = tasks or self.decomposer.decompose(request, datasets)
         self.guard.check_subagents(len(tasks))
         attached = self.task_service.attach_subtasks(task, tasks)
@@ -674,7 +715,7 @@ class MainAgent:
                 run.id,
                 "delegation_started",
                 {
-                    **self._checkpoint_state(request, intent, plan, datasets),
+                    **self._checkpoint_state(request, intent, plan, datasets, request_frame),
                     "completed_steps": ["decompose"],
                     "subtask_ids": [item.id for item in tasks],
                 },
@@ -696,7 +737,7 @@ class MainAgent:
                 run.id,
                 "delegation_completed",
                 {
-                    **self._checkpoint_state(request, intent, plan, datasets),
+                    **self._checkpoint_state(request, intent, plan, datasets, request_frame),
                     "completed_steps": [item.id for item in plan.steps],
                     "subtask_ids": [item.id for item in tasks],
                     "delegation_result": result.model_dump(mode="json"),

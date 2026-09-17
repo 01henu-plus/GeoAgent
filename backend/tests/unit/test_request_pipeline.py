@@ -23,6 +23,8 @@ from app.understanding.validator import RequestFrameValidator
 
 
 class FakeInterpreterAdapter(ModelAdapter):
+    supports_structured_output = True
+
     async def complete(self, request: ModelRequest) -> ModelResponse:
         return ModelResponse(
             content=json.dumps(

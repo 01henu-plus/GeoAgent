@@ -33,12 +33,14 @@ class StateSnapshotLoader:
         self.store = store
         self.limit = max(1, limit)
 
-    def load(self, conversation_id: str, *, exclude_run_id: str | None = None) -> StateSnapshot:
+    def load(self, conversation_id: str, *, exclude_run_id: str | None = None, exclude_task_id: str | None = None) -> StateSnapshot:
         messages = self.store.list_messages(conversation_id, limit=self.limit)
         runs = [item for item in self.store.list_runs(limit=self.limit * 4) if item.conversation_id == conversation_id]
         if exclude_run_id:
             runs = [item for item in runs if item.id != exclude_run_id]
         tasks = self.store.list_tasks(conversation_id, limit=self.limit * 2)
+        if exclude_task_id:
+            tasks = [item for item in tasks if item.id != exclude_task_id]
         active_run = next((item for item in runs if item.status in _ACTIVE_RUN_STATUSES), None)
         active_task = self.store.get_task(active_run.task_id) if active_run else next((item for item in tasks if item.status in _ACTIVE_TASK_STATUSES), None)
 

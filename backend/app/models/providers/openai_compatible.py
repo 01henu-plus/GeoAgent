@@ -9,6 +9,8 @@ from app.models.config import ModelConfig
 
 
 class OpenAICompatibleAdapter(ModelAdapter):
+    supports_structured_output = True
+
     def __init__(self, config: ModelConfig) -> None:
         if not config.model or not config.model.strip():
             raise ValueError("OpenAI 兼容接口需要填写模型名称。")

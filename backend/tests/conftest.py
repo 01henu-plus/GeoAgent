@@ -8,7 +8,7 @@ from app.config import Settings
 
 @pytest.fixture
 def application(tmp_path) -> Iterator[Application]:
-    settings = Settings(root=tmp_path, database=tmp_path / "state.sqlite3", workspace=tmp_path / "workspace")
+    settings = Settings(root=tmp_path, database=tmp_path / "state.sqlite3", workspace=tmp_path / "workspace", model_profiles="")
     app = Application(settings)
     app.start()
     try:
@@ -18,4 +18,3 @@ def application(tmp_path) -> Iterator[Application]:
         import asyncio
 
         asyncio.run(app.close())
-

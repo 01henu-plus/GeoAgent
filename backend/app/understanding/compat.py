@@ -25,7 +25,10 @@ class LegacyIntentAdapter:
             entities = dict(legacy.entities)
             rationale = legacy.rationale
             if frame.mode is InteractionMode.QUERY:
-                intent = IntentType.KNOWLEDGE_QUERY if "knowledge_lookup" in frame.capabilities else IntentType.RESULT_INTERPRETATION
+                if legacy.intent is IntentType.RUN_DIAGNOSIS:
+                    intent = IntentType.RUN_DIAGNOSIS
+                else:
+                    intent = IntentType.KNOWLEDGE_QUERY if "knowledge_lookup" in frame.capabilities else IntentType.RESULT_INTERPRETATION
             if intent is IntentType.UNKNOWN and "dataset_inspection" in frame.capabilities:
                 intent = IntentType.DATA_INSPECTION
         entities.update(
@@ -39,4 +42,3 @@ class LegacyIntentAdapter:
             }
         )
         return IntentResult(intent=intent, confidence=confidence, entities=entities, rationale=rationale)
-

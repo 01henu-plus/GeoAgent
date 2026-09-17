@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from app.core.models import AgentRequest, Dataset, IntentResult, MemoryItem, Plan
+from app.core.models import AgentRequest, Dataset, IntentResult, MemoryItem, Plan, RequestFrame
 
 
 class ContextManager:
@@ -27,11 +27,13 @@ class ContextManager:
         findings: list[Any] | None = None,
         errors: list[str] | None = None,
         intent_hint: IntentResult | None = None,
+        request_frame: RequestFrame | None = None,
     ) -> dict[str, Any]:
         context = {
             "user_request": request.user_input,
             "goal": request.user_input,
             "request_context": request.context,
+            "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
             "deterministic_hint": {
                 "intent": intent_hint.model_dump(mode="json") if intent_hint else None,
                 "plan": plan.model_dump(mode="json") if plan else None,
