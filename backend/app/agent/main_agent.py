@@ -47,10 +47,11 @@ from app.knowledge import KnowledgeRetriever
 from app.memory import MemoryManager
 from app.models import ModelAdapter, ModelRequest, ModelResponse
 from app.observability import TraceRecorder
+from app.run.lifecycle import PreparedRequest, RequestLifecycleBinder
 from app.runtime.agent_loop import AgentLoop
 from app.runtime.budget import BudgetExceeded, BudgetGuard
 from app.runtime.context_manager import ContextManager
-from app.runtime.lifecycle import finish_run, start_run
+from app.runtime.lifecycle import finish_run
 from app.state import StateStore
 from app.task.service import TaskService
 from app.understanding.compat import LegacyIntentAdapter
@@ -100,29 +101,68 @@ class MainAgent:
         self.default_model_profile = default_model_profile
         self.context_manager = context_manager or ContextManager()
         self.loop = AgentLoop()
+        self.lifecycle_binder = RequestLifecycleBinder(store, task_service)
 
     def prepare(self, request: AgentRequest, *, metadata: dict[str, object] | None = None) -> tuple[Task, Run]:
-        task = self.task_service.create(request.user_input, conversation_id=request.conversation_id)
-        run_metadata = {"goal": request.user_input, **(metadata or {})}
-        run = start_run(Run(conversation_id=request.conversation_id, task_id=task.id, agent_id="main", metadata=run_metadata))
-        self.store.save_run(run)
-        return task, run
+        """旧同步 API 兼容入口；正常请求必须走异步 prepare_request。"""
+        frame = RequestFrame(mode=InteractionMode.NEW_TASK, goal=request.user_input, needs_planning=True)
+        prepared = self.lifecycle_binder.bind(request, frame, metadata=metadata)
+        if prepared.task is None or prepared.run is None:
+            raise RuntimeError("无法为兼容调用创建新任务")
+        return prepared.task, prepared.run
+
+    async def prepare_request(
+        self,
+        request: AgentRequest,
+        *,
+        metadata: dict[str, object] | None = None,
+        resume_from: Checkpoint | None = None,
+    ) -> PreparedRequest:
+        """先完成 Request Understanding，再绑定 Task/Run 生命周期。"""
+        resume_state = resume_from.state if resume_from else {}
+        if isinstance(resume_state.get("request"), dict):
+            request = AgentRequest.model_validate(resume_state["request"])
+        datasets = self._resolve_datasets(request)
+        saved_frame = resume_state.get("request_frame")
+        if isinstance(saved_frame, dict):
+            frame = RequestFrame.model_validate(saved_frame)
+        else:
+            frame = await self.request_understanding.understand(
+                request.conversation_id,
+                request.user_input,
+                request=request,
+                datasets=datasets,
+                model_adapter=self._model_adapter_for(request),
+            )
+        previous_run = self.store.get_run(resume_from.run_id) if resume_from else None
+        if previous_run and previous_run.task_id and frame.mode is InteractionMode.NEW_TASK:
+            frame = frame.model_copy(
+                update={
+                    "mode": InteractionMode.CONTINUE_TASK,
+                    "target_task_id": previous_run.task_id,
+                    "target_run_id": previous_run.id,
+                    "needs_planning": True,
+                }
+            )
+        return self.lifecycle_binder.bind(request, frame, metadata=metadata)
 
     async def run(
         self,
         request: AgentRequest,
         *,
-        prepared: tuple[Task, Run] | None = None,
+        prepared: PreparedRequest | None = None,
         resume_from: Checkpoint | None = None,
         on_model_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> AgentResult:
         resume_state = resume_from.state if resume_from else {}
-        if resume_state.get("request"):
-            request = AgentRequest.model_validate(resume_state["request"])
-        task, run = prepared or self.prepare(request)
+        prepared_request = prepared or await self.prepare_request(request, resume_from=resume_from)
+        request = prepared_request.request
+        task, run = prepared_request.task, prepared_request.run
+        if run is None:
+            raise RuntimeError("请求没有可执行的 Run")
         intent: IntentResult | None = None
         plan: Plan | None = None
-        request_frame: RequestFrame | None = None
+        request_frame: RequestFrame | None = prepared_request.frame
         datasets = []
         phase = "created"
         await self.trace.emit(
@@ -134,24 +174,12 @@ class MainAgent:
         )
         try:
             datasets = self._resolve_datasets(request)
-            if resume_state.get("request_frame"):
-                request_frame = RequestFrame.model_validate(resume_state["request_frame"])
             if resume_from and resume_state.get("intent") and resume_state.get("plan"):
                 intent = IntentResult.model_validate(resume_state["intent"])
                 plan = Plan.model_validate(resume_state["plan"])
                 phase = resume_from.phase
                 await self.trace.emit(run.id, EventType.RESUME_STARTED, f"从 Checkpoint 继续：{resume_from.phase}", payload={"checkpoint_id": resume_from.id, "phase": resume_from.phase}, agent_id="main")
-            if request_frame is None:
-                request_frame = await self.request_understanding.understand(
-                    request.conversation_id,
-                    request.user_input,
-                    request=request,
-                    datasets=datasets,
-                    model_adapter=self._model_adapter_for(request),
-                    exclude_run_id=run.id,
-                    exclude_task_id=task.id,
-                )
-                phase = "request_understood"
+            phase = "request_understood"
             if intent is None:
                 intent = self.legacy_intent_adapter.to_intent(request_frame, request, datasets)
             await self.trace.emit(
@@ -165,11 +193,25 @@ class MainAgent:
                 },
                 agent_id="main",
             )
+            if request_frame.resolution_status.value != "resolved":
+                result = AgentResult(
+                    agent_id="main",
+                    task_id=task.id if task else run.task_id,
+                    status=AgentResultStatus.BLOCKED,
+                    summary="当前请求需要补充信息后才能继续。" + ("；".join(request_frame.blocking_issues) if request_frame.blocking_issues else ""),
+                    error="NEEDS_CLARIFICATION",
+                    trace_id=run.id,
+                )
+                run = finish_run(run, RunStatus.WAITING_USER, error=result.error)
+                self.store.save_run(run.model_copy(update={"metadata": {**run.metadata, "result": result.model_dump(mode="json")}}))
+                await self._checkpoint(run.id, "run_completed", {"status": run.status.value, "result": result.model_dump(mode="json")})
+                await self.trace.emit(run.id, EventType.RUN_FAILED, result.summary, payload={"status": run.status.value, "result": result.model_dump(mode="json")}, agent_id="main")
+                return result
             run = run.model_copy(update={"status": RunStatus.PLANNING})
             self.store.save_run(run)
             self.guard.check_execution_time(run)
             if isinstance(resume_state.get("delegation_result"), dict):
-                result = AgentResult.model_validate(resume_state["delegation_result"]).model_copy(update={"task_id": task.id, "trace_id": run.id})
+                result = AgentResult.model_validate(resume_state["delegation_result"]).model_copy(update={"task_id": task.id if task else run.task_id, "trace_id": run.id})
             else:
                 # 参考项目的核心：模型先基于完整会话和工具结果自行判断。
                 # 规则 IntentResolver/Planner 只作为无模型时的离线兜底，不能
@@ -203,7 +245,7 @@ class MainAgent:
                         )
                         await self._checkpoint(run.id, "plan_created", self._checkpoint_state(request, intent, plan, datasets, request_frame))
                     if request_frame.mode is InteractionMode.CANCEL_TASK:
-                        result = AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.SUCCESS, summary="已识别为取消当前任务的请求。", trace_id=run.id)
+                        result = AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.SUCCESS, summary="已识别为取消当前任务的请求。", trace_id=run.id)
                         decision = None
                     else:
                         decision = self.router.route(intent, plan, datasets)
@@ -222,7 +264,7 @@ class MainAgent:
                     if decision is None:
                         pass
                     elif decision.type.value == "ASK_USER":
-                        result = AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.BLOCKED, summary=decision.final_response or decision.reasoning_summary, error="WAITING_USER", trace_id=run.id)
+                        result = AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.BLOCKED, summary=decision.final_response or decision.reasoning_summary, error="WAITING_USER", trace_id=run.id)
                     elif decision.type.value == "DELEGATE":
                         result = await self._delegate(request, run, task, datasets, decision.subtasks, intent=intent, plan=plan, request_frame=request_frame)
                     elif decision.type.value == "TOOL":
@@ -232,10 +274,10 @@ class MainAgent:
                     elif intent.intent.value == "RESULT_INTERPRETATION":
                         result = self._interpret_result(request, run)
                     elif intent.intent.value == "UNKNOWN":
-                        result = AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.SUCCESS, summary=_conversation_reply(request.user_input), trace_id=run.id)
+                        result = AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.SUCCESS, summary=_conversation_reply(request.user_input), trace_id=run.id)
                     else:
                         findings = self.knowledge.retrieve(request.user_input) if intent.intent.value == "KNOWLEDGE_QUERY" else []
-                        result = AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.SUCCESS, summary="已整理 GIS 知识上下文。" if findings else "已理解请求，但当前计划没有需要执行的 GIS 操作。", findings=findings, trace_id=run.id, warnings=[] if findings else ["当前未配置大模型，离线模式只支持有限的 GIS 操作。"])
+                        result = AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.SUCCESS, summary="已整理 GIS 知识上下文。" if findings else "已理解请求，但当前计划没有需要执行的 GIS 操作。", findings=findings, trace_id=run.id, warnings=[] if findings else ["当前未配置大模型，离线模式只支持有限的 GIS 操作。"])
             final_status = _run_status_for_result(result.status, result.error)
             run = finish_run(self.store.get_run(run.id) or run, final_status, error=result.error)
             self.store.save_run(run.model_copy(update={"metadata": {**run.metadata, "result": result.model_dump(mode="json")}}))
@@ -243,7 +285,8 @@ class MainAgent:
                 self.memory.set("last_run_id", run.id, metadata={"status": result.status.value})
                 self.memory.set("last_result_summary", result.summary, metadata={"run_id": run.id})
             await self._checkpoint(run.id, "run_completed", {"status": final_status.value, "result": result.model_dump(mode="json")})
-            self.task_service.update(task, status=_task_status_for_result(result.status), result=result.summary)
+            if task is not None and prepared_request.action in {"create_task", "bind_task", "retry_run"}:
+                self.task_service.update(task, status=_task_status_for_result(result.status), result=result.summary)
             await self.trace.emit(run.id, EventType.RUN_COMPLETED if result.status in {AgentResultStatus.SUCCESS, AgentResultStatus.PARTIAL} else EventType.RUN_FAILED, result.summary, payload={"status": result.status.value, "result": result.model_dump(mode="json")}, agent_id="main")
             return result.model_copy(update={"trace_id": run.id})
         except asyncio.CancelledError:
@@ -253,27 +296,30 @@ class MainAgent:
             state = {**(previous_checkpoint.state if previous_checkpoint else {}), **self._checkpoint_state(request, intent, plan, datasets, request_frame)}
             state["phase"] = phase
             await self._checkpoint(run.id, "run_cancelled", state)
-            self.task_service.update(task, status=TaskStatus.CANCELLED, result="运行已取消")
+            if task is not None and prepared_request.action in {"create_task", "bind_task", "retry_run"}:
+                self.task_service.update(task, status=TaskStatus.CANCELLED, result="运行已取消")
             await self.trace.emit(run.id, EventType.RUN_CANCELLED, "运行已取消", payload={"status": RunStatus.CANCELLED.value}, agent_id="main")
-            return AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.CANCELLED, summary="运行已取消。", error="CANCELLED", trace_id=run.id)
+            return AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.CANCELLED, summary="运行已取消。", error="CANCELLED", trace_id=run.id)
         except BudgetExceeded as exc:
             run = finish_run(self.store.get_run(run.id) or run, RunStatus.BUDGET_EXCEEDED, error=str(exc))
             self.store.save_run(run)
-            self.task_service.update(task, status=TaskStatus.BLOCKED, result=str(exc))
+            if task is not None and prepared_request.action in {"create_task", "bind_task", "retry_run"}:
+                self.task_service.update(task, status=TaskStatus.BLOCKED, result=str(exc))
             await self.trace.emit(run.id, EventType.RUN_FAILED, str(exc), payload={"status": RunStatus.BUDGET_EXCEEDED.value}, agent_id="main")
-            return AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.BLOCKED, summary="运行因预算限制停止。", error=str(exc), trace_id=run.id)
+            return AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.BLOCKED, summary="运行因预算限制停止。", error=str(exc), trace_id=run.id)
         except Exception as exc:
             run = finish_run(self.store.get_run(run.id) or run, RunStatus.FAILED, error=str(exc))
             self.store.save_run(run)
-            self.task_service.update(task, status=TaskStatus.FAILED, result=str(exc))
+            if task is not None and prepared_request.action in {"create_task", "bind_task", "retry_run"}:
+                self.task_service.update(task, status=TaskStatus.FAILED, result=str(exc))
             await self.trace.emit(run.id, EventType.RUN_FAILED, str(exc), payload={"error_type": exc.__class__.__name__}, agent_id="main")
-            return AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.FAILED, summary="任务执行失败。", error=str(exc), trace_id=run.id)
+            return AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.FAILED, summary="任务执行失败。", error=str(exc), trace_id=run.id)
 
     async def _model_loop(
         self,
         request: AgentRequest,
         run: Run,
-        task: Task,
+        task: Task | None,
         datasets,
         intent: IntentResult | None,
         plan: Plan | None,
@@ -321,7 +367,7 @@ class MainAgent:
                     return None
                 await self.trace.emit(run.id, EventType.DECISION_MADE, "模型运行时决定直接回复，不执行空间工具。", payload={"source": "model_runtime", "action": "final", "model": response.model}, agent_id="main")
                 findings.append({"model": response.model, "content": response.content})
-                return AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.SUCCESS, summary=response.content.strip(), findings=findings, datasets=sorted(dataset_ids), artifacts=sorted(artifact_ids), trace_id=run.id)
+                return AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.SUCCESS, summary=response.content.strip(), findings=findings, datasets=sorted(dataset_ids), artifacts=sorted(artifact_ids), trace_id=run.id)
 
             await self.trace.emit(run.id, EventType.DECISION_MADE, f"模型运行时决定调用 {len(response.tool_calls)} 个工具。", payload={"source": "model_runtime", "action": "tool", "tools": [_model_tool_name(item) for item in response.tool_calls]}, agent_id="main")
             messages.append({"role": "assistant", "content": response.content or "", "tool_calls": response.tool_calls})

@@ -31,7 +31,7 @@ class ContextManager:
     ) -> dict[str, Any]:
         context = {
             "user_request": request.user_input,
-            "goal": request.user_input,
+            "goal": request_frame.goal if request_frame else request.user_input,
             "request_context": request.context,
             "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
             "deterministic_hint": {
