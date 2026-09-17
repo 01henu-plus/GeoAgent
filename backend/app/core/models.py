@@ -382,6 +382,29 @@ class RequestResources(StrictModel):
     runs: list[Run] = Field(default_factory=list)
 
 
+class WorkingMemoryItem(StrictModel):
+    """工作记忆中的轻量引用，不保存完整工具输出。"""
+
+    kind: str
+    reference_id: str | None = None
+    summary: str
+    source_run_id: str | None = None
+
+
+class WorkingMemory(StrictModel):
+    """以 Task 为作用域的结构化工作状态。"""
+
+    task_id: str
+    conversation_id: str | None = None
+    active_dataset_ids: list[str] = Field(default_factory=list)
+    active_artifact_ids: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    intermediate_results: list[WorkingMemoryItem] = Field(default_factory=list)
+    unresolved_questions: list[str] = Field(default_factory=list)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class Checkpoint(StrictModel):
     id: str = Field(default_factory=lambda: new_id("cp"))
     run_id: str

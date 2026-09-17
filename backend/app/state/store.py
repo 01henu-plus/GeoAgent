@@ -28,6 +28,7 @@ from app.core.models import (
     ToolCall,
     ToolResult,
     TraceEvent,
+    WorkingMemory,
     utc_now,
 )
 
@@ -52,6 +53,12 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS working_memories (
+    task_id TEXT PRIMARY KEY,
+    conversation_id TEXT,
     payload_json TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -118,6 +125,7 @@ CREATE TABLE IF NOT EXISTS trace_events (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_updated ON runs(updated_at);
+CREATE INDEX IF NOT EXISTS idx_working_memories_conversation ON working_memories(conversation_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_trace_run ON trace_events(run_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_lineage_output ON dataset_lineage(output_dataset_id);
 """
@@ -183,6 +191,7 @@ class StateStore:
 
     def delete_conversation(self, conversation_id: str) -> bool:
         with self._connect() as db:
+            db.execute("DELETE FROM working_memories WHERE conversation_id=?", (conversation_id,))
             cursor = db.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
             db.commit()
         return cursor.rowcount > 0
@@ -230,6 +239,27 @@ class StateStore:
             rows = db.execute(query, args).fetchall()
         return [self._model(Task, row[0]) for row in rows]
 
+    def save_working_memory(self, memory: WorkingMemory) -> None:
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO working_memories(task_id,conversation_id,payload_json,updated_at) VALUES(?,?,?,?)
+                ON CONFLICT(task_id) DO UPDATE SET conversation_id=excluded.conversation_id,
+                payload_json=excluded.payload_json, updated_at=excluded.updated_at""",
+                (memory.task_id, memory.conversation_id, memory.model_dump_json(), memory.updated_at.isoformat()),
+            )
+            db.commit()
+
+    def get_working_memory(self, task_id: str) -> WorkingMemory | None:
+        with self._connect() as db:
+            row = db.execute("SELECT payload_json FROM working_memories WHERE task_id=?", (task_id,)).fetchone()
+        return self._model(WorkingMemory, row[0]) if row else None
+
+    def delete_working_memory(self, task_id: str) -> bool:
+        with self._connect() as db:
+            cursor = db.execute("DELETE FROM working_memories WHERE task_id=?", (task_id,))
+            db.commit()
+        return cursor.rowcount > 0
+
     def save_subtask(self, task_id: str, subtask: SubTask) -> None:
         with self._connect() as db:
             db.execute(
@@ -262,6 +292,7 @@ class StateStore:
 
     def delete_runs(self, run_ids: list[str]) -> list[str]:
         deleted: list[str] = []
+        task_ids: set[str] = set()
         with self._connect() as db:
             for run_id in dict.fromkeys(run_ids):
                 row = db.execute("SELECT payload_json FROM runs WHERE id=?", (run_id,)).fetchone()
@@ -273,10 +304,15 @@ class StateStore:
                 db.execute("DELETE FROM tool_calls WHERE run_id=?", (run_id,))
                 db.execute("DELETE FROM dataset_lineage WHERE run_id=?", (run_id,))
                 if run.task_id:
-                    db.execute("DELETE FROM subtasks WHERE task_id=?", (run.task_id,))
-                    db.execute("DELETE FROM tasks WHERE id=?", (run.task_id,))
+                    task_ids.add(run.task_id)
                 db.execute("DELETE FROM runs WHERE id=?", (run_id,))
                 deleted.append(run_id)
+            for task_id in task_ids:
+                remaining = db.execute("SELECT 1 FROM runs WHERE json_extract(payload_json, '$.task_id')=? LIMIT 1", (task_id,)).fetchone()
+                if remaining is None:
+                    db.execute("DELETE FROM subtasks WHERE task_id=?", (task_id,))
+                    db.execute("DELETE FROM working_memories WHERE task_id=?", (task_id,))
+                    db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
             db.commit()
         return deleted
 
