@@ -2,21 +2,10 @@
 
 from __future__ import annotations
 
-from app.core.models import RunStatus, StateSnapshot, TaskStatus
+from app.core.models import StateSnapshot, TaskStatus
+from app.run.predicates import is_active_run
 from app.state import StateStore
 
-_ACTIVE_RUN_STATUSES = {
-    RunStatus.CREATED,
-    RunStatus.PLANNING,
-    RunStatus.RUNNING,
-    RunStatus.WAITING_TOOL,
-    RunStatus.WAITING_SUBAGENT,
-    RunStatus.WAITING_USER,
-    RunStatus.WAITING_APPROVAL,
-    RunStatus.RETRYING,
-    RunStatus.REPLANNING,
-    RunStatus.VALIDATING,
-}
 _ACTIVE_TASK_STATUSES = {
     TaskStatus.PENDING,
     TaskStatus.READY,
@@ -41,7 +30,7 @@ class StateSnapshotLoader:
         tasks = self.store.list_tasks(conversation_id, limit=self.limit * 2)
         if exclude_task_id:
             tasks = [item for item in tasks if item.id != exclude_task_id]
-        active_run = next((item for item in runs if item.status in _ACTIVE_RUN_STATUSES), None)
+        active_run = next((item for item in runs if is_active_run(item)), None)
         active_task = self.store.get_task(active_run.task_id) if active_run and active_run.task_id else next((item for item in tasks if item.status in _ACTIVE_TASK_STATUSES), None)
 
         run_ids = {item.id for item in runs}

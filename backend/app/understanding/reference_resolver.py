@@ -13,9 +13,11 @@ from app.core.models import (
     StateSnapshot,
     Task,
 )
+from app.state import StateStore
 from app.understanding.models import ReferenceResolution
 
 _EXPLICIT_ID_RE = re.compile(r"\b(?:artifact|art|run|task|dataset|ds)_[a-z0-9]+\b", re.IGNORECASE)
+_LATEST_REFERENCES = {"last", "latest", "刚才", "刚才的结果", "上一轮", "上一次", "上一张图"}
 _MENTIONS = (
     "刚才下载的数据",
     "刚才生成的文件",
@@ -39,6 +41,34 @@ _MENTIONS = (
 
 class ReferenceResolver:
     """优先使用显式 ID 和最近真实对象，不依赖大模型消解第一版引用。"""
+
+    def __init__(self, store: StateStore | None = None) -> None:
+        self.store = store
+
+    def resolve_runs(
+        self,
+        identifiers: list[str],
+        *,
+        conversation_id: str | None = None,
+        exclude_run_id: str | None = None,
+    ) -> list[Run]:
+        if self.store is None:
+            return []
+        result: list[Run] = []
+        for identifier in identifiers:
+            if identifier.casefold() in _LATEST_REFERENCES:
+                candidates = self.store.list_runs()
+                if conversation_id is not None:
+                    candidates = [item for item in candidates if item.conversation_id == conversation_id]
+                if exclude_run_id:
+                    candidates = [item for item in candidates if item.id != exclude_run_id]
+                if candidates:
+                    result.append(candidates[0])
+                continue
+            run = self.store.get_run(identifier)
+            if run and run.id != exclude_run_id and (conversation_id is None or run.conversation_id == conversation_id):
+                result.append(run)
+        return result
 
     def resolve(self, message: str, state: StateSnapshot, resources: RequestResources | None = None) -> ReferenceResolution:
         references: list[ResolvedReference] = []

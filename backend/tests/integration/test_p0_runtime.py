@@ -7,7 +7,7 @@ from app.api import create_app
 from app.application import Application
 from app.checkpoint.context import make_checkpoint
 from app.config import Settings
-from app.core.models import AgentRequest, AgentResultStatus, RunStatus
+from app.core.models import AgentRequest, AgentResultStatus, Run, RunStatus, TaskStatus
 from app.demo import seed_demo
 from app.models import ModelAdapter, ModelRequest, ModelResponse, ModelStreamChunk
 from app.models.config import ModelProfile
@@ -206,6 +206,24 @@ def test_run_manager_cancels_active_run(application):
 
     assert result.status is AgentResultStatus.CANCELLED
     assert application.store.get_run(run_id).status is RunStatus.CANCELLED
+
+
+def test_run_manager_cancels_persisted_active_run_without_local_task(application):
+    task = application.task_service.create("持久化取消", conversation_id="conv-db-cancel")
+    run = Run(task_id=task.id, conversation_id=task.conversation_id, agent_id="main", status=RunStatus.RUNNING)
+    application.store.save_run(run)
+
+    assert asyncio.run(application.run_manager.cancel(run.id)) is True
+    assert application.store.get_run(run.id).status is RunStatus.CANCELLED
+    assert application.store.get_task(task.id).status is TaskStatus.CANCELLED
+
+
+def test_run_manager_does_not_cancel_completed_run(application):
+    run = Run(agent_id="main", status=RunStatus.COMPLETED)
+    application.store.save_run(run)
+
+    assert asyncio.run(application.run_manager.cancel(run.id)) is False
+    assert application.store.get_run(run.id).status is RunStatus.COMPLETED
 
 
 def test_websocket_streams_run_events_before_result(application):

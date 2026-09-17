@@ -8,9 +8,9 @@ from app.core.models import (
     RequestResolutionStatus,
     RequestResources,
     ResolvedReference,
-    RunStatus,
     StateSnapshot,
 )
+from app.run.predicates import is_active_run, is_retryable_failed_run
 
 
 class RequestFrameValidator:
@@ -102,24 +102,12 @@ class RequestFrameValidator:
 
 def _find_failed_run(run_id: str | None, state: StateSnapshot):
     candidates = state.recent_runs if run_id is None else [item for item in state.recent_runs if item.id == run_id]
-    return next((item for item in candidates if item.status is RunStatus.FAILED or (item.error and item.status not in {RunStatus.WAITING_USER, RunStatus.WAITING_APPROVAL, RunStatus.CANCELLED})), None)
+    return next((item for item in candidates if is_retryable_failed_run(item)), None)
 
 
 def _find_active_run(run_id: str | None, state: StateSnapshot):
     candidates = state.recent_runs if run_id is None else [item for item in state.recent_runs if item.id == run_id]
-    active = {
-        RunStatus.CREATED,
-        RunStatus.PLANNING,
-        RunStatus.RUNNING,
-        RunStatus.WAITING_TOOL,
-        RunStatus.WAITING_SUBAGENT,
-        RunStatus.WAITING_USER,
-        RunStatus.WAITING_APPROVAL,
-        RunStatus.RETRYING,
-        RunStatus.REPLANNING,
-        RunStatus.VALIDATING,
-    }
-    return next((item for item in candidates if item.status in active), None)
+    return next((item for item in candidates if is_active_run(item)), None)
 
 
 def _dedupe(references: list[ResolvedReference]) -> list[ResolvedReference]:

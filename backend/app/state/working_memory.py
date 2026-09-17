@@ -84,18 +84,28 @@ class WorkingMemoryUpdater:
                 )
             )
 
-        unresolved: list[str] = []
-        if result.status in {ToolStatus.BLOCKED, ToolStatus.FAILED} and result.error is not None:
-            if result.error.category.value in {"INPUT", "DATA", "CRS"}:
-                unresolved.append(f"需要补充工具输入：{result.error.code}")
-
         return WorkingMemoryDelta(
             added_dataset_ids=list(dict.fromkeys(result.datasets)),
             added_artifact_ids=list(dict.fromkeys(result.artifacts)),
             intermediate_results=intermediate,
-            unresolved_questions=unresolved,
             source_run_id=run_id,
         )
+
+    def build_unresolved_question_delta(self, questions: list[str], *, run_id: str | None) -> WorkingMemoryDelta:
+        return WorkingMemoryDelta(
+            unresolved_questions=list(dict.fromkeys(item.strip() for item in questions if item and item.strip())),
+            source_run_id=run_id,
+        )
+
+    def add_unresolved_questions(self, task_id: str | None, questions: list[str], *, run_id: str | None) -> WorkingMemory | None:
+        if not task_id:
+            return None
+        memory = self.store.get_working_memory(task_id)
+        if memory is None:
+            return None
+        updated = self.apply_delta(memory, self.build_unresolved_question_delta(questions, run_id=run_id))
+        self.store.save_working_memory(updated)
+        return updated
 
     def merge_delta(self, current: WorkingMemoryDelta, incoming: WorkingMemoryDelta) -> WorkingMemoryDelta:
         """合并同一 SubAgent 的多个工具结果，不写入 StateStore。"""

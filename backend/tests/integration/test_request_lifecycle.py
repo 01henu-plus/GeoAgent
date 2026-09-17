@@ -7,6 +7,8 @@ from app.core.models import (
     ArtifactKind,
     Dataset,
     DatasetKind,
+    RequestFrame,
+    RequestResolutionStatus,
     RequestResources,
     Run,
     RunStatus,
@@ -131,6 +133,38 @@ def test_explicit_referenced_run_has_priority_over_recent_run(application):
     )
 
     assert any(item.type == "run" and item.target_id == selected.id for item in frame.references)
+
+
+def test_explicit_run_reference_requires_conversation_ownership(application):
+    same = Run(id="run-same-conversation", task_id="task-same", agent_id="main", conversation_id="conversation-same", status=RunStatus.COMPLETED)
+    other = Run(id="run-other-conversation", task_id="task-other", agent_id="main", conversation_id="conversation-other", status=RunStatus.COMPLETED)
+    application.store.save_run(same)
+    application.store.save_run(other)
+    resolver = application.main_agent.request_understanding.reference_resolver
+
+    assert [item.id for item in resolver.resolve_runs([same.id], conversation_id="conversation-same")] == [same.id]
+    assert resolver.resolve_runs([other.id], conversation_id="conversation-same") == []
+    assert [item.id for item in resolver.resolve_runs(["latest"], conversation_id="conversation-same")] == [same.id]
+    assert resolver.resolve_runs(["latest"], conversation_id="conversation-same", exclude_run_id=same.id) == []
+
+
+def test_blocked_reason_does_not_drop_existing_blocking_issue(application):
+    other_task = application.task_service.create("其他会话任务", conversation_id="conversation-other")
+    frame = RequestFrame(
+        mode="query",
+        goal="查看结果",
+        target_task_id=other_task.id,
+        resolution_status=RequestResolutionStatus.RESOLVED,
+        blocking_issues=["原有阻塞原因"],
+    )
+
+    prepared = application.main_agent.lifecycle_binder.bind(
+        AgentRequest(user_input="查看结果", conversation_id="conversation-current"),
+        frame,
+    )
+
+    assert "原有阻塞原因" in prepared.frame.blocking_issues
+    assert "目标任务不属于当前会话" in prepared.frame.blocking_issues
 
 
 def test_retry_creates_run_on_failed_task_without_new_task(application):

@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 
 from app.core.models import AgentRequest, AgentResult, Checkpoint, Run, RunStatus, TaskStatus
 from app.run.lifecycle import LifecycleAction, PreparedRequest
+from app.run.predicates import is_active_run
 
 
 class RunManager:
@@ -102,17 +103,11 @@ class RunManager:
                 await task
             except asyncio.CancelledError:
                 pass
-            current = self.store.get_run(run_id)
-            if current and current.status in _ACTIVE_RUN_STATUSES:
-                current = current.model_copy(update={"status": RunStatus.CANCELLED, "error": "CANCELLED"})
-                self.store.save_run(current)
-            if current:
-                self._mark_task_cancelled(current)
             if self.metrics:
                 self.metrics.increment("runs.cancelled")
             return True
         run = self.store.get_run(run_id)
-        if run and run.status in _ACTIVE_RUN_STATUSES:
+        if run and is_active_run(run):
             cancelled = run.model_copy(update={"status": RunStatus.CANCELLED, "error": "CANCELLED"})
             self.store.save_run(cancelled)
             self._mark_task_cancelled(cancelled)
@@ -128,17 +123,3 @@ class RunManager:
         task = self.store.get_task(run.task_id)
         if task and task.status in {TaskStatus.PENDING, TaskStatus.READY, TaskStatus.RUNNING, TaskStatus.WAITING, TaskStatus.BLOCKED}:
             self.main_agent.task_service.update(task, status=TaskStatus.CANCELLED, result="运行已取消")
-
-
-_ACTIVE_RUN_STATUSES = {
-    RunStatus.CREATED,
-    RunStatus.PLANNING,
-    RunStatus.RUNNING,
-    RunStatus.WAITING_TOOL,
-    RunStatus.WAITING_SUBAGENT,
-    RunStatus.WAITING_USER,
-    RunStatus.WAITING_APPROVAL,
-    RunStatus.RETRYING,
-    RunStatus.REPLANNING,
-    RunStatus.VALIDATING,
-}

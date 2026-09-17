@@ -12,11 +12,11 @@ from app.core.models import (
     RequestResolutionStatus,
     RequestResources,
     Run,
-    RunStatus,
     Task,
     TaskStatus,
     WorkingMemory,
 )
+from app.run.predicates import is_active_run, is_retryable_failed_run
 from app.runtime.lifecycle import start_run
 from app.state import StateStore, WorkingMemoryUpdater
 from app.task.service import TaskService
@@ -45,6 +45,7 @@ class PreparedRequest:
         target_task: Task | None = None,
         target_run: Run | None = None,
         working_memory: WorkingMemory | None = None,
+        working_memory_created: bool = False,
         blocked_reason: str | None = None,
     ) -> None:
         self.request = request
@@ -55,6 +56,7 @@ class PreparedRequest:
         self.target_task = target_task
         self.target_run = target_run
         self.working_memory = working_memory
+        self.working_memory_created = working_memory_created
         self.blocked_reason = blocked_reason
 
 
@@ -87,9 +89,9 @@ class RequestLifecycleBinder:
         if frame.mode is InteractionMode.NEW_TASK:
             task = self.task_service.create(frame.goal, conversation_id=request.conversation_id)
             task = self.task_service.update(task, status=TaskStatus.RUNNING)
-            working_memory = self._bind_working_memory(task, frame, request_resources)
+            working_memory, working_memory_created = self._bind_working_memory(task, frame, request_resources)
             run = self._new_run(request, task, frame, metadata=metadata)
-            return PreparedRequest(request=request, frame=frame, action=LifecycleAction.CREATE_TASK, task=task, run=run, working_memory=working_memory)
+            return PreparedRequest(request=request, frame=frame, action=LifecycleAction.CREATE_TASK, task=task, run=run, working_memory=working_memory, working_memory_created=working_memory_created)
 
         if frame.mode in {InteractionMode.CONTINUE_TASK, InteractionMode.MODIFY_TASK}:
             if target_task is None:
@@ -98,28 +100,28 @@ class RequestLifecycleBinder:
             lineage = dict(metadata or {})
             if target_run is not None:
                 lineage["continued_from"] = target_run.id
-            working_memory = self._bind_working_memory(task, frame, request_resources)
+            working_memory, working_memory_created = self._bind_working_memory(task, frame, request_resources)
             run = self._new_run(
                 request,
                 task,
                 frame,
                 metadata=lineage,
             )
-            return PreparedRequest(request=request, frame=frame, action=LifecycleAction.BIND_TASK, task=task, run=run, target_task=target_task, target_run=target_run, working_memory=working_memory)
+            return PreparedRequest(request=request, frame=frame, action=LifecycleAction.BIND_TASK, task=task, run=run, target_task=target_task, target_run=target_run, working_memory=working_memory, working_memory_created=working_memory_created)
 
         if frame.mode is InteractionMode.RETRY_TASK:
-            if target_run is None or not _is_failed(target_run):
+            if target_run is None or not is_retryable_failed_run(target_run):
                 return self._blocked(request, frame, "没有找到可重试的失败运行", metadata=metadata)
             task = target_task or (self.store.get_task(target_run.task_id) if target_run.task_id else None)
             if task is None:
                 return self._blocked(request, frame, "失败运行没有关联任务", metadata=metadata)
             task = self.task_service.update(task, status=TaskStatus.RUNNING)
-            working_memory = self._bind_working_memory(task, frame, request_resources)
+            working_memory, working_memory_created = self._bind_working_memory(task, frame, request_resources)
             run = self._new_run(request, task, frame, metadata={"retry_of": target_run.id, **(metadata or {})})
-            return PreparedRequest(request=request, frame=frame, action=LifecycleAction.RETRY_RUN, task=task, run=run, target_task=task, target_run=target_run, working_memory=working_memory)
+            return PreparedRequest(request=request, frame=frame, action=LifecycleAction.RETRY_RUN, task=task, run=run, target_task=task, target_run=target_run, working_memory=working_memory, working_memory_created=working_memory_created)
 
         if frame.mode is InteractionMode.CANCEL_TASK:
-            if target_run is None or not _is_active(target_run):
+            if target_run is None or not is_active_run(target_run):
                 return self._blocked(request, frame, "没有找到可取消的运行", metadata=metadata)
             working_memory = self.store.get_working_memory(target_task.id) if target_task else None
             return PreparedRequest(request=request, frame=frame, action=LifecycleAction.CANCEL_RUN, task=target_task, run=target_run, target_task=target_task, target_run=target_run, working_memory=working_memory)
@@ -134,11 +136,12 @@ class RequestLifecycleBinder:
         task: Task,
         frame: RequestFrame,
         request_resources: RequestResources | None,
-    ) -> WorkingMemory:
+    ) -> tuple[WorkingMemory, bool]:
+        created = self.store.get_working_memory(task.id) is None
         memory = self.working_memory_updater.load_or_create(task.id, task.conversation_id)
         memory = self.working_memory_updater.apply_request(memory, frame, request_resources)
         self.store.save_working_memory(memory)
-        return memory
+        return memory, created
 
     def _new_run(
         self,
@@ -167,8 +170,9 @@ class RequestLifecycleBinder:
         return run
 
     def _blocked(self, request: AgentRequest, frame: RequestFrame, reason: str | None = None, *, metadata: dict[str, object] | None = None) -> PreparedRequest:
-        issues = frame.blocking_issues or ([reason] if reason else ["请求需要澄清"])
-        blocked_frame = frame.model_copy(update={"blocking_issues": list(dict.fromkeys(issues))})
+        issues = [*frame.blocking_issues, *([reason] if reason else [])]
+        issues = list(dict.fromkeys(issue for issue in issues if issue)) or ["请求需要澄清"]
+        blocked_frame = frame.model_copy(update={"blocking_issues": issues})
         target_task = self.store.get_task(frame.target_task_id) if frame.target_task_id else None
         run = self._new_run(request, target_task, blocked_frame, metadata={"command_run": True, "blocked": True, **(metadata or {})})
         working_memory = self.store.get_working_memory(target_task.id) if target_task else None
@@ -182,25 +186,6 @@ class RequestLifecycleBinder:
             working_memory=working_memory,
             blocked_reason="；".join(blocked_frame.blocking_issues),
         )
-
-
-def _is_failed(run: Run) -> bool:
-    return run.status is RunStatus.FAILED or (bool(run.error) and run.status not in {RunStatus.WAITING_USER, RunStatus.WAITING_APPROVAL, RunStatus.CANCELLED})
-
-
-def _is_active(run: Run) -> bool:
-    return run.status in {
-        RunStatus.CREATED,
-        RunStatus.PLANNING,
-        RunStatus.RUNNING,
-        RunStatus.WAITING_TOOL,
-        RunStatus.WAITING_SUBAGENT,
-        RunStatus.WAITING_USER,
-        RunStatus.WAITING_APPROVAL,
-        RunStatus.RETRYING,
-        RunStatus.REPLANNING,
-        RunStatus.VALIDATING,
-    }
 
 
 __all__ = ["LifecycleAction", "PreparedRequest", "RequestLifecycleBinder"]

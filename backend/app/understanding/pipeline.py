@@ -27,7 +27,7 @@ class RequestUnderstandingPipeline:
     ) -> None:
         self.normalizer = normalizer or RequestNormalizer()
         self.state_loader = state_loader or StateSnapshotLoader(store)
-        self.reference_resolver = reference_resolver or ReferenceResolver()
+        self.reference_resolver = reference_resolver or ReferenceResolver(store)
         self.rule_gate = rule_gate or RuleGate()
         self.interpreter = interpreter or RequestInterpreter()
         self.validator = validator or RequestFrameValidator()

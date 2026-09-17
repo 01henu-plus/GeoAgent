@@ -160,7 +160,7 @@ class MainAgent:
         saved_working_memory = resume_state.get("working_memory")
         if task is not None and isinstance(saved_working_memory, dict):
             current_memory = self.store.get_working_memory(task.id)
-            if current_memory is not None:
+            if current_memory is not None and not prepared_request.working_memory_created:
                 working_memory = current_memory
             else:
                 restored = WorkingMemory.model_validate(saved_working_memory)
@@ -211,6 +211,8 @@ class MainAgent:
                     error="NEEDS_CLARIFICATION",
                     trace_id=run.id,
                 )
+                if task is not None:
+                    self.working_memory_updater.add_unresolved_questions(task.id, request_frame.blocking_issues, run_id=run.id)
                 run = finish_run(run, RunStatus.WAITING_USER, error=result.error)
                 self.store.save_run(run.model_copy(update={"metadata": {**run.metadata, "result": result.model_dump(mode="json")}}))
                 await self._checkpoint(run.id, "run_completed", {"status": run.status.value, "result": result.model_dump(mode="json")})
@@ -291,6 +293,9 @@ class MainAgent:
             final_status = _run_status_for_result(result.status, result.error)
             run = finish_run(self.store.get_run(run.id) or run, final_status, error=result.error)
             self.store.save_run(run.model_copy(update={"metadata": {**run.metadata, "result": result.model_dump(mode="json")}}))
+            if task is not None and result.status is AgentResultStatus.BLOCKED and result.error in {"NEEDS_CLARIFICATION", "WAITING_USER"}:
+                questions = request_frame.blocking_issues if request_frame and request_frame.blocking_issues else [result.summary]
+                self.working_memory_updater.add_unresolved_questions(task.id, questions, run_id=run.id)
             if self.memory:
                 candidates = self.memory_extractor.extract(request, request_frame, run, result)
                 self.memory.write_candidates(candidates)
@@ -425,8 +430,6 @@ class MainAgent:
         return self.model_adapter
 
     def _model_user_message(self, request: AgentRequest, run: Run, datasets, intent: IntentResult | None, plan: Plan | None, request_frame: RequestFrame | None = None, *, working_memory: WorkingMemory | None = None) -> str:
-        from app.entry.reference_resolver import ReferenceResolver
-
         history = self.store.list_messages(request.conversation_id, limit=20)
         if history and history[-1].role == "user" and history[-1].content == request.user_input:
             history = history[:-1]
@@ -448,7 +451,7 @@ class MainAgent:
         memories = self.memory.recall(request.user_input, scope="project", limit=5) if self.memory else []
         referenced_runs = [
             item.model_dump(mode="json")
-            for item in ReferenceResolver(self.store).resolve_runs(request.referenced_run_ids, conversation_id=request.conversation_id, exclude_run_id=run.id)
+            for item in self.request_understanding.reference_resolver.resolve_runs(request.referenced_run_ids, conversation_id=request.conversation_id, exclude_run_id=run.id)
         ]
         working_memory = working_memory or (self.store.get_working_memory(run.task_id) if run.task_id else None)
         context = self.context_manager.main_context(
@@ -691,12 +694,10 @@ class MainAgent:
         return None
 
     def _interpret_result(self, request: AgentRequest, run: Run) -> AgentResult:
-        from app.entry.reference_resolver import ReferenceResolver
-
         identifiers = list(request.referenced_run_ids)
         if not identifiers and any(term in request.user_input.casefold() for term in ("刚才", "上一轮", "上一次", "结果", "产物")):
             identifiers = ["latest"]
-        runs = ReferenceResolver(self.store).resolve_runs(identifiers, conversation_id=request.conversation_id, exclude_run_id=run.id)
+        runs = self.request_understanding.reference_resolver.resolve_runs(identifiers, conversation_id=request.conversation_id, exclude_run_id=run.id)
         if not runs:
             return AgentResult(agent_id="main", task_id=run.task_id, status=AgentResultStatus.BLOCKED, summary="没有找到可以解读的历史结果。", error="RUN_NOT_FOUND", trace_id=run.id)
         latest = runs[0]
@@ -720,12 +721,10 @@ class MainAgent:
         return DatasetResolver.request_resources(request, self.registry, self.store)
 
     def _diagnose_runs(self, request: AgentRequest, run: Run) -> AgentResult:
-        from app.entry.reference_resolver import ReferenceResolver
-
         identifiers = list(request.referenced_run_ids)
         if not identifiers and any(word in request.user_input.casefold() for word in ("刚才", "上一轮", "上一次", "失败", "错误", "trace")):
             identifiers = ["latest"]
-        runs = ReferenceResolver(self.store).resolve_runs(identifiers, conversation_id=request.conversation_id, exclude_run_id=run.id)
+        runs = self.request_understanding.reference_resolver.resolve_runs(identifiers, conversation_id=request.conversation_id, exclude_run_id=run.id)
         if not runs:
             return AgentResult(
                 agent_id="main",

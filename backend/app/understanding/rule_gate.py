@@ -6,10 +6,14 @@ import re
 
 from app.core.models import InteractionMode, RequestFrame, ResolvedReference, StateSnapshot
 from app.understanding.models import ReferenceResolution
+from app.understanding.patterns import (
+    is_cancel_request,
+    is_continue_request,
+    is_modify_request,
+    is_retry_request,
+    strip_modify_prefix,
+)
 
-_CANCEL_RE = re.compile(r"^(停止|取消|算了|结束任务|终止)(这个任务|当前任务|任务)?[。！!、，,]?$", re.IGNORECASE)
-_CONTINUE_RE = re.compile(r"^(继续|接着做|继续刚才的|继续上一次|沿用刚才的)(吧|做|任务|分析)?[。！!，,]?$", re.IGNORECASE)
-_RETRY_RE = re.compile(r"^(再试一次|重试|重新来|重新执行|再跑一次)[。！!，,]?$", re.IGNORECASE)
 _GREETING_RE = re.compile(r"^(你好|您好|嗨|哈喽|hello|hi|hey|在吗)[。！!，,~～ ]*$", re.IGNORECASE)
 
 _CAPABILITY_TERMS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -31,21 +35,21 @@ class RuleGate:
         lowered = compact.casefold()
         if _GREETING_RE.fullmatch(compact):
             return self._frame(InteractionMode.CHAT, compact, resolution, capabilities=["conversation"], confidence=0.99)
-        if _CANCEL_RE.fullmatch(compact):
+        if is_cancel_request(compact, strict=True):
             if not state.active_task_id:
                 return None
             return self._frame(InteractionMode.CANCEL_TASK, "取消当前任务", resolution, target_task_id=state.active_task_id, target_run_id=state.active_run_id, confidence=0.99)
-        if _CONTINUE_RE.fullmatch(compact) or _is_context_continue(lowered):
+        if is_continue_request(compact):
             if not state.active_task_id:
                 return None
             goal = state.task_goal or compact
             return self._frame(InteractionMode.CONTINUE_TASK, goal, resolution, target_task_id=state.active_task_id, target_run_id=state.active_run_id, capabilities=infer_capabilities(f"{compact} {goal}", references=resolution.references), confidence=0.98)
-        if _RETRY_RE.fullmatch(compact):
+        if is_retry_request(compact, strict=True):
             if not _has_failed_run(state):
                 return None
             return self._frame(InteractionMode.RETRY_TASK, state.task_goal or compact, resolution, target_task_id=state.active_task_id, target_run_id=_failed_run_id(state), capabilities=infer_capabilities(f"{compact} {state.task_goal or ''}", references=resolution.references), confidence=0.98)
-        if state.active_task_id and _is_modify_request(lowered):
-            constraint = _strip_modify_prefix(compact)
+        if state.active_task_id and is_modify_request(compact):
+            constraint = strip_modify_prefix(compact)
             return self._frame(InteractionMode.MODIFY_TASK, compact, resolution, constraints=[constraint] if constraint else [], target_task_id=state.active_task_id, target_run_id=state.active_run_id, capabilities=infer_capabilities(compact, references=resolution.references), confidence=0.94)
         if _is_result_query(lowered):
             return self._frame(InteractionMode.QUERY, compact, resolution, target_task_id=state.active_task_id, target_run_id=state.active_run_id, capabilities=["result_query", "artifact_read"], confidence=0.95)
@@ -77,18 +81,6 @@ def _failed_run_id(state: StateSnapshot) -> str | None:
         if run.status.value == "FAILED":
             return run.id
     return None
-
-
-def _is_modify_request(text: str) -> bool:
-    return text.startswith(("不对", "改成", "换成", "调整", "把")) and any(term in text for term in ("改", "换", "调整", "范围", "条件", "参数"))
-
-
-def _is_context_continue(text: str) -> bool:
-    return text.endswith(("继续", "接着")) and any(term in text for term in ("用", "数据", "结果", "这个", "它", "刚才"))
-
-
-def _strip_modify_prefix(message: str) -> str:
-    return re.sub(r"^(不对[，, ]*|把|改成|换成|调整[为成]?)[ ]*", "", message, flags=re.IGNORECASE).strip("，,。；; ")
 
 
 def _is_result_query(text: str) -> bool:

@@ -40,6 +40,7 @@ def test_delegated_subagents_use_parent_task_and_merge_results_into_working_memo
     assert all(item.metadata.get("subtask_id") in task.subtasks for item in child_runs)
     assert memory is not None
     assert set(result.datasets).issubset(memory.active_dataset_ids)
+    assert memory.unresolved_questions == []
 
 
 def test_subagent_receives_deep_working_memory_snapshot_without_writing_parent_memory(application):
@@ -165,7 +166,7 @@ def test_partial_subagent_delta_keeps_outputs_created_before_failure(application
     merged = updater.apply_delta(WorkingMemory(task_id="task-partial"), current)
 
     assert merged.active_dataset_ids == ["projected-dem"]
-    assert "需要补充工具输入：SLOPE_FAILED" in merged.unresolved_questions
+    assert merged.unresolved_questions == []
 
 
 def test_failed_subagent_without_outputs_does_not_add_resources(application):

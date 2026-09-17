@@ -4,8 +4,11 @@ from app.core.models import (
     AgentRequest,
     AgentResult,
     AgentResultStatus,
+    Checkpoint,
     Dataset,
     DatasetKind,
+    InteractionMode,
+    RequestFrame,
     Run,
     RunStatus,
     ToolResult,
@@ -87,6 +90,20 @@ def test_tool_result_updates_working_memory_with_dataset_and_artifact(applicatio
     assert updated.active_artifact_ids == ["artifact-a"]
     assert updated.intermediate_results[0].source_run_id == "run-wm-tool"
     assert updated.intermediate_results[0].reference_id == result.call_id
+
+
+def test_blocked_request_records_unresolved_question_only_after_clarification(application):
+    task = application.task_service.create("等待数据", conversation_id="conv-wm-clarification")
+    application.task_service.update(task, status=TaskStatus.WAITING)
+    application.store.save_run(Run(task_id=task.id, conversation_id=task.conversation_id, agent_id="main", status=RunStatus.WAITING_USER))
+    application.store.save_working_memory(WorkingMemory(task_id=task.id, conversation_id=task.conversation_id))
+
+    result = asyncio.run(application.ask(AgentRequest(user_input="用刚才的数据继续", conversation_id=task.conversation_id)))
+
+    assert result.status is AgentResultStatus.BLOCKED
+    memory = application.store.get_working_memory(task.id)
+    assert memory is not None
+    assert memory.unresolved_questions
 
 
 def test_working_memory_is_task_scoped(application):
@@ -197,3 +214,58 @@ def test_context_uses_structured_working_memory_without_run_state(application):
     assert context["working_memory"]["active_dataset_ids"] == ["dataset-context"]
     assert "run_id" not in context["working_memory"]
     assert "turn_count" not in context["working_memory"]
+
+
+def test_resume_uses_current_task_working_memory_instead_of_old_checkpoint(application):
+    task = application.task_service.create("恢复任务", conversation_id="conv-wm-resume-current")
+    old_run = Run(id="run-wm-resume-current", task_id=task.id, conversation_id=task.conversation_id, agent_id="main", status=RunStatus.CANCELLED)
+    application.store.save_run(old_run)
+    version_one = WorkingMemory(task_id=task.id, conversation_id=task.conversation_id, active_dataset_ids=["dataset-v1"])
+    application.store.save_working_memory(version_one)
+    request = AgentRequest(user_input="继续", conversation_id=task.conversation_id)
+    frame = RequestFrame(mode=InteractionMode.CONTINUE_TASK, goal="恢复任务", target_task_id=task.id, target_run_id=old_run.id, needs_planning=True)
+    checkpoint = Checkpoint(
+        run_id=old_run.id,
+        phase="plan_created",
+        state={"request": request.model_dump(mode="json"), "request_frame": frame.model_dump(mode="json"), "working_memory": version_one.model_dump(mode="json")},
+    )
+    version_two = version_one.model_copy(update={"active_dataset_ids": ["dataset-v2"]})
+    application.store.save_working_memory(version_two)
+    seen: dict[str, WorkingMemory] = {}
+
+    async def fake_model_loop(*args, **kwargs):
+        seen["memory"] = kwargs["working_memory"]
+        return AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.SUCCESS, summary="恢复完成", trace_id=args[1].id)
+
+    application.main_agent._model_loop = fake_model_loop
+    prepared = asyncio.run(application.main_agent.prepare_request(request, resume_from=checkpoint))
+    asyncio.run(application.main_agent.run(request, prepared=prepared, resume_from=checkpoint))
+
+    assert seen["memory"].active_dataset_ids == ["dataset-v2"]
+    assert application.store.get_working_memory(task.id).active_dataset_ids == ["dataset-v2"]
+
+
+def test_resume_restores_checkpoint_working_memory_when_store_is_missing(application):
+    task = application.task_service.create("恢复缺失状态", conversation_id="conv-wm-resume-fallback")
+    old_run = Run(id="run-wm-resume-fallback", task_id=task.id, conversation_id=task.conversation_id, agent_id="main", status=RunStatus.CANCELLED)
+    application.store.save_run(old_run)
+    version_one = WorkingMemory(task_id=task.id, conversation_id=task.conversation_id, active_dataset_ids=["dataset-checkpoint"])
+    request = AgentRequest(user_input="继续", conversation_id=task.conversation_id)
+    frame = RequestFrame(mode=InteractionMode.CONTINUE_TASK, goal="恢复缺失状态", target_task_id=task.id, target_run_id=old_run.id, needs_planning=True)
+    checkpoint = Checkpoint(
+        run_id=old_run.id,
+        phase="plan_created",
+        state={"request": request.model_dump(mode="json"), "request_frame": frame.model_dump(mode="json"), "working_memory": version_one.model_dump(mode="json")},
+    )
+    seen: dict[str, WorkingMemory] = {}
+
+    async def fake_model_loop(*args, **kwargs):
+        seen["memory"] = kwargs["working_memory"]
+        return AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.SUCCESS, summary="恢复完成", trace_id=args[1].id)
+
+    application.main_agent._model_loop = fake_model_loop
+    prepared = asyncio.run(application.main_agent.prepare_request(request, resume_from=checkpoint))
+    asyncio.run(application.main_agent.run(request, prepared=prepared, resume_from=checkpoint))
+
+    assert seen["memory"].active_dataset_ids == ["dataset-checkpoint"]
+    assert application.store.get_working_memory(task.id).active_dataset_ids == ["dataset-checkpoint"]

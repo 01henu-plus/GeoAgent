@@ -10,6 +10,12 @@ from app.core.models import AgentRequest, Dataset, InteractionMode, RequestFrame
 from app.decision.intent import IntentResolver
 from app.models import ModelAdapter, ModelRequest
 from app.understanding.models import ReferenceResolution
+from app.understanding.patterns import (
+    is_cancel_request,
+    is_continue_request,
+    is_modify_request,
+    is_retry_request,
+)
 from app.understanding.rule_gate import infer_capabilities
 
 logger = logging.getLogger(__name__)
@@ -109,22 +115,22 @@ class RequestInterpreter:
             target_task_id = None
             target_run_id = None
             confidence = 0.99
-        elif _looks_like_cancel(lowered):
+        elif is_cancel_request(lowered):
             mode = InteractionMode.CANCEL_TASK
             target_task_id = state.active_task_id
             target_run_id = state.active_run_id
             confidence = 0.85 if state.active_task_id else 0.35
-        elif _looks_like_retry(lowered):
+        elif is_retry_request(lowered):
             mode = InteractionMode.RETRY_TASK
             target_run_id = _failed_run_id(state)
             confidence = 0.85 if target_run_id else 0.35
-        elif _looks_like_continue(lowered):
+        elif is_continue_request(lowered):
             mode = InteractionMode.CONTINUE_TASK
             target_task_id = state.active_task_id
             target_run_id = state.active_run_id
             goal = message if message.strip() != "继续" else (state.task_goal or message)
             confidence = 0.85 if state.active_task_id else 0.35
-        elif _looks_like_modify(lowered) and state.active_task_id:
+        elif is_modify_request(lowered) and state.active_task_id:
             mode = InteractionMode.MODIFY_TASK
             target_task_id = state.active_task_id
             target_run_id = state.active_run_id
@@ -161,22 +167,6 @@ def _strip_code_fence(content: str) -> str:
     if value.startswith("```"):
         value = re.sub(r"^```(?:json)?\s*|\s*```$", "", value, flags=re.IGNORECASE | re.DOTALL)
     return value.strip()
-
-
-def _looks_like_cancel(text: str) -> bool:
-    return text.startswith(("停止", "取消", "算了", "结束任务", "终止"))
-
-
-def _looks_like_retry(text: str) -> bool:
-    return text.startswith(("再试一次", "重试", "重新来", "重新执行", "再跑一次"))
-
-
-def _looks_like_continue(text: str) -> bool:
-    return text == "继续" or text.startswith(("继续", "接着", "沿用刚才")) or (text.endswith(("继续", "接着")) and any(term in text for term in ("用", "数据", "结果", "这个", "它", "刚才")))
-
-
-def _looks_like_modify(text: str) -> bool:
-    return text.startswith(("不对", "把", "改成", "换成", "调整")) and any(term in text for term in ("改", "换", "调整", "范围", "条件", "参数"))
 
 
 def _failed_run_id(state: StateSnapshot) -> str | None:
