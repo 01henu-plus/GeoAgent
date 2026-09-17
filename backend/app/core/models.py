@@ -1,0 +1,441 @@
+"""GeoAgent 的领域模型。
+
+这些模型描述 GIS Agent 的事实边界：请求、任务、运行、工具结果、数据集、
+产物和追踪事件。执行器只接受/返回这些结构化对象，避免把异常字符串直接
+当成成功结果交给上层 Agent。
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any
+from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def new_id(prefix: str) -> str:
+    """生成可读且不会依赖数据库自增的领域 ID。"""
+
+    return f"{prefix}_{uuid4().hex[:12]}"
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True, protected_namespaces=(), populate_by_name=True, serialize_by_alias=True)
+
+
+class DatasetKind(StrEnum):
+    VECTOR = "VECTOR"
+    RASTER = "RASTER"
+    TABLE = "TABLE"
+    POINT_CLOUD = "POINT_CLOUD"
+    TRAJECTORY = "TRAJECTORY"
+    NETWORK = "NETWORK"
+    SERVICE = "SERVICE"
+
+
+class TaskStatus(StrEnum):
+    PENDING = "PENDING"
+    READY = "READY"
+    RUNNING = "RUNNING"
+    WAITING = "WAITING"
+    SUCCEEDED = "SUCCEEDED"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+    BLOCKED = "BLOCKED"
+    CANCELLED = "CANCELLED"
+
+
+class RunStatus(StrEnum):
+    CREATED = "CREATED"
+    PLANNING = "PLANNING"
+    RUNNING = "RUNNING"
+    WAITING_TOOL = "WAITING_TOOL"
+    WAITING_SUBAGENT = "WAITING_SUBAGENT"
+    WAITING_USER = "WAITING_USER"
+    WAITING_APPROVAL = "WAITING_APPROVAL"
+    RETRYING = "RETRYING"
+    REPLANNING = "REPLANNING"
+    VALIDATING = "VALIDATING"
+    COMPLETED = "COMPLETED"
+    PARTIAL_COMPLETED = "PARTIAL_COMPLETED"
+    FAILED = "FAILED"
+    INTERRUPTED = "INTERRUPTED"
+    CANCELLED = "CANCELLED"
+    BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
+
+
+class IntentType(StrEnum):
+    DATA_INSPECTION = "DATA_INSPECTION"
+    SPATIAL_ANALYSIS = "SPATIAL_ANALYSIS"
+    DATA_TRANSFORMATION = "DATA_TRANSFORMATION"
+    RESULT_INTERPRETATION = "RESULT_INTERPRETATION"
+    CODE_TASK = "CODE_TASK"
+    RUN_DIAGNOSIS = "RUN_DIAGNOSIS"
+    KNOWLEDGE_QUERY = "KNOWLEDGE_QUERY"
+    UNKNOWN = "UNKNOWN"
+
+
+class DecisionType(StrEnum):
+    TOOL = "TOOL"
+    DELEGATE = "DELEGATE"
+    REPLAN = "REPLAN"
+    ASK_USER = "ASK_USER"
+    FINAL = "FINAL"
+    ABORT = "ABORT"
+
+
+class ToolStatus(StrEnum):
+    SUCCESS = "SUCCESS"
+    PARTIAL_SUCCESS = "PARTIAL_SUCCESS"
+    FAILED = "FAILED"
+    BLOCKED = "BLOCKED"
+    CANCELLED = "CANCELLED"
+    UNKNOWN = "UNKNOWN"
+
+
+class ErrorCategory(StrEnum):
+    INPUT = "INPUT"
+    CRS = "CRS"
+    GEOMETRY = "GEOMETRY"
+    DATA = "DATA"
+    RASTER = "RASTER"
+    RESOURCE = "RESOURCE"
+    PERMISSION = "PERMISSION"
+    EXECUTION = "EXECUTION"
+    EXTERNAL = "EXTERNAL"
+    UNKNOWN = "UNKNOWN"
+
+
+class FailureAction(StrEnum):
+    RETRY = "RETRY"
+    REPAIR = "REPAIR"
+    REPLAN = "REPLAN"
+    ASK_USER = "ASK_USER"
+    ABORT = "ABORT"
+
+
+class RiskLevel(StrEnum):
+    READ = "READ"
+    WRITE = "WRITE"
+    DESTRUCTIVE = "DESTRUCTIVE"
+    EXTERNAL = "EXTERNAL"
+
+
+class AgentResultStatus(StrEnum):
+    SUCCESS = "SUCCESS"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+    BLOCKED = "BLOCKED"
+    CANCELLED = "CANCELLED"
+
+
+class ArtifactKind(StrEnum):
+    DATASET = "DATASET"
+    MAP = "MAP"
+    REPORT = "REPORT"
+    TABLE = "TABLE"
+    LOG = "LOG"
+    OTHER = "OTHER"
+
+
+class CRSInfo(StrictModel):
+    authority: str | None = None
+    name: str | None = None
+    is_geographic: bool = False
+    linear_unit: str | None = None
+
+
+class BoundingBox(StrictModel):
+    min_x: float
+    min_y: float
+    max_x: float
+    max_y: float
+
+    @field_validator("max_x")
+    @classmethod
+    def max_x_not_before_min_x(cls, value: float, info: Any) -> float:
+        if "min_x" in info.data and value < info.data["min_x"]:
+            raise ValueError("max_x must be >= min_x")
+        return value
+
+    @field_validator("max_y")
+    @classmethod
+    def max_y_not_before_min_y(cls, value: float, info: Any) -> float:
+        if "min_y" in info.data and value < info.data["min_y"]:
+            raise ValueError("max_y must be >= min_y")
+        return value
+
+
+class DatasetSchema(StrictModel):
+    fields: dict[str, str] = Field(default_factory=dict)
+    geometry_type: str | None = None
+    feature_count: int | None = Field(default=None, ge=0)
+    width: int | None = Field(default=None, ge=0)
+    height: int | None = Field(default=None, ge=0)
+    bands: int | None = Field(default=None, ge=0)
+    resolution: tuple[float, float] | None = None
+    nodata: float | int | None = None
+    invalid_geometry_count: int | None = Field(default=None, ge=0)
+
+
+class Dataset(StrictModel):
+    id: str = Field(default_factory=lambda: new_id("ds"))
+    name: str
+    kind: DatasetKind
+    path: str
+    format: str
+    crs: CRSInfo | None = None
+    extent: BoundingBox | None = None
+    schema_: DatasetSchema | None = Field(default=None, alias="schema")
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    source_dataset_ids: list[str] = Field(default_factory=list)
+    created_by_run_id: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("name", "path", "format")
+    @classmethod
+    def required_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("dataset text fields cannot be empty")
+        return value
+
+    @property
+    def schema(self) -> DatasetSchema | None:
+        return self.schema_
+
+    def model_dump(self, *args, **kwargs):
+        kwargs.setdefault("by_alias", True)
+        return super().model_dump(*args, **kwargs)
+
+    def model_dump_json(self, *args, **kwargs):
+        kwargs.setdefault("by_alias", True)
+        return super().model_dump_json(*args, **kwargs)
+
+
+class Artifact(StrictModel):
+    id: str = Field(default_factory=lambda: new_id("art"))
+    name: str
+    kind: ArtifactKind
+    path: str | None = None
+    media_type: str | None = None
+    dataset_id: str | None = None
+    run_id: str | None = None
+    description: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class AgentRequest(StrictModel):
+    request_id: str = Field(default_factory=lambda: new_id("req"))
+    conversation_id: str = Field(default_factory=lambda: new_id("conv"))
+    user_input: str
+    dataset_ids: list[str] = Field(default_factory=list)
+    attachment_ids: list[str] = Field(default_factory=list)
+    referenced_run_ids: list[str] = Field(default_factory=list)
+    model_profile: str | None = None
+    context: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("user_input")
+    @classmethod
+    def non_empty_input(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("user_input cannot be empty")
+        return value
+
+
+class Task(StrictModel):
+    id: str = Field(default_factory=lambda: new_id("task"))
+    goal: str
+    status: TaskStatus = TaskStatus.PENDING
+    subtasks: list[str] = Field(default_factory=list)
+    result: str | None = None
+    conversation_id: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class SubTask(StrictModel):
+    id: str = Field(default_factory=lambda: new_id("sub"))
+    goal: str
+    description: str
+    operation: str | None = None
+    dataset_ids: list[str] = Field(default_factory=list)
+    dependencies: list[str] = Field(default_factory=list)
+    parallelizable: bool = True
+    required: bool = True
+    assigned_agent_id: str | None = None
+    failure_policy: str = "continue_if_optional"
+    status: TaskStatus = TaskStatus.PENDING
+
+
+class ToolMetadata(StrictModel):
+    name: str
+    description: str
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    deterministic: bool = True
+    idempotent: bool = True
+    risk_level: RiskLevel = RiskLevel.READ
+    supports_retry: bool = False
+    produces_dataset: bool = False
+    produces_artifact: bool = False
+    tags: list[str] = Field(default_factory=list)
+
+
+class ToolCall(StrictModel):
+    id: str = Field(default_factory=lambda: new_id("call"))
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    run_id: str | None = None
+    agent_id: str | None = None
+    attempt: int = Field(default=1, ge=1)
+
+
+class ToolError(StrictModel):
+    code: str
+    category: ErrorCategory = ErrorCategory.UNKNOWN
+    message: str
+    retryable: bool = False
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolResult(StrictModel):
+    call_id: str
+    status: ToolStatus
+    output: Any = None
+    error: ToolError | None = None
+    warnings: list[str] = Field(default_factory=list)
+    datasets: list[str] = Field(default_factory=list)
+    artifacts: list[str] = Field(default_factory=list)
+    retryable: bool = False
+    duration_ms: float = Field(default=0.0, ge=0.0)
+
+
+class AgentDecision(StrictModel):
+    type: DecisionType
+    reasoning_summary: str
+    tool_call: ToolCall | None = None
+    subtasks: list[SubTask] = Field(default_factory=list)
+    final_response: str | None = None
+
+
+class AgentResult(StrictModel):
+    agent_id: str
+    task_id: str
+    status: AgentResultStatus
+    summary: str
+    findings: list[Any] = Field(default_factory=list)
+    datasets: list[str] = Field(default_factory=list)
+    artifacts: list[str] = Field(default_factory=list)
+    evidence: list[Any] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    error: str | None = None
+    trace_id: str
+
+
+class Run(StrictModel):
+    id: str = Field(default_factory=lambda: new_id("run"))
+    parent_run_id: str | None = None
+    conversation_id: str | None = None
+    task_id: str
+    agent_id: str
+    status: RunStatus = RunStatus.CREATED
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    error: str | None = None
+    turn_count: int = 0
+    tool_call_count: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class Checkpoint(StrictModel):
+    id: str = Field(default_factory=lambda: new_id("cp"))
+    run_id: str
+    phase: str
+    state: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class TraceEvent(StrictModel):
+    id: str = Field(default_factory=lambda: new_id("evt"))
+    run_id: str
+    event_type: str
+    message: str = ""
+    payload: dict[str, Any] = Field(default_factory=dict)
+    sequence: int = 0
+    timestamp: datetime = Field(default_factory=utc_now)
+    agent_id: str | None = None
+
+
+class Conversation(StrictModel):
+    id: str = Field(default_factory=lambda: new_id("conv"))
+    title: str = "新对话"
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class Message(StrictModel):
+    id: str = Field(default_factory=lambda: new_id("msg"))
+    conversation_id: str
+    role: str
+    content: str
+    run_id: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class MemoryItem(StrictModel):
+    id: str = Field(default_factory=lambda: new_id("mem"))
+    scope: str = "project"
+    key: str
+    value: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class RunBudget(StrictModel):
+    max_agent_turns: int = Field(default=20, ge=1)
+    max_tool_calls: int = Field(default=40, ge=1)
+    max_retry_per_action: int = Field(default=2, ge=0)
+    max_subagents: int = Field(default=5, ge=0)
+    max_parallel_agents: int = Field(default=3, ge=1)
+    max_tokens: int = Field(default=1200, ge=1)
+    max_execution_seconds: int = Field(default=300, ge=1)
+
+
+class IntentResult(StrictModel):
+    intent: IntentType
+    confidence: float = Field(ge=0, le=1)
+    entities: dict[str, Any] = Field(default_factory=dict)
+    rationale: str = ""
+
+
+class PlanStep(StrictModel):
+    id: str = Field(default_factory=lambda: new_id("step"))
+    title: str
+    action: str
+    depends_on: list[str] = Field(default_factory=list)
+    tool_name: str | None = None
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    required: bool = True
+    description: str = ""
+    status: TaskStatus = TaskStatus.PENDING
+
+
+class Plan(StrictModel):
+    id: str = Field(default_factory=lambda: new_id("plan"))
+    goal: str
+    intent: IntentType
+    steps: list[PlanStep] = Field(default_factory=list)
+    revision: int = 1
+    clarification: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+__all__ = [name for name in globals() if not name.startswith("_")]

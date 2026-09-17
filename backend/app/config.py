@@ -1,0 +1,40 @@
+"""GeoAgent 配置。"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ENV_FILE = PROJECT_ROOT / "backend" / ".env"
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="GEOAGENT_", env_file=ENV_FILE, extra="ignore", protected_namespaces=())
+
+    root: Path = Field(default=PROJECT_ROOT)
+    database: Path = Field(default=Path("state/geoagent.sqlite3"))
+    workspace: Path = Field(default=Path("workspace"))
+    default_crs: str = "EPSG:3857"
+    max_agent_turns: int = Field(default=20, ge=1)
+    max_tool_calls: int = Field(default=40, ge=1)
+    max_retries: int = Field(default=2, ge=0)
+    max_subagents: int = Field(default=5, ge=0)
+    max_parallel_agents: int = Field(default=3, ge=1)
+    max_tokens: int = Field(default=1200, ge=1)
+    max_execution_seconds: int = Field(default=300, ge=1)
+    tool_timeout_seconds: int = Field(default=120, ge=1)
+    model_profiles: str | None = None
+
+    @property
+    def database_path(self) -> Path:
+        return self._absolute(self.database)
+
+    @property
+    def workspace_path(self) -> Path:
+        return self._absolute(self.workspace)
+
+    def _absolute(self, value: Path) -> Path:
+        return value if value.is_absolute() else (self.root / value).resolve()
