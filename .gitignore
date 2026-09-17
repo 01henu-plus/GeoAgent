@@ -32,3 +32,6 @@ workspace/
 
 # Local project design notes are kept outside the source repository.
 docs/
+
+# The project design README stays local until the project is complete.
+README.md
