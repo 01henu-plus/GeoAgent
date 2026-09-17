@@ -172,7 +172,7 @@ def _looks_like_retry(text: str) -> bool:
 
 
 def _looks_like_continue(text: str) -> bool:
-    return text == "继续" or text.startswith(("继续", "接着", "沿用刚才"))
+    return text == "继续" or text.startswith(("继续", "接着", "沿用刚才")) or (text.endswith(("继续", "接着")) and any(term in text for term in ("用", "数据", "结果", "这个", "它", "刚才")))
 
 
 def _looks_like_modify(text: str) -> bool:

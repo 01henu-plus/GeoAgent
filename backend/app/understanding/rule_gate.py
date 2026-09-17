@@ -35,7 +35,7 @@ class RuleGate:
             if not state.active_task_id:
                 return None
             return self._frame(InteractionMode.CANCEL_TASK, "取消当前任务", resolution, target_task_id=state.active_task_id, target_run_id=state.active_run_id, confidence=0.99)
-        if _CONTINUE_RE.fullmatch(compact):
+        if _CONTINUE_RE.fullmatch(compact) or _is_context_continue(lowered):
             if not state.active_task_id:
                 return None
             goal = state.task_goal or compact
@@ -81,6 +81,10 @@ def _failed_run_id(state: StateSnapshot) -> str | None:
 
 def _is_modify_request(text: str) -> bool:
     return text.startswith(("不对", "改成", "换成", "调整", "把")) and any(term in text for term in ("改", "换", "调整", "范围", "条件", "参数"))
+
+
+def _is_context_continue(text: str) -> bool:
+    return text.endswith(("继续", "接着")) and any(term in text for term in ("用", "数据", "结果", "这个", "它", "刚才"))
 
 
 def _strip_modify_prefix(message: str) -> str:

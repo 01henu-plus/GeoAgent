@@ -6,6 +6,7 @@ from app.core.models import (
     InteractionMode,
     RequestFrame,
     RequestResolutionStatus,
+    RequestResources,
     ResolvedReference,
     RunStatus,
     StateSnapshot,
@@ -13,15 +14,15 @@ from app.core.models import (
 
 
 class RequestFrameValidator:
-    def validate(self, frame: RequestFrame, state: StateSnapshot) -> RequestFrame:
+    def validate(self, frame: RequestFrame, state: StateSnapshot, resources: RequestResources | None = None) -> RequestFrame:
         unresolved = list(frame.unresolved_references)
         blocking: list[str] = list(frame.blocking_issues)
         valid_references: list[ResolvedReference] = []
         known = {
             "task": set(state.known_task_ids),
-            "run": set(state.known_run_ids),
+            "run": set(state.known_run_ids) | ({item.id for item in resources.runs} if resources else set()),
             "artifact": set(state.known_artifact_ids),
-            "dataset": set(state.known_dataset_ids),
+            "dataset": set(state.known_dataset_ids) | ({item.id for item in resources.datasets} if resources else set()),
         }
         for reference in frame.references:
             if reference.target_id and reference.target_id in known.get(reference.type, set()):
