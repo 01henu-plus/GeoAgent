@@ -22,8 +22,8 @@ dist/
 frontend/tsconfig.tsbuildinfo
 
 # Local runtime state and generated GIS data.
-state/
-workspace/
+/state/
+/workspace/
 
 # Local editor and agent metadata.
 .idea/
