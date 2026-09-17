@@ -88,12 +88,14 @@ class RequestLifecycleBinder:
             if target_task is None:
                 return self._blocked(request, frame, "没有找到要继续或修改的任务", metadata=metadata)
             task = self.task_service.update(target_task, status=TaskStatus.RUNNING)
+            lineage = dict(metadata or {})
+            if target_run is not None:
+                lineage["continued_from"] = target_run.id
             run = self._new_run(
                 request,
                 task,
                 frame,
-                parent_run_id=target_run.id if target_run else None,
-                metadata=metadata,
+                metadata=lineage,
             )
             return PreparedRequest(request=request, frame=frame, action=LifecycleAction.BIND_TASK, task=task, run=run, target_task=target_task, target_run=target_run)
 
@@ -104,7 +106,7 @@ class RequestLifecycleBinder:
             if task is None:
                 return self._blocked(request, frame, "失败运行没有关联任务", metadata=metadata)
             task = self.task_service.update(task, status=TaskStatus.RUNNING)
-            run = self._new_run(request, task, frame, parent_run_id=target_run.id, metadata={"retry_of": target_run.id, **(metadata or {})})
+            run = self._new_run(request, task, frame, metadata={"retry_of": target_run.id, **(metadata or {})})
             return PreparedRequest(request=request, frame=frame, action=LifecycleAction.RETRY_RUN, task=task, run=run, target_task=task, target_run=target_run)
 
         if frame.mode is InteractionMode.CANCEL_TASK:
@@ -122,7 +124,6 @@ class RequestLifecycleBinder:
         task: Task | None,
         frame: RequestFrame,
         *,
-        parent_run_id: str | None = None,
         metadata: dict[str, object] | None = None,
     ) -> Run:
         run_metadata: dict[str, Any] = {
@@ -136,7 +137,6 @@ class RequestLifecycleBinder:
             Run(
                 conversation_id=request.conversation_id,
                 task_id=task.id if task else None,
-                parent_run_id=parent_run_id,
                 agent_id="main",
                 metadata=run_metadata,
             )

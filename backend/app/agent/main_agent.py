@@ -21,6 +21,7 @@ from app.core.models import (
     InteractionMode,
     Plan,
     RequestFrame,
+    RequestResources,
     Run,
     RunBudget,
     RunStatus,
@@ -123,6 +124,7 @@ class MainAgent:
         if isinstance(resume_state.get("request"), dict):
             request = AgentRequest.model_validate(resume_state["request"])
         datasets = self._resolve_datasets(request)
+        request_resources = self._resolve_request_resources(request)
         saved_frame = resume_state.get("request_frame")
         if isinstance(saved_frame, dict):
             frame = RequestFrame.model_validate(saved_frame)
@@ -131,6 +133,7 @@ class MainAgent:
                 request.conversation_id,
                 request.user_input,
                 request=request,
+                request_resources=request_resources,
                 datasets=datasets,
                 model_adapter=self._model_adapter_for(request),
             )
@@ -709,6 +712,11 @@ class MainAgent:
         from app.entry.dataset_resolver import DatasetResolver
 
         return DatasetResolver().resolve(request, self.registry, store=self.store)
+
+    def _resolve_request_resources(self, request: AgentRequest) -> RequestResources:
+        from app.entry.dataset_resolver import DatasetResolver
+
+        return DatasetResolver.request_resources(request, self.registry, self.store)
 
     def _diagnose_runs(self, request: AgentRequest, run: Run) -> AgentResult:
         from app.entry.reference_resolver import ReferenceResolver
