@@ -47,7 +47,7 @@ def test_waiting_for_a_run_is_idempotent_for_assistant_messages(application):
 
     async def run_case():
         request = AgentRequest(user_input="检查 roads", conversation_id="conversation-idempotent", dataset_ids=[ids["roads"]])
-        run = application.conversations.submit(request)
+        run = await application.conversations.submit(request)
         first = await application.conversations.wait(run.id)
         second = await application.conversations.wait(run.id)
         return first, second

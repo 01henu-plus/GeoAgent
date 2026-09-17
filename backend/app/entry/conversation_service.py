@@ -30,16 +30,14 @@ class ConversationService:
         return self.store.delete_conversation(conversation_id)
 
     async def ask(self, request: AgentRequest) -> AgentResult:
-        self._save_user_message(request)
-        result = await self.main_agent.run(request)
-        self._save_assistant_message(request, result)
-        return result
+        run = await self.submit(request)
+        return await self.wait(run.id)
 
-    def submit(self, request: AgentRequest, *, on_model_delta: Callable[[str], Awaitable[None]] | None = None) -> Run:
+    async def submit(self, request: AgentRequest, *, on_model_delta: Callable[[str], Awaitable[None]] | None = None) -> Run:
         if self.run_manager is None:
             raise RuntimeError("ConversationService 未配置 RunManager")
         self._save_user_message(request)
-        return self.run_manager.submit(request, on_model_delta=on_model_delta)
+        return await self.run_manager.submit(request, on_model_delta=on_model_delta)
 
     async def wait(self, run_id: str) -> AgentResult:
         if self.run_manager is None:

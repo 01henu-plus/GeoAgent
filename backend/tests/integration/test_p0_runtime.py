@@ -195,7 +195,7 @@ def test_run_manager_cancels_active_run(application):
     request = AgentRequest(user_input="等待取消", conversation_id="conv_cancel")
 
     async def run_case():
-        run = application.conversations.submit(request)
+        run = await application.conversations.submit(request)
         await asyncio.sleep(0)
         assert await application.run_manager.cancel(run.id)
         return run.id, await application.run_manager.wait(run.id)

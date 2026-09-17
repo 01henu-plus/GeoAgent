@@ -118,7 +118,7 @@ def create_app(application: Application | None = None) -> FastAPI:
     async def create_run(body: AskBody) -> dict[str, Any]:
         request = _request_from_body(body)
         try:
-            run = geoagent.conversations.submit(request)
+            run = await geoagent.conversations.submit(request)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return run.model_dump(mode="json")
@@ -249,7 +249,7 @@ def create_app(application: Application | None = None) -> FastAPI:
         has_model_context = isinstance(checkpoint.state.get("messages"), list) and bool(checkpoint.state["messages"])
         if not has_saved_plan and not has_model_context:
             raise HTTPException(status_code=409, detail="checkpoint 还没有可恢复的上下文")
-        run = geoagent.run_manager.submit(request, resume_from=checkpoint, metadata={"resumed_from": run_id})
+        run = await geoagent.run_manager.submit(request, resume_from=checkpoint, metadata={"resumed_from": run_id})
         result = await geoagent.conversations.wait(run.id)
         return {"resumed_from": run_id, "run_id": run.id, "checkpoint": checkpoint.id, "result": result.model_dump(mode="json")}
 
@@ -280,7 +280,7 @@ def create_app(application: Application | None = None) -> FastAPI:
                 async def on_model_delta(content: str) -> None:
                     event_queue.put_nowait(("delta", content))
 
-                run = geoagent.conversations.submit(request, on_model_delta=on_model_delta)
+                run = await geoagent.conversations.submit(request, on_model_delta=on_model_delta)
 
                 geoagent.bus.subscribe(on_event)
                 waiter = asyncio.create_task(geoagent.conversations.wait(run.id))
