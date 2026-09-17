@@ -11,6 +11,7 @@ from app.core.models import (
     RequestFrame,
     Run,
     RunStatus,
+    TaskStatus,
     ToolResult,
     ToolStatus,
     WorkingMemory,
