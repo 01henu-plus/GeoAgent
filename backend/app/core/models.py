@@ -147,6 +147,14 @@ class AgentResultStatus(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class RequestResolutionStatus(StrEnum):
+    """RequestFrame 的状态解析结果，不等同于模型置信度。"""
+
+    RESOLVED = "resolved"
+    NEEDS_CLARIFICATION = "needs_clarification"
+    INVALID = "invalid"
+
+
 class ArtifactKind(StrEnum):
     DATASET = "DATASET"
     MAP = "MAP"
@@ -340,7 +348,7 @@ class AgentDecision(StrictModel):
 
 class AgentResult(StrictModel):
     agent_id: str
-    task_id: str
+    task_id: str | None = None
     status: AgentResultStatus
     summary: str
     findings: list[Any] = Field(default_factory=list)
@@ -356,7 +364,7 @@ class Run(StrictModel):
     id: str = Field(default_factory=lambda: new_id("run"))
     parent_run_id: str | None = None
     conversation_id: str | None = None
-    task_id: str
+    task_id: str | None = None
     agent_id: str
     status: RunStatus = RunStatus.CREATED
     started_at: datetime | None = None
@@ -457,6 +465,8 @@ class RequestFrame(StrictModel):
     needs_tool: bool = False
     unresolved_references: list[str] = Field(default_factory=list)
     confidence: float = Field(default=1.0, ge=0, le=1)
+    resolution_status: RequestResolutionStatus = RequestResolutionStatus.RESOLVED
+    blocking_issues: list[str] = Field(default_factory=list)
 
 
 class RunBudget(StrictModel):
