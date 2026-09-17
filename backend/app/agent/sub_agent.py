@@ -17,9 +17,12 @@ from app.core.models import (
     Run,
     RunBudget,
     RunStatus,
+    SubAgentExecutionResult,
     SubTask,
     ToolCall,
     ToolStatus,
+    WorkingMemory,
+    WorkingMemoryDelta,
     new_id,
 )
 from app.events import EventType
@@ -30,7 +33,7 @@ from app.observability import TraceRecorder
 from app.runtime.budget import BudgetExceeded, BudgetGuard
 from app.runtime.context_manager import ContextManager
 from app.runtime.lifecycle import finish_run, start_run
-from app.state import StateStore
+from app.state import StateStore, WorkingMemoryUpdater
 
 
 class SubAgent:
@@ -42,32 +45,57 @@ class SubAgent:
         self.budget = budget or RunBudget(max_agent_turns=10)
         self.guard = BudgetGuard(self.budget)
 
-    async def run(self, request: AgentRequest, subtask: SubTask, datasets: list[Dataset], *, parent_run_id: str) -> AgentResult:
+    async def run(
+        self,
+        request: AgentRequest,
+        subtask: SubTask,
+        datasets: list[Dataset],
+        *,
+        parent_task_id: str,
+        parent_run_id: str,
+        working_memory_snapshot: WorkingMemory | None,
+    ) -> SubAgentExecutionResult:
         agent_id = new_id("subagent")
-        task_id = new_id("subtask")
-        run = start_run(Run(parent_run_id=parent_run_id, conversation_id=request.conversation_id, task_id=task_id, agent_id=agent_id, metadata={"goal": subtask.goal}))
+        run = start_run(
+            Run(
+                parent_run_id=parent_run_id,
+                conversation_id=request.conversation_id,
+                task_id=parent_task_id,
+                agent_id=agent_id,
+                metadata={"goal": subtask.goal, "subtask_id": subtask.id, "subtask_goal": subtask.goal},
+            )
+        )
         self.store.save_run(run)
         await self.trace.emit(parent_run_id, EventType.SUBAGENT_SPAWNED, f"启动 {subtask.goal}", payload={"agent_id": agent_id, "subtask_id": subtask.id}, agent_id=agent_id)
         selected = _dataset_for_subtask(subtask, datasets)
         local_datasets = [selected] if selected is not None else []
         allowed_tools = _allowed_tools(subtask)
-        local = self.context_manager.sub_context(request, subtask.model_dump(mode="json"), local_datasets, allowed_tools=allowed_tools)
+        snapshot = working_memory_snapshot.model_copy(deep=True) if working_memory_snapshot is not None else None
+        local = self.context_manager.sub_context(request, subtask.model_dump(mode="json"), local_datasets, working_memory=snapshot, allowed_tools=allowed_tools)
         findings: list[Any] = [{"scope": "subtask", "goal": subtask.goal, "context_dataset_count": len(local["datasets"])}]
         result_datasets: list[str] = []
         warnings: list[str] = []
         errors: list[str] = []
         budget_exceeded = False
+        updater = WorkingMemoryUpdater(self.store)
+        delta = WorkingMemoryDelta(source_run_id=run.id)
+
+        def record(tool_result):
+            nonlocal delta
+            delta = updater.merge_delta(delta, updater.build_delta_from_tool_result(tool_result, run_id=run.id))
+            return tool_result
+
         try:
             self.guard.check_execution_time(run)
             if selected is None:
                 raise ValueError("没有可用于该 SubTask 的数据集。")
-            inspect = await self._call(run, "dataset.inspect", {"dataset_id": selected.id})
+            inspect = record(await self._call(run, "dataset.inspect", {"dataset_id": selected.id}))
             if inspect.status not in {ToolStatus.SUCCESS, ToolStatus.PARTIAL_SUCCESS}:
                 raise RuntimeError(inspect.error.message if inspect.error else "数据检查失败")
             findings.append({"dataset": selected.name, "inspection": inspect.output})
             result_datasets.append(selected.id)
             if subtask.operation == "vector.validate" or "road" in subtask.goal.casefold() or "道路" in subtask.goal:
-                validation = await self._call(run, "vector.validate", {"dataset_id": selected.id})
+                validation = record(await self._call(run, "vector.validate", {"dataset_id": selected.id}))
                 if validation.status not in {ToolStatus.SUCCESS, ToolStatus.PARTIAL_SUCCESS}:
                     raise RuntimeError(validation.error.message if validation.error else "道路质量检查失败")
                 findings.append({"road_quality": validation.output})
@@ -75,14 +103,14 @@ class SubAgent:
             elif subtask.operation == "raster.slope" or "terrain" in subtask.goal.casefold() or any(word in subtask.goal for word in ("地形", "坡度", "DEM")):
                 if selected.kind.value != "RASTER":
                     raise ValueError("terrain SubTask 需要 Raster DEM。")
-                slope = await self._call(run, "raster.slope", {"dataset_id": selected.id})
+                slope = record(await self._call(run, "raster.slope", {"dataset_id": selected.id}))
                 if slope.status is ToolStatus.FAILED and slope.error and slope.error.code == "CRS_UNIT_MISMATCH":
                     target_crs = CRSService(default_crs=self.executor.services["settings"].default_crs).choose_projected_crs(selected)
-                    projected = await self._call(run, "crs.reproject", {"dataset_id": selected.id, "target_crs": target_crs})
+                    projected = record(await self._call(run, "crs.reproject", {"dataset_id": selected.id, "target_crs": target_crs}))
                     if projected.status is not ToolStatus.SUCCESS or not projected.datasets:
                         raise RuntimeError(projected.error.message if projected.error else "DEM 重投影失败")
                     result_datasets.extend(projected.datasets)
-                    slope = await self._call(run, "raster.slope", {"dataset_id": projected.datasets[0]})
+                    slope = record(await self._call(run, "raster.slope", {"dataset_id": projected.datasets[0]}))
                 if slope.status not in {ToolStatus.SUCCESS, ToolStatus.PARTIAL_SUCCESS}:
                     raise RuntimeError(slope.error.message if slope.error else "坡度计算失败")
                 result_datasets.extend(slope.datasets)
@@ -105,7 +133,7 @@ class SubAgent:
             errors.append(error.message)
         status = AgentResultStatus.BLOCKED if budget_exceeded else AgentResultStatus.FAILED if errors and not findings[1:] else AgentResultStatus.PARTIAL if errors else AgentResultStatus.SUCCESS
         summary = f"{subtask.goal}：{'因预算限制停止' if budget_exceeded else '完成' if status is AgentResultStatus.SUCCESS else '部分完成' if status is AgentResultStatus.PARTIAL else '失败'}"
-        final = AgentResult(agent_id=agent_id, task_id=task_id, status=status, summary=summary, findings=findings, datasets=result_datasets, warnings=warnings, error="；".join(errors) if errors else None, trace_id=run.id, evidence=[{"run_id": run.id, "events": len(self.store.list_events(run.id))}])
+        final = AgentResult(agent_id=agent_id, task_id=parent_task_id, status=status, summary=summary, findings=findings, datasets=result_datasets, warnings=warnings, error="；".join(errors) if errors else None, trace_id=run.id, evidence=[{"run_id": run.id, "events": len(self.store.list_events(run.id)), "subtask_id": subtask.id}])
         finished = finish_run(
             self.store.get_run(run.id) or run,
             RunStatus.BUDGET_EXCEEDED if budget_exceeded else RunStatus.COMPLETED if status is AgentResultStatus.SUCCESS else RunStatus.PARTIAL_COMPLETED if status is AgentResultStatus.PARTIAL else RunStatus.FAILED,
@@ -113,7 +141,7 @@ class SubAgent:
         )
         self.store.save_run(finished.model_copy(update={"metadata": {**finished.metadata, "result": final.model_dump(mode="json")}}))
         await self.trace.emit(parent_run_id, EventType.SUBAGENT_COMPLETED, summary, payload={"agent_id": agent_id, "status": status.value, "result": final.model_dump(mode="json")}, agent_id=agent_id)
-        return final
+        return SubAgentExecutionResult(result=final, working_memory_delta=delta)
 
     async def _call(self, run: Run, name: str, arguments: dict[str, Any]):
         current = self.store.get_run(run.id) or run
