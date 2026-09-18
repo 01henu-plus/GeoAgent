@@ -66,6 +66,46 @@ def test_decision_engine_state_gate_emits_plan_without_executing_it():
     assert decision.plan_goal == "分析 DEM"
 
 
+def test_decision_engine_returns_none_when_no_deterministic_action_exists():
+    assert DecisionEngine().decide(_state()) is None
+
+
+def test_decision_engine_maps_internal_control_capabilities():
+    engine = DecisionEngine()
+    plan = engine.from_model_response(
+        ModelResponse(tool_calls=[{"id": "plan", "function": {"name": "agent.plan", "arguments": '{"goal":"分析 DEM"}'}}])
+    )
+    ask_user = engine.from_model_response(
+        ModelResponse(tool_calls=[{"id": "ask", "function": {"name": "agent.ask_user", "arguments": '{"question":"请提供距离"}'}}])
+    )
+    assert plan.type is DecisionType.PLAN
+    assert plan.plan_goal == "分析 DEM"
+    assert ask_user.type is DecisionType.ASK_USER
+    assert ask_user.final_response == "请提供距离"
+
+
+def test_decision_engine_rejects_mixed_control_and_gis_batch():
+    decision = DecisionEngine().from_model_response(
+        ModelResponse(
+            tool_calls=[
+                {"id": "plan", "function": {"name": "agent.plan", "arguments": "{}"}},
+                {"id": "inspect", "function": {"name": "dataset.inspect", "arguments": "{}"}},
+            ]
+        )
+    )
+    assert decision.type is DecisionType.ABORT
+    assert decision.metadata["error_code"] == "INVALID_AGENT_DECISION_BATCH"
+
+
+def test_decision_engine_maps_runtime_failure_directives_only_when_deterministic():
+    engine = DecisionEngine()
+    state = _state().model_copy(update={"latest_failure": {"directive": "REPLAN", "deterministic": True, "error": "失败"}})
+    assert engine.decide(state).type is DecisionType.REPLAN
+
+    non_deterministic = state.model_copy(update={"latest_failure": {"directive": "REPLAN", "deterministic": False}})
+    assert engine.decide(non_deterministic) is None
+
+
 def test_agent_state_builder_reads_fresh_working_memory_without_mutating_store(application):
     task = application.task_service.create("分析 DEM", conversation_id="conversation-state")
     run = Run(id="run-state", task_id=task.id, conversation_id=task.conversation_id, agent_id="main")
@@ -133,6 +173,41 @@ def test_agent_runtime_plan_fast_path_executes_one_transition_before_decision():
     result = asyncio.run(AgentRuntime().run(state, decide=decide, dispatch=dispatch, fast_path=fast_path))
     assert result.status is AgentResultStatus.SUCCESS
     assert calls == ["fast", "decide"]
+
+
+def test_agent_runtime_separates_transition_safety_from_model_turns():
+    state = _state().model_copy(update={"current_plan": Plan(goal="持续执行", intent="DATA_INSPECTION", steps=[])})
+    fast_calls = 0
+    decision_calls = 0
+
+    async def fast_path(current):
+        nonlocal fast_calls
+        fast_calls += 1
+        if fast_calls == 4:
+            return RuntimeTransition(clear_plan=True)
+        return RuntimeTransition(current_plan=current.current_plan)
+
+    async def decide(_state):
+        nonlocal decision_calls
+        decision_calls += 1
+        return AgentDecision(type=DecisionType.FINAL, reasoning_summary="完成", final_response="完成")
+
+    async def dispatch(_decision, _state):
+        return RuntimeTransition(terminal=True, status=AgentResultStatus.SUCCESS, final_response="完成")
+
+    result = asyncio.run(
+        AgentRuntime(max_runtime_transitions=8).run(
+            state,
+            decide=decide,
+            dispatch=dispatch,
+            fast_path=fast_path,
+        )
+    )
+    assert result.status is AgentResultStatus.SUCCESS
+    assert result.iterations == 5
+    assert fast_calls == 4
+    assert decision_calls == 1
+    assert result.state is not None and result.state.turn_count == 0
 
 
 def test_context_exposes_plan_summary_progress_and_latest_failure():
