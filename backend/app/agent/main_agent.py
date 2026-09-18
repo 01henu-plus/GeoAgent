@@ -12,11 +12,14 @@ from app.checkpoint.context import make_checkpoint
 from app.checkpoint.store import CheckpointStore
 from app.conversation_memory import ConversationMemoryService
 from app.core.models import (
+    AgentDecision,
     AgentRequest,
     AgentResult,
     AgentResultStatus,
     Checkpoint,
+    DecisionType,
     ErrorCategory,
+    FailureAction,
     IntentResult,
     IntentType,
     InteractionMode,
@@ -38,6 +41,7 @@ from app.core.models import (
     new_id,
 )
 from app.decision import (
+    CONTROL_CAPABILITY_DEFINITIONS,
     AgentRouter,
     DecisionEngine,
     FailureAnalyzer,
@@ -58,7 +62,7 @@ from app.models import ModelAdapter, ModelRequest, ModelResponse
 from app.observability import TraceRecorder
 from app.profile import ProfilePreferenceExtractor, UserProfileService
 from app.run.lifecycle import PreparedRequest, RequestLifecycleBinder
-from app.runtime.agent_loop import AgentLoop, resolve_plan_arguments
+from app.runtime.agent_loop import AgentLoop, PlanLoopOutcome, resolve_plan_arguments
 from app.runtime.agent_runtime import AgentRuntime, RuntimeTransition
 from app.runtime.agent_state import AgentStateBuilder
 from app.runtime.budget import BudgetExceeded, BudgetGuard
@@ -82,9 +86,11 @@ _MODEL_SYSTEM_PROMPT = """
 1. 普通问候、闲聊、概念解释或询问当前界面时，直接用中文回答，不调用工具，也不要自动跳转到结果。
 2. 用户明确要求检查、查询、分析、转换或生成空间数据时，才调用工具；工具调用必须使用真实的结构化 tool_calls。
 3. 先利用会话历史、用户上传的数据、数据集属性和历史运行结果理解指代关系，不要因为列表中的第一个数据集就擅自选用它。
-4. 输入不完整、数据角色不明确或关键参数缺失时，先用中文追问；不要猜测距离、字段、坐标系或数据集。
-5. 每轮工具返回后重新判断下一步。可以先检查数据，再根据检查结果选择后续工具，也可以停止并直接回答。
-6. 只使用提供的工具和工具返回的事实，不能编造数据、文件、统计值或已完成的操作。最终回答简洁、具体、中文化。
+4. 输入不完整、数据角色不明确或关键参数缺失时，调用 agent.ask_user；不要猜测距离、字段、坐标系或数据集。
+5. 简单且直接可执行时调用 GIS 工具；存在明确多步依赖时调用 agent.plan；存在相对独立的多个主题且确有并行价值时调用 agent.delegate。
+6. 当前计划因失败或新信息不再适用时调用 agent.replan；已有清晰 current_plan 时优先让运行时继续执行，不要每轮重新规划。
+7. 不要为了规划而规划，也不要为了委派而委派。每一批只能选择一个内部控制动作，不能把内部控制动作和 GIS 工具混在一起。
+8. 每轮工具返回后重新判断下一步。只使用提供的工具和工具返回的事实，不能编造数据、文件、统计值或已完成的操作。最终回答简洁、具体、中文化。
 """.strip()
 
 _MODEL_CONTEXT_INSTRUCTION = "请优先依据当前请求、RequestFrame、WorkingMemory 和最新工具观察回答；只在确有必要时调用提供的空间工具。"
@@ -141,7 +147,7 @@ class MainAgent:
         self.loop = AgentLoop()
         self.state_builder = AgentStateBuilder(store)
         self.decision_engine = DecisionEngine()
-        self.agent_runtime = AgentRuntime(max_iterations=self.budget.max_agent_turns)
+        self.agent_runtime = AgentRuntime(max_runtime_transitions=self.budget.max_runtime_transitions)
         self.lifecycle_binder = RequestLifecycleBinder(store, task_service)
 
     async def prepare_request(
@@ -420,6 +426,7 @@ class MainAgent:
             "latest_failure": None,
             "datasets": list(datasets),
             "plan": plan,
+            "original_plan": plan.model_copy(deep=True) if plan is not None else None,
             "completed_steps": set(initial_plan_completed_steps or []),
             "step_outputs": dict(initial_plan_step_outputs or {}),
             "run": run,
@@ -459,6 +466,10 @@ class MainAgent:
             )
 
         async def decide(state):
+            state_decision = self.decision_engine.decide_from_state(state)
+            if state_decision is not None:
+                await self._trace_runtime_decision(state_decision, state)
+                return state_decision
             current = self.store.get_run(run.id) or session["run"]
             self.guard.check_turn(current)
             self.guard.check_execution_time(current)
@@ -514,7 +525,9 @@ class MainAgent:
                 model=model_name,
             )
             session["last_response"] = response
-            return self.decision_engine.from_model_response(response, source="model")
+            decision = self.decision_engine.from_model_response(response, source="model")
+            await self._trace_runtime_decision(decision, state)
+            return decision
 
         async def dispatch(decision, state):
             return await self._dispatch_runtime_decision(
@@ -535,6 +548,14 @@ class MainAgent:
             if step is None:
                 session["fast_path_enabled"] = False
                 return None
+            await self._trace_runtime_decision(
+                AgentDecision(
+                    type=DecisionType.TOOL,
+                    reasoning_summary=f"按当前计划直接执行下一步：{step.title}。",
+                    source="plan_fast_path",
+                ),
+                state,
+            )
             return await self._execute_runtime_plan_step(
                 step,
                 request=request,
@@ -551,7 +572,7 @@ class MainAgent:
             dispatch=dispatch,
             refresh_state=refresh_state,
             fast_path=fast_path,
-            max_iterations=self.budget.max_agent_turns,
+            max_runtime_transitions=self.budget.max_runtime_transitions,
         )
         if outcome.error == "EMPTY_MODEL_RESPONSE":
             return None
@@ -572,6 +593,29 @@ class MainAgent:
             trace_id=run.id,
         )
 
+    async def _trace_runtime_decision(self, decision: AgentDecision, state) -> None:
+        """统一记录运行时决策摘要，不记录模型私有推理过程。"""
+
+        current = self.store.get_run(state.run_id)
+        plan = state.current_plan
+        failure = state.latest_failure or {}
+        await self.trace.emit(
+            state.run_id,
+            EventType.DECISION_MADE,
+            decision.reasoning_summary,
+            payload={
+                "decision_type": decision.type.value,
+                "source": decision.source,
+                "turn_count": current.turn_count if current else state.turn_count,
+                "has_plan": plan is not None,
+                "plan_revision": plan.revision if plan else None,
+                "latest_failure_action": failure.get("directive") or failure.get("action"),
+                "tool_call_count": current.tool_call_count if current else state.tool_call_count,
+                "replan_count": current.replan_count if current else state.replan_count,
+            },
+            agent_id="main",
+        )
+
     async def _dispatch_runtime_decision(
         self,
         decision,
@@ -590,7 +634,6 @@ class MainAgent:
             response = (decision.final_response or "").strip()
             if not response:
                 return RuntimeTransition(terminal=True, error="EMPTY_MODEL_RESPONSE")
-            await self.trace.emit(run.id, EventType.DECISION_MADE, "模型运行时决定直接回复，不执行空间工具。", payload={"source": "model_runtime", "action": "final", "model": decision.metadata.get("model")}, agent_id="main")
             session["findings"].append({"model": decision.metadata.get("model"), "content": response})
             return RuntimeTransition(
                 terminal=True,
@@ -610,13 +653,21 @@ class MainAgent:
         if decision.type.value == "ABORT":
             if decision.metadata.get("empty_response"):
                 return RuntimeTransition(terminal=True, error="EMPTY_MODEL_RESPONSE")
-            return RuntimeTransition(terminal=True, status=AgentResultStatus.FAILED, error=decision.reasoning_summary)
+            return RuntimeTransition(
+                terminal=True,
+                status=AgentResultStatus.FAILED,
+                error=decision.metadata.get("error_code") or decision.reasoning_summary,
+            )
         if decision.type.value == "PLAN":
             if intent is None:
                 intent = self.legacy_intent_adapter.to_intent(request_frame, request, session["datasets"])
             new_plan = self.planner.build(decision.plan_goal or state.goal, intent, session["datasets"])
             session["plan"] = new_plan
+            session["original_plan"] = new_plan.model_copy(deep=True)
             session["fast_path_enabled"] = True
+            session["completed_steps"] = set()
+            session["step_outputs"] = {}
+            session["latest_failure"] = None
             await self.trace.emit(run.id, EventType.PLAN_CREATED, f"生成运行时计划：{len(new_plan.steps)} 步", payload={**new_plan.model_dump(mode="json"), "source": "agent_runtime"}, agent_id="main")
             await self._checkpoint(run.id, "plan_created", self._checkpoint_state(request, intent, new_plan, session["datasets"], request_frame))
             return RuntimeTransition(current_plan=new_plan)
@@ -626,7 +677,16 @@ class MainAgent:
             result = await self._delegate(request, run, task, session["datasets"], decision.subtasks, intent=intent, plan=session["plan"], request_frame=request_frame, working_memory=session["working_memory"])
             return RuntimeTransition(terminal=True, status=result.status, final_response=result.summary, error=result.error, findings=tuple(result.findings), dataset_ids=tuple(result.datasets), artifact_ids=tuple(result.artifacts))
         if decision.type.value == "REPLAN":
-            return RuntimeTransition(terminal=True, status=AgentResultStatus.BLOCKED, error="REPLAN_REQUIRED", final_response=decision.reasoning_summary, directive=LoopDirective.REPLAN)
+            return await self._dispatch_runtime_replan(
+                decision,
+                state,
+                request=request,
+                run=run,
+                task=task,
+                intent=intent,
+                request_frame=request_frame,
+                session=session,
+            )
 
         if decision.type.value != "TOOL":
             return RuntimeTransition(terminal=True, status=AgentResultStatus.FAILED, error=f"不支持的运行时动作：{decision.type.value}")
@@ -635,6 +695,7 @@ class MainAgent:
         session["protocol_messages"].append({"role": "assistant", "content": decision.metadata.get("content", ""), "tool_calls": raw_calls})
         invalid_calls = {item.get("id"): item for item in decision.metadata.get("invalid_tool_calls", []) if isinstance(item, dict)}
         batch_observations: list[dict[str, Any]] = []
+        batch_failure: dict[str, Any] | None = None
         for call in decision.normalized_tool_calls():
             invalid = invalid_calls.get(call.id)
             if invalid is not None:
@@ -677,11 +738,19 @@ class MainAgent:
                 session["dataset_ids"].update(tool_result.datasets)
                 session["artifact_ids"].update(tool_result.artifacts)
             elif execution_outcome is not None:
-                session["latest_failure"] = {
+                batch_failure = {
                     "action": execution_outcome.directive.value,
+                    "directive": execution_outcome.directive.value,
+                    "deterministic": False,
+                    "tool_name": name,
+                    "error_code": tool_result.error.code if tool_result.error else None,
                     "error": tool_result.error.message if tool_result.error else execution_outcome.rationale,
+                    "verification_problems": list(execution_outcome.verification_problems),
+                    "recovery_action": execution_outcome.recovery_action.value if execution_outcome.recovery_action else None,
+                    "attempts": execution_outcome.attempts,
                 }
             session["protocol_messages"].append(protocol_tool_message(execution_outcome or observation))
+        session["latest_failure"] = batch_failure
         latest_observation = _batch_observation(batch_observations)
         session["latest_observation"] = latest_observation
         bounded_protocol = compact_protocol_messages(session["protocol_messages"], max_tokens=self.budget.protocol_history_tokens)
@@ -700,6 +769,8 @@ class MainAgent:
         )
         return RuntimeTransition(
             observation=latest_observation,
+            latest_failure=session["latest_failure"],
+            clear_failure=session["latest_failure"] is None,
             findings=tuple(session["findings"]),
             dataset_ids=tuple(sorted(session["dataset_ids"])),
             artifact_ids=tuple(sorted(session["artifact_ids"])),
@@ -740,6 +811,7 @@ class MainAgent:
             self._accept_main_tool_result(session["run"], outcome.result)
             session["dataset_ids"].update(outcome.result.datasets)
             session["artifact_ids"].update(outcome.result.artifacts)
+            session["latest_failure"] = None
             session["completed_steps"].add(step.id)
             step.status = TaskStatus.SUCCEEDED
             session["step_outputs"][step.id] = {
@@ -750,6 +822,18 @@ class MainAgent:
             }
         else:
             session["fast_path_enabled"] = False
+            session["latest_failure"] = {
+                "action": outcome.directive.value,
+                "directive": outcome.directive.value,
+                "deterministic": True,
+                "step_id": step.id,
+                "tool_name": step.tool_name,
+                "error_code": outcome.result.error.code if outcome.result.error else None,
+                "error": outcome.result.error.message if outcome.result.error else outcome.rationale,
+                "verification_problems": list(outcome.verification_problems),
+                "recovery_action": outcome.recovery_action.value if outcome.recovery_action else None,
+                "attempts": outcome.attempts,
+            }
         observation = _execution_observation(outcome)
         session["latest_observation"] = observation
         await self._checkpoint(
@@ -764,6 +848,8 @@ class MainAgent:
         )
         return RuntimeTransition(
             observation=observation,
+            latest_failure=session["latest_failure"],
+            clear_failure=session["latest_failure"] is None,
             directive=outcome.directive,
             findings=tuple(session["findings"]),
             dataset_ids=tuple(sorted(session["dataset_ids"])),
@@ -771,6 +857,129 @@ class MainAgent:
             current_plan=session["plan"],
             completed_steps=(step.id,) if outcome.accepted else (),
             step_outputs={step.id: session["step_outputs"][step.id]} if outcome.accepted else {},
+        )
+
+    async def _dispatch_runtime_replan(
+        self,
+        decision,
+        state,
+        *,
+        request: AgentRequest,
+        run: Run,
+        task: Task | None,
+        intent: IntentResult | None,
+        request_frame: RequestFrame | None,
+        session: dict[str, Any],
+    ) -> RuntimeTransition:
+        """把运行时 REPLAN 请求接到现有 Replanner，不在 Decision 层重建计划。"""
+
+        current_plan = session.get("plan")
+        if current_plan is None:
+            return RuntimeTransition(
+                terminal=True,
+                status=AgentResultStatus.BLOCKED,
+                error="REPLAN_REQUIRED",
+                final_response="当前没有可供重新规划的执行计划。",
+                directive=LoopDirective.REPLAN,
+            )
+        failure = session.get("latest_failure") or {}
+        failed_step = next(
+            (item for item in current_plan.steps if item.id == failure.get("step_id")),
+            None,
+        )
+        error_message = str(failure.get("error") or decision.reasoning_summary or "当前执行失败，需要重新规划。")
+        error_code = str(failure.get("error_code") or "REPLAN_REQUIRED")
+        verification_problems = [str(item) for item in failure.get("verification_problems", [])]
+        failed_result = ToolResult(
+            call_id=f"replan_{failed_step.id if failed_step else 'runtime'}",
+            status=ToolStatus.SUCCESS if verification_problems and not failure.get("error_code") else ToolStatus.FAILED,
+            error=None if verification_problems and not failure.get("error_code") else ToolError(
+                code=error_code,
+                category=ErrorCategory.EXECUTION,
+                message=error_message,
+            ),
+        )
+        failed_outcome = ExecutionOutcome(
+            result=failed_result,
+            verified=False,
+            verification_problems=verification_problems,
+            recovery_action=FailureAction.REPLAN,
+            attempts=int(failure.get("attempts") or 1),
+            accepted=False,
+            directive=LoopDirective.REPLAN,
+            rationale=error_message,
+        )
+        outcome = PlanLoopOutcome(
+            completed_steps=frozenset(session["completed_steps"]),
+            findings=tuple(session["findings"]),
+            output_ids=tuple(sorted(session["dataset_ids"])),
+            artifacts=tuple(sorted(session["artifact_ids"])),
+            errors=(error_message,),
+            step_outputs=dict(session["step_outputs"]),
+            failed_step=failed_step,
+            failed_outcome=failed_outcome,
+            directive=LoopDirective.REPLAN,
+        )
+        if intent is None:
+            intent = self.legacy_intent_adapter.to_intent(request_frame, request, session["datasets"])
+        state_payload = {
+            "completed_steps": sorted(session["completed_steps"]),
+            "findings": list(session["findings"]),
+            "output_ids": sorted(session["dataset_ids"]),
+            "artifacts": sorted(session["artifact_ids"]),
+            "errors": [error_message],
+            "step_outputs": dict(session["step_outputs"]),
+            "previous_replan_reasons": list(session.get("previous_replan_reasons", [])),
+        }
+        original_plan = session.get("original_plan") or current_plan.model_copy(deep=True)
+        try:
+            revised, next_state = await self._replan_plan(
+                request,
+                run,
+                session["datasets"],
+                intent,
+                original_plan,
+                current_plan,
+                outcome,
+                state_payload,
+                request_frame=request_frame,
+            )
+        except ReplanNotPossible as exc:
+            running = self.store.get_run(run.id) or run
+            if running.status is RunStatus.REPLANNING:
+                self.store.save_run(running.model_copy(update={"status": RunStatus.RUNNING}))
+            return RuntimeTransition(
+                terminal=True,
+                status=AgentResultStatus.BLOCKED,
+                error="REPLAN_REQUIRED",
+                final_response=str(exc),
+                directive=LoopDirective.REPLAN,
+                latest_failure=failure,
+            )
+        except BudgetExceeded as exc:
+            return RuntimeTransition(
+                terminal=True,
+                status=AgentResultStatus.BLOCKED,
+                error=str(exc),
+                directive=LoopDirective.ABORT,
+                latest_failure=failure,
+            )
+        session["plan"] = revised
+        session["original_plan"] = original_plan
+        session["completed_steps"] = set(next_state["completed_steps"])
+        session["step_outputs"] = dict(next_state["step_outputs"])
+        session["findings"] = list(next_state["findings"])
+        session["latest_failure"] = None
+        session["fast_path_enabled"] = True
+        session["run"] = self.store.get_run(run.id) or run
+        return RuntimeTransition(
+            current_plan=revised,
+            clear_failure=True,
+            directive=LoopDirective.CONTINUE,
+            observation={"replanned": True, "revision": revised.revision},
+            findings=tuple(session["findings"]),
+            dataset_ids=tuple(sorted(session["dataset_ids"])),
+            artifact_ids=tuple(sorted(session["artifact_ids"])),
         )
 
     def _build_model_messages(
@@ -844,6 +1053,8 @@ class MainAgent:
                 working_memory=working_memory,
                 request_resources=request_resources,
                 current_observation=current_observation,
+                plan_progress=plan_progress,
+                latest_failure=latest_failure,
                 task_goal=task.goal if task else None,
                 context_tokens=dynamic_tokens,
             )
@@ -980,7 +1191,7 @@ class MainAgent:
         return [
             {"type": "function", "function": {"name": item.name, "description": item.description, "parameters": item.input_schema or common_schema}}
             for item in self.executor.registry.definitions()
-        ]
+        ] + CONTROL_CAPABILITY_DEFINITIONS
 
     @staticmethod
     def _checkpoint_state(request: AgentRequest, intent: IntentResult | None, plan: Plan | None, datasets, request_frame: RequestFrame | None = None) -> dict[str, Any]:
