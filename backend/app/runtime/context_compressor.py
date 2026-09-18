@@ -13,11 +13,12 @@ class ContextCompressor:
     def __init__(self, *, max_tokens: int = 6000) -> None:
         self.max_tokens = max(128, max_tokens)
 
-    def compress(self, sections: list[ContextSection]) -> dict[str, Any]:
+    def compress(self, sections: list[ContextSection], *, max_tokens: int | None = None) -> dict[str, Any]:
         working = [replace(section, content=deepcopy(section.content)) for section in sections]
         changed: set[str] = set()
         dropped: list[str] = []
-        target = max(64, self.max_tokens - 40)
+        budget = max(1, max_tokens if max_tokens is not None else self.max_tokens)
+        target = max(64, budget - 40)
 
         for priority in (ContextPriority.LOW, ContextPriority.MEDIUM, ContextPriority.HIGH):
             while self._estimate(working) > target:
@@ -65,13 +66,23 @@ class ContextCompressor:
             working[working.index(section)] = replacement
 
         payload = {section.name: section.content for section in working}
-        truncated = bool(changed or dropped or self._estimate(working) > target)
+        required_sections = {section.name: section.content for section in working if section.required}
+        required_tokens = estimate_tokens(required_sections)
+        estimated_tokens = estimate_tokens(payload)
+        over_budget = estimated_tokens > budget
+        truncated = bool(changed or dropped or over_budget)
         payload["context_meta"] = {
             "truncated": truncated,
-            "budget_tokens": self.max_tokens,
-            "estimated_tokens": 0,
+            "over_budget": over_budget,
+            "budget_tokens": budget,
+            "estimated_tokens": estimated_tokens,
+            "overflow_tokens": max(0, estimated_tokens - budget),
+            "required_tokens": required_tokens,
         }
         payload["context_meta"]["estimated_tokens"] = estimate_tokens(payload)
+        payload["context_meta"]["overflow_tokens"] = max(0, payload["context_meta"]["estimated_tokens"] - budget)
+        payload["context_meta"]["over_budget"] = payload["context_meta"]["overflow_tokens"] > 0
+        payload["truncated"] = truncated or payload["context_meta"]["over_budget"]
         if changed:
             payload["context_meta"]["compressed_sections"] = sorted(changed)
         if dropped:

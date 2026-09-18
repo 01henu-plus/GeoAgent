@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field
 
 
 class ModelRequest(BaseModel):
+    """一次模型请求；``max_tokens`` 表示模型输出上限，不是输入上下文预算。"""
+
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]] = Field(default_factory=list)
     temperature: float | None = None

@@ -6,7 +6,6 @@ Assembler -> ContextSection -> Compressor -> ModelContext。
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from app.core.models import (
@@ -29,9 +28,8 @@ from app.runtime.context_compressor import ContextCompressor
 class ContextManager:
     """保持历史 API 的 facade；新代码以 token budget 为核心。"""
 
-    def __init__(self, *, max_tokens: int = 6000, max_chars: int | None = None) -> None:
+    def __init__(self, *, max_tokens: int = 6000) -> None:
         self.max_tokens = max_tokens
-        self._legacy_max_chars = max_chars
         self.assembler = ContextAssembler()
         self.compressor = ContextCompressor(max_tokens=max_tokens)
 
@@ -57,6 +55,7 @@ class ContextManager:
         current_observation: Any = None,
         user_profile: UserProfile | dict[str, Any] | None = None,
         conversation_memory: ConversationMemory | dict[str, Any] | None = None,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         resource_view = _request_resources_view(request, request_resources)
         sections = self.assembler.assemble_main(
@@ -80,10 +79,7 @@ class ContextManager:
             user_profile=user_profile,
             conversation_memory=conversation_memory,
         )
-        context = self.compressor.compress(sections)
-        if self._legacy_max_chars is not None:
-            return self._legacy_bound(context)
-        return context
+        return self.compressor.compress(sections, max_tokens=max_tokens)
 
     def sub_context(
         self,
@@ -95,6 +91,7 @@ class ContextManager:
         working_memory: WorkingMemory | dict[str, Any] | None = None,
         budget: dict[str, Any] | None = None,
         allowed_tools: list[str] | None = None,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         sections = self.assembler.assemble_sub(
             request,
@@ -105,27 +102,7 @@ class ContextManager:
             budget=budget,
             allowed_tools=allowed_tools,
         )
-        context = self.compressor.compress(sections)
-        if self._legacy_max_chars is not None:
-            return self._legacy_bound(context)
-        return context
-
-    def _legacy_bound(self, context: dict[str, Any]) -> dict[str, Any]:
-        """兼容旧的 ``max_chars`` 调用；新代码不依赖这个分支。"""
-
-        limit = max(80, self._legacy_max_chars or 80)
-        if len(_serialize(context)) <= limit:
-            return context
-        result: dict[str, Any] = {"user_request": str(context.get("user_request", "")), "truncated": True}
-        while len(_serialize(result)) > limit and result["user_request"]:
-            result["user_request"] = result["user_request"][:-max(1, len(result["user_request"]) // 10)]
-        if len(_serialize(result)) > limit:
-            result["user_request"] = result["user_request"][: max(0, limit - 38)]
-        return result
-
-
-def _serialize(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+        return self.compressor.compress(sections, max_tokens=max_tokens)
 
 
 def _request_resources_view(request: AgentRequest, resources: RequestResources | None) -> dict[str, Any]:
