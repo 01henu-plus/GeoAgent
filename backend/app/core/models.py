@@ -444,6 +444,8 @@ class SubAgentExecutionResult(StrictModel):
 
     result: AgentResult
     working_memory_delta: WorkingMemoryDelta = Field(default_factory=WorkingMemoryDelta)
+    directive: LoopDirective = LoopDirective.CONTINUE
+    failure_rationale: str | None = None
 
 
 class Checkpoint(StrictModel):

@@ -112,7 +112,7 @@ class Application:
             max_execution_seconds=self.settings.max_execution_seconds,
         )
         self.task_service = TaskService(TaskRepository(self.store))
-        self.sub_agent = SubAgent(self.tool_executor, self.store, self.trace, context_manager=ContextManager(max_tokens=self.budget.subagent_context_tokens), budget=self.budget, services_factory=self.execution_services)
+        self.sub_agent = SubAgent(self.tool_executor, self.store, self.trace, context_manager=ContextManager(max_tokens=self.budget.subagent_context_tokens), budget=self.budget, services_factory=self.execution_services, registry=self.registry, default_crs=self.settings.default_crs)
         self.agent_manager = AgentManager(self.sub_agent, max_parallel=self.settings.max_parallel_agents, max_subagents=self.settings.max_subagents, timeout_seconds=self.settings.max_execution_seconds)
         self.main_agent = MainAgent(store=self.store, trace=self.trace, executor=self.tool_executor, registry=self.registry, task_service=self.task_service, agent_manager=self.agent_manager, settings=self.settings, checkpoint_store=self.checkpoints, memory=self.memory, knowledge=self.knowledge, model_adapter=self.model_adapter, model_adapters=self.model_adapters, default_model_profile=self.default_model_profile, context_manager=self.context_manager, budget=self.budget, services_factory=self.execution_services, profile_service=self.profile, profile_extractor=self.profile_extractor, conversation_memory=self.conversation_memory)
         self.run_manager = RunManager(self.main_agent, self.store, self.metrics)

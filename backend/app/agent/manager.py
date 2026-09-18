@@ -8,6 +8,7 @@ from app.core.models import (
     AgentRequest,
     AgentResult,
     Dataset,
+    LoopDirective,
     SubAgentExecutionResult,
     SubTask,
     WorkingMemory,
@@ -55,5 +56,7 @@ class AgentManager:
                     by_id[task.id] = SubAgentExecutionResult(
                         result=AgentResult(agent_id="scheduler", task_id=parent_task_id, status="FAILED", summary=f"{task.goal} 调度失败", error=str(value), trace_id=parent_run_id),
                         working_memory_delta=WorkingMemoryDelta(),
+                        directive=LoopDirective.ABORT,
+                        failure_rationale=str(value),
                     )
         return [by_id[task.id] for task in tasks]
