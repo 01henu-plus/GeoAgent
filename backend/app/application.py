@@ -102,6 +102,7 @@ class Application:
             max_agent_turns=self.settings.max_agent_turns,
             max_tool_calls=self.settings.max_tool_calls,
             max_retry_per_action=self.settings.max_retries,
+            max_replans=self.settings.max_replans,
             max_subagents=self.settings.max_subagents,
             max_parallel_agents=self.settings.max_parallel_agents,
             max_tokens=self.settings.max_tokens,

@@ -25,6 +25,10 @@ class BudgetGuard:
         if count > self.budget.max_subagents:
             raise BudgetExceeded("SubAgent budget exceeded")
 
+    def check_replan(self, run: Run) -> None:
+        if run.replan_count >= self.budget.max_replans:
+            raise BudgetExceeded("REPLAN_BUDGET_EXCEEDED")
+
     def check_execution_time(self, run: Run) -> None:
         if run.started_at is None:
             return

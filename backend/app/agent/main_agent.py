@@ -22,6 +22,7 @@ from app.core.models import (
     InteractionMode,
     LoopDirective,
     Plan,
+    ReplanContext,
     RequestFrame,
     RequestResources,
     Run,
@@ -41,6 +42,8 @@ from app.decision import (
     FailureAnalyzer,
     IntentResolver,
     Planner,
+    Replanner,
+    ReplanNotPossible,
     ResultVerifier,
     TaskDecomposer,
 )
@@ -104,6 +107,7 @@ class MainAgent:
         )
         self.legacy_intent_adapter = LegacyIntentAdapter(self.intent_resolver)
         self.planner = Planner()
+        self.replanner = Replanner(self.planner)
         self.router = AgentRouter()
         self.decomposer = TaskDecomposer()
         self.failure_analyzer = FailureAnalyzer()
@@ -195,6 +199,10 @@ class MainAgent:
                     working_memory = restored
         if run is None:
             raise RuntimeError("请求没有可执行的 Run")
+        saved_replan_count = resume_state.get("replan_count")
+        if isinstance(saved_replan_count, int) and saved_replan_count > 0 and run.replan_count < saved_replan_count:
+            run = run.model_copy(update={"replan_count": saved_replan_count})
+            self.store.save_run(run)
         intent: IntentResult | None = None
         plan: Plan | None = None
         request_frame: RequestFrame | None = prepared_request.frame
@@ -740,57 +748,149 @@ class MainAgent:
         )
 
     async def _execute_plan(self, request: AgentRequest, run: Run, task: Task, datasets, intent: IntentResult, plan: Plan, resume_state: dict[str, Any], *, request_frame: RequestFrame | None = None) -> AgentResult:
-        completed = set(resume_state.get("completed_steps", []))
-        findings = list(resume_state.get("findings", []))
-        output_ids = list(resume_state.get("output_ids", []))
-        artifacts = list(resume_state.get("artifacts", []))
-        errors = list(resume_state.get("errors", []))
-        step_outputs = dict(resume_state.get("step_outputs", {})) if isinstance(resume_state.get("step_outputs"), dict) else {}
+        state = _plan_state_from_resume(resume_state)
+        original_plan = Plan.model_validate(resume_state["original_plan"]) if isinstance(resume_state.get("original_plan"), dict) else plan.model_copy(deep=True)
+        current_plan = plan
+
+        while True:
+            outcome = await self._execute_plan_once(request, run, task, datasets, intent, current_plan, state, original_plan=original_plan, request_frame=request_frame)
+            if outcome.failed_step is not None and outcome.directive is LoopDirective.REPLAN and _replan_candidate(outcome):
+                try:
+                    current_plan, state = await self._replan_plan(
+                        request,
+                        run,
+                        datasets,
+                        intent,
+                        original_plan,
+                        current_plan,
+                        outcome,
+                        state,
+                        request_frame=request_frame,
+                    )
+                except ReplanNotPossible as exc:
+                    return _plan_failure_result(task, run, outcome, str(exc))
+                continue
+            return self._plan_result_from_outcome(task, run, intent, current_plan, outcome)
+
+    async def _execute_plan_once(self, request: AgentRequest, run: Run, task: Task, datasets, intent: IntentResult, plan: Plan, state: dict[str, Any], *, original_plan: Plan, request_frame: RequestFrame | None = None):
         async def execute_step(step, arguments):
             completed_arguments = self._complete_plan_arguments(step.tool_name or "", arguments, user_id=request.user_id)
-            outcome = await self.tool_execution_cycle.execute(
-                run,
-                step.tool_name or "",
-                completed_arguments,
-                user_id=request.user_id,
-            )
+            outcome = await self.tool_execution_cycle.execute(run, step.tool_name or "", completed_arguments, user_id=request.user_id)
             if outcome.accepted:
                 self._accept_main_tool_result(run, outcome.result)
             return outcome
 
-        async def checkpoint(completed_steps, state):
-            await self._step_checkpoint(run.id, request, intent, plan, datasets, completed_steps, request_frame=request_frame, **state)
+        async def checkpoint(completed_steps, checkpoint_state):
+            current_run = self.store.get_run(run.id) or run
+            await self._step_checkpoint(
+                run.id,
+                request,
+                intent,
+                plan,
+                datasets,
+                completed_steps,
+                request_frame=request_frame,
+                original_plan=original_plan.model_dump(mode="json"),
+                replan_count=current_run.replan_count,
+                previous_replan_reasons=list(state.get("previous_replan_reasons", [])),
+                **checkpoint_state,
+            )
 
-        outcome = await self.loop.execute_plan(
+        return await self.loop.execute_plan(
             plan,
-            completed_steps=completed,
-            findings=findings,
-            output_ids=output_ids,
-            artifacts=artifacts,
-            errors=errors,
-            step_outputs=step_outputs,
+            completed_steps=set(state["completed_steps"]),
+            findings=list(state["findings"]),
+            output_ids=list(state["output_ids"]),
+            artifacts=list(state["artifacts"]),
+            errors=list(state["errors"]),
+            step_outputs=dict(state["step_outputs"]),
             execute_step=execute_step,
             checkpoint=checkpoint,
         )
+
+    async def _replan_plan(self, request, run, datasets, intent, original_plan, current_plan, outcome, state, *, request_frame):
+        current_run = self.store.get_run(run.id) or run
+        self.guard.check_replan(current_run)
+        next_count = current_run.replan_count + 1
+        failed = outcome.failed_outcome
+        failed_step = outcome.failed_step
+        reason = _replan_reason(failed_step, failed)
+        reasons = list(state.get("previous_replan_reasons", []))
+        reasons.append(reason)
+        current_memory = self.store.get_working_memory(run.task_id) if run.task_id else None
+        current_dataset_ids = list(dict.fromkeys([*(current_memory.active_dataset_ids if current_memory else []), *outcome.output_ids]))
+        current_artifact_ids = list(dict.fromkeys([*(current_memory.active_artifact_ids if current_memory else []), *outcome.artifacts]))
+        context = ReplanContext(
+            goal=current_plan.goal,
+            original_plan=original_plan,
+            current_plan=current_plan,
+            current_revision=current_plan.revision,
+            completed_steps=sorted(outcome.completed_steps),
+            step_outputs=_compact_replan_step_outputs(outcome.step_outputs),
+            failed_step=failed_step,
+            failed_tool_name=failed_step.tool_name if failed_step else None,
+            failed_arguments=dict(failed_step.arguments) if failed_step else {},
+            error_code=failed.result.error.code if failed and failed.result.error else None,
+            error_message=failed.result.error.message if failed and failed.result.error else None,
+            verification_problems=list(failed.verification_problems) if failed else [],
+            recovery_action=failed.recovery_action if failed else None,
+            directive=outcome.directive,
+            attempts=failed.attempts if failed else 1,
+            current_dataset_ids=current_dataset_ids,
+            current_artifact_ids=current_artifact_ids,
+            replan_count=next_count,
+            previous_replan_reasons=reasons,
+        )
+        replanning_run = current_run.model_copy(update={"status": RunStatus.REPLANNING, "replan_count": next_count})
+        self.store.save_run(replanning_run)
+        await self._checkpoint(
+            run.id,
+            "replan_started",
+            {
+                "request": request.model_dump(mode="json"),
+                "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
+                "intent": intent.model_dump(mode="json"),
+                "plan": current_plan.model_dump(mode="json"),
+                "original_plan": original_plan.model_dump(mode="json"),
+                "replan_context": context.model_dump(mode="json"),
+                "replan_count": next_count,
+                **_plan_state_from_outcome(outcome, reasons),
+            },
+        )
+        revised = self.replanner.replan(context, intent, datasets)
+        running = replanning_run.model_copy(update={"status": RunStatus.RUNNING})
+        self.store.save_run(running)
+        next_state = _plan_state_from_outcome(outcome, reasons)
+        # 失败尝试保留在 findings/replan reason 中，但不能让已成功修复的
+        # 旧错误把新 revision 错判为 PARTIAL。
+        next_state["errors"] = []
+        await self._checkpoint(
+            run.id,
+            "replan_completed",
+            {
+                "request": request.model_dump(mode="json"),
+                "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
+                "intent": intent.model_dump(mode="json"),
+                "plan": revised.model_dump(mode="json"),
+                "original_plan": original_plan.model_dump(mode="json"),
+                "replan_count": next_count,
+                **next_state,
+            },
+        )
+        await self.trace.emit(run.id, EventType.PLAN_CREATED, f"生成 Replan revision {revised.revision}", payload={"revision": revised.revision, "source": "replan", "previous_revision": current_plan.revision}, agent_id="main")
+        return revised, next_state
+
+    def _plan_result_from_outcome(self, task, run, intent, plan, outcome):
         if outcome.failed_step is not None:
             failed = outcome.failed_outcome
             message = outcome.errors[-1] if outcome.errors else f"{outcome.failed_step.title}未完成。"
             if failed is not None and failed.rationale and not failed.verification_problems and failed.result.error is None:
                 message = failed.rationale
             if outcome.directive is LoopDirective.ASK_USER:
-                status = AgentResultStatus.BLOCKED
-                error = "WAITING_USER"
-                summary = f"{outcome.failed_step.title}需要补充信息：{message}"
-            elif outcome.directive is LoopDirective.REPLAN:
-                status = AgentResultStatus.BLOCKED
-                error = "REPLAN_REQUIRED"
-                summary = f"{outcome.failed_step.title}当前执行策略不适用，需要重新规划。"
-            else:
-                status = AgentResultStatus.FAILED
-                error = message
-                summary = f"{outcome.failed_step.title}未完成：{message}"
-            return AgentResult(agent_id="main", task_id=task.id, status=status, summary=summary, findings=list(outcome.findings), datasets=list(outcome.output_ids), artifacts=list(outcome.artifacts), warnings=list(outcome.errors[:-1]), error=error, trace_id=run.id)
-
+                return _plan_failure_result(task, run, outcome, "WAITING_USER", f"{outcome.failed_step.title}需要补充信息：{message}")
+            if outcome.directive is LoopDirective.REPLAN:
+                return _plan_failure_result(task, run, outcome, "REPLAN_REQUIRED", f"{outcome.failed_step.title}当前执行策略不适用，需要重新规划。")
+            return _plan_failure_result(task, run, outcome, message, f"{outcome.failed_step.title}未完成：{message}")
         operation = str(plan.metadata.get("operation") or intent.entities.get("operation") or "")
         status = AgentResultStatus.PARTIAL if outcome.errors else AgentResultStatus.SUCCESS
         return AgentResult(agent_id="main", task_id=task.id, status=status, summary=_plan_result_summary(operation, plan, list(outcome.findings), list(outcome.output_ids), list(outcome.artifacts)), findings=list(outcome.findings), datasets=list(outcome.output_ids), artifacts=list(outcome.artifacts), warnings=list(outcome.errors), error=outcome.errors[0] if outcome.errors and not outcome.findings else None, trace_id=run.id)
@@ -956,33 +1056,105 @@ class MainAgent:
             )
         return result
 
-    async def _execute_tool_raw(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None) -> ToolResult:
+    async def _execute_tool_raw(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None, attempt: int = 1) -> ToolResult:
         current = self.store.get_run(run.id) or run
         self.guard.check_turn(current)
         self.guard.check_execution_time(current)
         self.guard.check_tool(current)
         next_run = current.model_copy(update={"tool_call_count": current.tool_call_count + 1, "status": RunStatus.WAITING_TOOL})
         self.store.save_run(next_run)
-        call = ToolCall(id=call_id or new_id("call"), name=name, arguments=arguments, run_id=run.id, agent_id="main")
+        call = ToolCall(id=call_id or new_id("call"), name=name, arguments=arguments, run_id=run.id, agent_id="main", attempt=attempt)
         user_id = self.store.user_id_for_run(current.id)
         services = self.services_factory(user_id) if self.services_factory else self.executor.services
         return await self.executor.execute(call, agent_id="main", services=services)
 
-    async def _tool(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None) -> ToolResult:
+    async def _tool(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None, attempt: int = 1) -> ToolResult:
         """保留给旧测试/调用方的 Raw Tool hook；新路径由 Cycle 负责包裹。"""
 
-        return await self._execute_tool_raw(run, name, arguments, call_id=call_id)
+        return await self._execute_tool_raw(run, name, arguments, call_id=call_id, attempt=attempt)
 
-    async def _raw_tool_for_cycle(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None) -> ToolResult:
+    async def _raw_tool_for_cycle(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None, attempt: int = 1) -> ToolResult:
         """通过兼容 hook 执行 Raw Tool，便于测试替换而不绕过 Cycle。"""
-
-        return await self._tool(run, name, arguments, call_id=call_id)
+        try:
+            return await self._tool(run, name, arguments, call_id=call_id, attempt=attempt)
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            return await self._tool(run, name, arguments, call_id=call_id)
 
 
 def _set_plan_step_status(plan: Plan, step_id: str, status: TaskStatus) -> None:
     step = next((item for item in plan.steps if item.id == step_id), None)
     if step is not None:
         step.status = status
+
+
+def _plan_state_from_resume(resume_state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "completed_steps": list(resume_state.get("completed_steps", [])),
+        "findings": list(resume_state.get("findings", [])),
+        "output_ids": list(resume_state.get("output_ids", [])),
+        "artifacts": list(resume_state.get("artifacts", [])),
+        "errors": list(resume_state.get("errors", [])),
+        "step_outputs": dict(resume_state.get("step_outputs", {})) if isinstance(resume_state.get("step_outputs"), dict) else {},
+        "previous_replan_reasons": list(resume_state.get("previous_replan_reasons", [])),
+    }
+
+
+def _plan_state_from_outcome(outcome, reasons: list[str]) -> dict[str, Any]:
+    return {
+        "completed_steps": sorted(outcome.completed_steps),
+        "findings": list(outcome.findings),
+        "output_ids": list(outcome.output_ids),
+        "artifacts": list(outcome.artifacts),
+        "errors": list(outcome.errors),
+        "step_outputs": dict(outcome.step_outputs),
+        "previous_replan_reasons": reasons,
+    }
+
+
+def _replan_candidate(outcome) -> bool:
+    failed = outcome.failed_outcome
+    if failed is None:
+        return False
+    if failed.verification_problems:
+        return True
+    return bool(failed.result.error and failed.result.error.code == "ALGORITHM_NOT_APPLICABLE")
+
+
+def _replan_reason(step, outcome: ExecutionOutcome | None) -> str:
+    code = outcome.result.error.code if outcome and outcome.result.error else "VERIFICATION_FAILED" if outcome and outcome.verification_problems else "REPLAN"
+    return f"{step.id if step else 'unknown_step'}:{code}"
+
+
+def _compact_replan_step_outputs(step_outputs: dict[str, Any]) -> dict[str, Any]:
+    """只保留 Replanner 所需的输出引用，不把完整 Tool output 带入失败上下文。"""
+
+    compact: dict[str, Any] = {}
+    for step_id, value in step_outputs.items():
+        if not isinstance(value, dict):
+            continue
+        compact[step_id] = {
+            key: value[key]
+            for key in ("dataset_id", "dataset_ids", "artifact_ids", "status")
+            if key in value
+        }
+    return compact
+
+
+def _plan_failure_result(task, run, outcome, error: str, summary: str | None = None) -> AgentResult:
+    return AgentResult(
+        agent_id="main",
+        task_id=task.id,
+        status=AgentResultStatus.BLOCKED if error.startswith(("WAITING_USER", "REPLAN")) else AgentResultStatus.FAILED,
+        summary=summary or error,
+        findings=list(outcome.findings),
+        datasets=list(outcome.output_ids),
+        artifacts=list(outcome.artifacts),
+        warnings=list(outcome.errors[:-1]),
+        error=error,
+        trace_id=run.id,
+    )
 
 
 def _aggregate_subagent_directive(executions: list[Any]) -> LoopDirective:

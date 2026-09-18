@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     max_agent_turns: int = Field(default=20, ge=1)
     max_tool_calls: int = Field(default=40, ge=1)
     max_retries: int = Field(default=2, ge=0)
+    max_replans: int = Field(default=2, ge=0)
     max_subagents: int = Field(default=5, ge=0)
     max_parallel_agents: int = Field(default=3, ge=1)
     model_input_tokens: int = Field(default=12000, ge=128)
