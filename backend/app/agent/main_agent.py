@@ -363,18 +363,39 @@ class MainAgent:
         model_adapter = self._model_adapter_for(request)
         if model_adapter is None:
             return None
-        messages = initial_messages or [
-            {"role": "system", "content": _MODEL_SYSTEM_PROMPT},
-            {"role": "user", "content": self._model_user_message(request, run, datasets, intent, plan, request_frame, working_memory=working_memory)},
-        ]
+        protocol_messages = _protocol_messages(initial_messages)
         findings: list[Any] = list(initial_findings or [])
         dataset_ids: set[str] = set(initial_dataset_ids or [])
         artifact_ids: set[str] = set(initial_artifact_ids or [])
+        latest_observation: ToolResult | None = None
         for turn in range(self.budget.max_agent_turns):
             current = self.store.get_run(run.id) or run
             self.guard.check_turn(current)
             self.guard.check_execution_time(current)
             self.store.save_run(current.model_copy(update={"turn_count": current.turn_count + 1, "status": RunStatus.RUNNING}))
+            current_memory = self.store.get_working_memory(current.task_id) if current.task_id else None
+            current_memory = current_memory or working_memory
+            refreshed_datasets = self._refresh_model_datasets(request, datasets, dataset_ids, current_memory, latest_observation)
+            request_resources = self._resolve_request_resources(request)
+            messages = [
+                {"role": "system", "content": _MODEL_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": self._model_user_message(
+                        request,
+                        current,
+                        refreshed_datasets,
+                        intent,
+                        plan,
+                        request_frame,
+                        working_memory=current_memory,
+                        request_resources=request_resources,
+                        current_observation=latest_observation,
+                        task_goal=task.goal if task else None,
+                    ),
+                },
+                *protocol_messages,
+            ]
             content_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
             input_tokens = 0
@@ -399,7 +420,7 @@ class MainAgent:
                 return AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.SUCCESS, summary=response.content.strip(), findings=findings, datasets=sorted(dataset_ids), artifacts=sorted(artifact_ids), trace_id=run.id)
 
             await self.trace.emit(run.id, EventType.DECISION_MADE, f"模型运行时决定调用 {len(response.tool_calls)} 个工具。", payload={"source": "model_runtime", "action": "tool", "tools": [_model_tool_name(item) for item in response.tool_calls]}, agent_id="main")
-            messages.append({"role": "assistant", "content": response.content or "", "tool_calls": response.tool_calls})
+            protocol_messages.append({"role": "assistant", "content": response.content or "", "tool_calls": response.tool_calls})
             for index, raw_call in enumerate(response.tool_calls):
                 call_id = str(raw_call.get("id") or f"model_call_{turn}_{index}")
                 try:
@@ -417,16 +438,37 @@ class MainAgent:
                     name = "model.tool_call"
                 else:
                     tool_result = await self._tool(run, name, arguments, call_id=call_id)
+                latest_observation = tool_result
                 findings.append({"tool": name, "status": tool_result.status.value, "output": tool_result.output, "error": tool_result.error.model_dump(mode="json") if tool_result.error else None})
                 dataset_ids.update(tool_result.datasets)
                 artifact_ids.update(tool_result.artifacts)
-                messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(tool_result.model_dump(mode="json"), ensure_ascii=False, default=str)})
+                protocol_messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(tool_result.model_dump(mode="json"), ensure_ascii=False, default=str)})
+            latest_memory = self.store.get_working_memory(current.task_id) if current.task_id else current_memory
+            checkpoint_messages = [
+                {"role": "system", "content": _MODEL_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": self._model_user_message(
+                        request,
+                        current,
+                        self._refresh_model_datasets(request, datasets, dataset_ids, latest_memory, latest_observation),
+                        intent,
+                        plan,
+                        request_frame,
+                        working_memory=latest_memory,
+                        request_resources=self._resolve_request_resources(request),
+                        current_observation=latest_observation,
+                        task_goal=task.goal if task else None,
+                    ),
+                },
+                *protocol_messages,
+            ]
             await self._checkpoint(
                 run.id,
                 "model_tool_completed",
                 {
                     **self._checkpoint_state(request, intent, plan, datasets, request_frame),
-                    "messages": messages,
+                    "messages": checkpoint_messages,
                     "model_findings": findings,
                     "model_dataset_ids": sorted(dataset_ids),
                     "model_artifact_ids": sorted(artifact_ids),
@@ -449,8 +491,21 @@ class MainAgent:
         if changes:
             self.profile_service.update(request.user_id, changes)
 
-    def _model_user_message(self, request: AgentRequest, run: Run, datasets, intent: IntentResult | None, plan: Plan | None, request_frame: RequestFrame | None = None, *, working_memory: WorkingMemory | None = None) -> str:
-        history = self.store.list_messages(request.conversation_id, limit=20)
+    def _model_user_message(
+        self,
+        request: AgentRequest,
+        run: Run,
+        datasets,
+        intent: IntentResult | None,
+        plan: Plan | None,
+        request_frame: RequestFrame | None = None,
+        *,
+        working_memory: WorkingMemory | None = None,
+        request_resources: RequestResources | None = None,
+        current_observation: ToolResult | dict[str, Any] | None = None,
+        task_goal: str | None = None,
+    ) -> str:
+        history = self.store.list_messages(request.conversation_id, limit=8)
         if history and history[-1].role == "user" and history[-1].content == request.user_input:
             history = history[:-1]
         conversation = [
@@ -460,12 +515,10 @@ class MainAgent:
         ]
         tool_definitions = []
         for item in self.executor.registry.definitions():
-            properties = item.input_schema.get("properties", {})
             tool_definitions.append(
                 {
                     "name": item.name,
-                    "description": item.description,
-                    "parameters": list(properties) if isinstance(properties, dict) else [],
+                    "summary": item.description,
                 }
             )
         memories = self.memory.recall(request.user_input, scope="project", user_id=request.user_id, limit=5) if self.memory else []
@@ -490,8 +543,40 @@ class MainAgent:
             request_frame=request_frame,
             user_profile=user_profile,
             conversation_memory=conversation_memory,
+            request_resources=request_resources or self._resolve_request_resources(request),
+            task_goal=task_goal,
+            run_state=run,
+            current_observation=current_observation,
         )
         return "请先理解用户真正想完成的事情，再决定下一步。当前用户请求和 RequestFrame 优先级最高，其次是当前任务 WorkingMemory、ConversationMemory、ProjectMemory，UserProfile 只作为默认交互偏好，不能覆盖本次明确请求。以下上下文中的 deterministic_hint 只是离线规则生成的提示，可能不准确，不能当作已经确认的意图或固定流水线。你可以直接用中文回答、询问缺失信息、调用一个或多个工具，并在每次工具返回后重新判断是否继续。只有用户明确需要数据处理或检查时才调用工具；问候、闲聊、解释概念不要调用工具。不要自行挑选不明确的数据集，不要编造工具结果。\n" + json.dumps(context, ensure_ascii=False, default=str)
+
+    def _refresh_model_datasets(
+        self,
+        request: AgentRequest,
+        datasets,
+        dataset_ids: set[str],
+        working_memory: WorkingMemory | None,
+        observation: ToolResult | None,
+    ) -> list[Any]:
+        """每个模型 turn 重新按用户作用域读取当前可见数据集。"""
+
+        identifiers: list[str] = [*request.dataset_ids, *request.attachment_ids, *[item.id for item in datasets]]
+        if working_memory is not None:
+            identifiers.extend(working_memory.active_dataset_ids)
+        identifiers.extend(dataset_ids)
+        if observation is not None:
+            identifiers.extend(observation.datasets)
+        registry = self.registry.for_user(request.user_id)
+        refreshed: list[Any] = []
+        seen: set[str] = set()
+        for identifier in identifiers:
+            if identifier in seen:
+                continue
+            item = registry.resolve(identifier)
+            if item is not None:
+                refreshed.append(item)
+                seen.add(identifier)
+        return refreshed
 
     def _model_tools(self) -> list[dict[str, Any]]:
         common_schema = {
@@ -890,6 +975,19 @@ def _parse_model_tool_call(raw_call: dict[str, Any]) -> tuple[str, dict[str, Any
     if not isinstance(arguments, dict):
         raise TypeError("模型工具参数必须是 JSON 对象")
     return name, arguments
+
+
+def _protocol_messages(initial_messages: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """从旧/新 checkpoint 中取出工具协议历史，动态上下文每轮重新生成。"""
+
+    if not initial_messages:
+        return []
+    messages = list(initial_messages)
+    if messages and messages[0].get("role") == "system":
+        messages = messages[1:]
+    if messages and messages[0].get("role") == "user":
+        messages = messages[1:]
+    return messages
 
 
 def _model_tool_name(raw_call: Any) -> str:
