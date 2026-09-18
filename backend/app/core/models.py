@@ -106,6 +106,7 @@ class MeasurementSystem(StrEnum):
 
 class DecisionType(StrEnum):
     TOOL = "TOOL"
+    PLAN = "PLAN"
     DELEGATE = "DELEGATE"
     REPLAN = "REPLAN"
     ASK_USER = "ASK_USER"
@@ -384,8 +385,25 @@ class AgentDecision(StrictModel):
     type: DecisionType
     reasoning_summary: str
     tool_call: ToolCall | None = None
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    plan_goal: str | None = None
     subtasks: list[SubTask] = Field(default_factory=list)
     final_response: str | None = None
+    source: str = "unknown"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    def model_post_init(self, __context: Any) -> None:
+        """保留旧的单工具字段，同时让批量工具调用成为权威表示。"""
+
+        if self.tool_call is not None and not self.tool_calls:
+            self.tool_calls = [self.tool_call]
+        elif self.tool_calls and self.tool_call is None:
+            self.tool_call = self.tool_calls[0]
+
+    def normalized_tool_calls(self) -> list[ToolCall]:
+        """返回兼容旧调用方的工具批次视图。"""
+
+        return list(self.tool_calls or ([self.tool_call] if self.tool_call else []))
 
 
 class AgentResult(StrictModel):

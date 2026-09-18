@@ -34,6 +34,18 @@ class PlanLoopOutcome:
 class AgentLoop:
     """执行有依赖关系的 GIS Plan，不负责猜测用户意图。"""
 
+    @staticmethod
+    def next_executable_step(plan: Plan, completed_steps: set[str] | None = None) -> PlanStep | None:
+        """返回当前确定可执行的下一步，不执行整张 Plan。"""
+
+        completed = set(completed_steps or ())
+        for step in plan.steps:
+            if step.id in completed:
+                continue
+            if all(dependency in completed for dependency in step.depends_on):
+                return step
+        return None
+
     async def execute_plan(
         self,
         plan: Plan,
