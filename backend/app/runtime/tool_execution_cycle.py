@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from app.core.models import FailureAction, Run, RunBudget, ToolResult, ToolStatus
+from app.core.models import FailureAction, LoopDirective, Run, RunBudget, ToolResult, ToolStatus
 from app.decision.failure_analyzer import FailureAnalyzer
 from app.decision.verifier import ResultVerifier
 from app.events import EventType
@@ -26,6 +26,7 @@ class ExecutionOutcome:
     recovery_action: FailureAction | None
     attempts: int
     accepted: bool
+    directive: LoopDirective = LoopDirective.CONTINUE
     original_result: ToolResult | None = None
     rationale: str | None = None
 
@@ -117,6 +118,7 @@ class ToolExecutionCycle:
             break
 
         if current.status not in {ToolStatus.SUCCESS, ToolStatus.PARTIAL_SUCCESS}:
+            directive = _directive_for_failure(recovery_action)
             return ExecutionOutcome(
                 result=current,
                 verified=False,
@@ -124,6 +126,7 @@ class ToolExecutionCycle:
                 recovery_action=recovery_action,
                 attempts=attempts,
                 accepted=False,
+                directive=directive,
                 original_result=original,
                 rationale=rationale,
             )
@@ -162,6 +165,7 @@ class ToolExecutionCycle:
             recovery_action=recovery_action,
             attempts=attempts,
             accepted=accepted,
+            directive=LoopDirective.CONTINUE if accepted else LoopDirective.ABORT,
             original_result=original,
             rationale=rationale,
         )
@@ -261,3 +265,17 @@ class ToolExecutionCycle:
 
 
 __all__ = ["ExecutionOutcome", "ToolExecutionCycle"]
+
+
+def _directive_for_failure(action: FailureAction | None) -> LoopDirective:
+    """把最终失败动作映射为上层循环信号。
+
+    RETRY/REPAIR 表示执行过程中发生过恢复尝试；当尝试已经用尽时，
+    它们不再是下一步控制信号，默认安全终止当前步骤。
+    """
+
+    return {
+        FailureAction.ASK_USER: LoopDirective.ASK_USER,
+        FailureAction.REPLAN: LoopDirective.REPLAN,
+        FailureAction.ABORT: LoopDirective.ABORT,
+    }.get(action, LoopDirective.ABORT)

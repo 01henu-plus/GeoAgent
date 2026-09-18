@@ -143,6 +143,15 @@ class FailureAction(StrEnum):
     ABORT = "ABORT"
 
 
+class LoopDirective(StrEnum):
+    """执行结果交给上层循环时的下一步控制信号。"""
+
+    CONTINUE = "CONTINUE"
+    ASK_USER = "ASK_USER"
+    REPLAN = "REPLAN"
+    ABORT = "ABORT"
+
+
 class RiskLevel(StrEnum):
     READ = "READ"
     WRITE = "WRITE"

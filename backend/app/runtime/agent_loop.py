@@ -11,10 +11,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from app.core.models import Plan, PlanStep, TaskStatus, ToolResult, ToolStatus
+from app.core.models import LoopDirective, Plan, PlanStep, TaskStatus
+from app.runtime.tool_execution_cycle import ExecutionOutcome
 
-StepExecutor = Callable[[PlanStep, dict[str, Any]], Awaitable[ToolResult]]
-StepVerifier = Callable[[PlanStep, ToolResult], Awaitable[list[str]]]
+StepExecutor = Callable[[PlanStep, dict[str, Any]], Awaitable[ExecutionOutcome]]
 CheckpointWriter = Callable[[set[str], dict[str, Any]], Awaitable[None]]
 
 
@@ -27,8 +27,8 @@ class PlanLoopOutcome:
     errors: tuple[str, ...]
     step_outputs: dict[str, dict[str, Any]]
     failed_step: PlanStep | None = None
-    failed_result: ToolResult | None = None
-    verification_problems: tuple[str, ...] = ()
+    failed_outcome: ExecutionOutcome | None = None
+    directive: LoopDirective = LoopDirective.CONTINUE
 
 
 class AgentLoop:
@@ -45,7 +45,6 @@ class AgentLoop:
         errors: list[str] | None = None,
         step_outputs: dict[str, dict[str, Any]] | None = None,
         execute_step: StepExecutor,
-        verify_step: StepVerifier,
         checkpoint: CheckpointWriter,
     ) -> PlanLoopOutcome:
         completed = set(completed_steps or ())
@@ -75,11 +74,18 @@ class AgentLoop:
 
             step.status = TaskStatus.RUNNING
             arguments = resolve_plan_arguments(step.arguments, outputs)
-            result = await execute_step(step, arguments)
+            outcome = await execute_step(step, arguments)
+            result = outcome.result
             finding = {
                 "step_id": step.id,
                 "tool": step.tool_name,
                 "status": result.status.value,
+                "accepted": outcome.accepted,
+                "verified": outcome.verified,
+                "verification_problems": list(outcome.verification_problems),
+                "recovery_action": outcome.recovery_action.value if outcome.recovery_action else None,
+                "directive": outcome.directive.value,
+                "attempts": outcome.attempts,
                 "output": result.output,
                 "datasets": result.datasets,
                 "artifacts": result.artifacts,
@@ -87,22 +93,23 @@ class AgentLoop:
             }
             collected_findings.append(finding)
 
-            if result.status not in {ToolStatus.SUCCESS, ToolStatus.PARTIAL_SUCCESS}:
+            if not outcome.accepted:
                 step.status = TaskStatus.FAILED
-                message = result.error.message if result.error else f"{step.title}失败。"
+                message = _outcome_message(step, outcome)
                 collected_errors.append(message)
                 await checkpoint(completed, _state(collected_findings, collected_outputs, collected_artifacts, collected_errors, outputs))
                 if step.required:
-                    return PlanLoopOutcome(frozenset(completed), tuple(collected_findings), tuple(collected_outputs), tuple(collected_artifacts), tuple(collected_errors), outputs, failed_step=step, failed_result=result)
-                continue
-
-            problems = await verify_step(step, result)
-            if problems:
-                step.status = TaskStatus.FAILED
-                collected_errors.extend(problems)
-                await checkpoint(completed, _state(collected_findings, collected_outputs, collected_artifacts, collected_errors, outputs))
-                if step.required:
-                    return PlanLoopOutcome(frozenset(completed), tuple(collected_findings), tuple(collected_outputs), tuple(collected_artifacts), tuple(collected_errors), outputs, failed_step=step, failed_result=result, verification_problems=tuple(problems))
+                    return PlanLoopOutcome(
+                        frozenset(completed),
+                        tuple(collected_findings),
+                        tuple(collected_outputs),
+                        tuple(collected_artifacts),
+                        tuple(collected_errors),
+                        outputs,
+                        failed_step=step,
+                        failed_outcome=outcome,
+                        directive=outcome.directive,
+                    )
                 continue
 
             _extend_unique(collected_outputs, result.datasets)
@@ -155,3 +162,13 @@ def _extend_unique(values: list[str], additions: list[str]) -> None:
 
 
 __all__ = ["AgentLoop", "PlanLoopOutcome", "resolve_plan_arguments"]
+
+
+def _outcome_message(step: PlanStep, outcome: ExecutionOutcome) -> str:
+    if outcome.verification_problems:
+        return "；".join(outcome.verification_problems)
+    if outcome.result.error is not None:
+        return outcome.result.error.message
+    if outcome.rationale:
+        return outcome.rationale
+    return f"{step.title}失败。"
