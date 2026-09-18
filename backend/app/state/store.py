@@ -28,6 +28,8 @@ from app.core.models import (
     ToolCall,
     ToolResult,
     TraceEvent,
+    User,
+    UserSession,
     WorkingMemory,
     utc_now,
 )
@@ -39,6 +41,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
+    user_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -110,11 +113,29 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
+    owner_user_id TEXT,
     scope TEXT NOT NULL,
     memory_key TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE(scope, memory_key)
+    UNIQUE(owner_user_id, scope, memory_key)
+);
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    email TEXT UNIQUE,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    payload_json TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT
 );
 CREATE TABLE IF NOT EXISTS trace_events (
     id TEXT PRIMARY KEY,
@@ -141,7 +162,38 @@ class StateStore:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.executescript(SCHEMA)
+            self._migrate_schema(db)
             db.commit()
+
+    @staticmethod
+    def _migrate_schema(db: sqlite3.Connection) -> None:
+        """为已有本地 SQLite 增加身份字段，不删除旧业务数据。"""
+
+        conversation_columns = {row[1] for row in db.execute("PRAGMA table_info(conversations)").fetchall()}
+        if "user_id" not in conversation_columns:
+            db.execute("ALTER TABLE conversations ADD COLUMN user_id TEXT")
+        memory_columns = {row[1] for row in db.execute("PRAGMA table_info(memories)").fetchall()}
+        if "owner_user_id" not in memory_columns:
+            db.execute("ALTER TABLE memories RENAME TO memories_legacy")
+            db.execute(
+                """CREATE TABLE memories (
+                id TEXT PRIMARY KEY,
+                owner_user_id TEXT,
+                scope TEXT NOT NULL,
+                memory_key TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_user_id, scope, memory_key)
+                )"""
+            )
+            db.execute(
+                """INSERT INTO memories(id,owner_user_id,scope,memory_key,payload_json,updated_at)
+                SELECT id,NULL,scope,memory_key,payload_json,updated_at FROM memories_legacy"""
+            )
+            db.execute("DROP TABLE memories_legacy")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_memories_owner ON memories(owner_user_id, scope, updated_at)")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -165,23 +217,94 @@ class StateStore:
     def _model(model_type: type[T], value: str) -> T:
         return model_type.model_validate_json(value)  # type: ignore[attr-defined]
 
-    def upsert_conversation(self, conversation_id: str, title: str, timestamp: str) -> None:
+    def save_user(self, user: User) -> None:
         with self._connect() as db:
             db.execute(
-                """INSERT INTO conversations(id,title,created_at,updated_at) VALUES(?,?,?,?)
-                ON CONFLICT(id) DO UPDATE SET title=excluded.title, updated_at=excluded.updated_at""",
-                (conversation_id, title, timestamp, timestamp),
+                """INSERT OR REPLACE INTO users(id,username,email,payload_json,created_at,updated_at)
+                VALUES(?,?,?,?,?,?)""",
+                (user.id, user.username, user.email, user.model_dump_json(), user.created_at.isoformat(), user.updated_at.isoformat()),
             )
             db.commit()
 
-    def create_conversation(self, title: str = "新对话") -> Conversation:
-        conversation = Conversation(title=title)
-        self.upsert_conversation(conversation.id, conversation.title, conversation.created_at.isoformat())
+    def count_users(self) -> int:
+        with self._connect() as db:
+            row = db.execute("SELECT COUNT(*) FROM users").fetchone()
+        return int(row[0])
+
+    def get_user(self, user_id: str) -> User | None:
+        with self._connect() as db:
+            row = db.execute("SELECT payload_json FROM users WHERE id=?", (user_id,)).fetchone()
+        return self._model(User, row[0]) if row else None
+
+    def get_user_by_username(self, username: str) -> User | None:
+        with self._connect() as db:
+            row = db.execute("SELECT payload_json FROM users WHERE username=?", (username.casefold(),)).fetchone()
+        return self._model(User, row[0]) if row else None
+
+    def get_user_by_email(self, email: str) -> User | None:
+        with self._connect() as db:
+            row = db.execute("SELECT payload_json FROM users WHERE email=?", (email.casefold(),)).fetchone()
+        return self._model(User, row[0]) if row else None
+
+    def save_session(self, session: UserSession) -> None:
+        with self._connect() as db:
+            db.execute(
+                """INSERT OR REPLACE INTO sessions(id,user_id,token_hash,payload_json,expires_at,created_at,last_seen_at)
+                VALUES(?,?,?,?,?,?,?)""",
+                (session.id, session.user_id, session.token_hash, session.model_dump_json(), session.expires_at.isoformat(), session.created_at.isoformat(), session.last_seen_at.isoformat() if session.last_seen_at else None),
+            )
+            db.commit()
+
+    def get_session(self, token_hash: str) -> UserSession | None:
+        with self._connect() as db:
+            row = db.execute("SELECT payload_json FROM sessions WHERE token_hash=?", (token_hash,)).fetchone()
+        return self._model(UserSession, row[0]) if row else None
+
+    def touch_session(self, session_id: str, timestamp) -> None:
+        with self._connect() as db:
+            row = db.execute("SELECT payload_json FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if row:
+                session = self._model(UserSession, row[0]).model_copy(update={"last_seen_at": timestamp})
+                db.execute("UPDATE sessions SET payload_json=?, last_seen_at=? WHERE id=?", (session.model_dump_json(), timestamp.isoformat(), session_id))
+                db.commit()
+
+    def delete_session(self, session_id: str) -> bool:
+        with self._connect() as db:
+            cursor = db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            db.commit()
+        return cursor.rowcount > 0
+
+    def delete_session_by_token(self, token_hash: str) -> bool:
+        with self._connect() as db:
+            cursor = db.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash,))
+            db.commit()
+        return cursor.rowcount > 0
+
+    def upsert_conversation(self, conversation_id: str, title: str, timestamp: str, user_id: str | None = None) -> None:
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO conversations(id,title,user_id,created_at,updated_at) VALUES(?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET title=excluded.title,
+                user_id=COALESCE(conversations.user_id, excluded.user_id), updated_at=excluded.updated_at""",
+                (conversation_id, title, user_id, timestamp, timestamp),
+            )
+            db.commit()
+
+    def create_conversation(self, title: str = "新对话", *, user_id: str | None = None) -> Conversation:
+        conversation = Conversation(title=title, user_id=user_id)
+        self.upsert_conversation(conversation.id, conversation.title, conversation.created_at.isoformat(), user_id)
         return conversation
 
-    def list_conversations(self, limit: int = 50) -> list[Conversation]:
+    def list_conversations(self, limit: int = 50, *, user_id: str | None = None) -> list[Conversation]:
+        query = "SELECT * FROM conversations"
+        args: tuple[Any, ...] = ()
+        if user_id is not None:
+            query += " WHERE user_id=?"
+            args = (user_id,)
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        args += (max(1, limit),)
         with self._connect() as db:
-            rows = db.execute("SELECT * FROM conversations ORDER BY updated_at DESC LIMIT ?", (max(1, limit),)).fetchall()
+            rows = db.execute(query, args).fetchall()
         return [Conversation.model_validate(dict(row)) for row in rows]
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
@@ -189,10 +312,19 @@ class StateStore:
             row = db.execute("SELECT * FROM conversations WHERE id=?", (conversation_id,)).fetchone()
         return Conversation.model_validate(dict(row)) if row else None
 
-    def delete_conversation(self, conversation_id: str) -> bool:
+    def get_conversation_for_user(self, conversation_id: str, user_id: str) -> Conversation | None:
         with self._connect() as db:
-            db.execute("DELETE FROM working_memories WHERE conversation_id=?", (conversation_id,))
-            cursor = db.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
+            row = db.execute("SELECT * FROM conversations WHERE id=? AND user_id=?", (conversation_id, user_id)).fetchone()
+        return Conversation.model_validate(dict(row)) if row else None
+
+    def delete_conversation(self, conversation_id: str, *, user_id: str | None = None) -> bool:
+        with self._connect() as db:
+            if user_id is None:
+                cursor = db.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
+            else:
+                cursor = db.execute("DELETE FROM conversations WHERE id=? AND user_id=?", (conversation_id, user_id))
+            if cursor.rowcount:
+                db.execute("DELETE FROM working_memories WHERE conversation_id=?", (conversation_id,))
             db.commit()
         return cursor.rowcount > 0
 
@@ -226,6 +358,16 @@ class StateStore:
         with self._connect() as db:
             row = db.execute("SELECT payload_json FROM tasks WHERE id=?", (task_id,)).fetchone()
         return self._model(Task, row[0]) if row else None
+
+    def task_belongs_to_user(self, task_id: str, user_id: str) -> bool:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT 1 FROM tasks t JOIN conversations c
+                ON json_extract(t.payload_json, '$.conversation_id')=c.id
+                WHERE t.id=? AND c.user_id=?""",
+                (task_id, user_id),
+            ).fetchone()
+        return row is not None
 
     def list_tasks(self, conversation_id: str | None = None, limit: int = 50) -> list[Task]:
         query = "SELECT payload_json FROM tasks"
@@ -282,9 +424,36 @@ class StateStore:
             row = db.execute("SELECT payload_json FROM runs WHERE id=?", (run_id,)).fetchone()
         return self._model(Run, row[0]) if row else None
 
-    def list_runs(self, limit: int = 50) -> list[Run]:
+    def run_belongs_to_user(self, run_id: str, user_id: str) -> bool:
         with self._connect() as db:
-            rows = db.execute("SELECT payload_json FROM runs ORDER BY updated_at DESC LIMIT ?", (max(1, limit),)).fetchall()
+            row = db.execute(
+                """SELECT 1 FROM runs r JOIN conversations c
+                ON json_extract(r.payload_json, '$.conversation_id')=c.id
+                WHERE r.id=? AND c.user_id=?""",
+                (run_id, user_id),
+            ).fetchone()
+        return row is not None
+
+    def user_id_for_run(self, run_id: str) -> str | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT c.user_id FROM runs r JOIN conversations c
+                ON json_extract(r.payload_json, '$.conversation_id')=c.id
+                WHERE r.id=?""",
+                (run_id,),
+            ).fetchone()
+        return row[0] if row else None
+
+    def list_runs(self, limit: int = 50, *, user_id: str | None = None) -> list[Run]:
+        query = "SELECT r.payload_json FROM runs r"
+        args: tuple[Any, ...] = ()
+        if user_id is not None:
+            query += " JOIN conversations c ON json_extract(r.payload_json, '$.conversation_id')=c.id WHERE c.user_id=?"
+            args = (user_id,)
+        query += " ORDER BY r.updated_at DESC LIMIT ?"
+        args += (max(1, limit),)
+        with self._connect() as db:
+            rows = db.execute(query, args).fetchall()
         return [self._model(Run, row[0]) for row in rows]
 
     def delete_run(self, run_id: str) -> bool:
@@ -353,6 +522,10 @@ class StateStore:
             row = db.execute("SELECT payload_json FROM datasets WHERE id=?", (dataset_id,)).fetchone()
         return self._model(Dataset, row[0]) if row else None
 
+    def get_dataset_for_user(self, dataset_id: str, user_id: str) -> Dataset | None:
+        dataset = self.get_dataset(dataset_id)
+        return dataset if dataset is not None and dataset.owner_user_id in {None, user_id} else None
+
     def list_datasets(self, kind: str | None = None) -> list[Dataset]:
         query = "SELECT payload_json FROM datasets"
         args: tuple[Any, ...] = ()
@@ -363,6 +536,9 @@ class StateStore:
         with self._connect() as db:
             rows = db.execute(query, args).fetchall()
         return [self._model(Dataset, row[0]) for row in rows]
+
+    def list_datasets_for_user(self, user_id: str, kind: str | None = None) -> list[Dataset]:
+        return [item for item in self.list_datasets(kind) if item.owner_user_id in {None, user_id}]
 
     def save_lineage(
         self,
@@ -422,23 +598,37 @@ class StateStore:
         items = [self._model(Artifact, row[0]) for row in rows]
         return [item for item in items if run_id is None or item.run_id == run_id]
 
+    def list_artifacts_for_user(self, user_id: str, run_id: str | None = None) -> list[Artifact]:
+        return [item for item in self.list_artifacts(run_id) if item.owner_user_id in {None, user_id}]
+
     def get_artifact(self, artifact_id: str) -> Artifact | None:
         with self._connect() as db:
             row = db.execute("SELECT payload_json FROM artifacts WHERE id=?", (artifact_id,)).fetchone()
         return self._model(Artifact, row[0]) if row else None
 
+    def get_artifact_for_user(self, artifact_id: str, user_id: str) -> Artifact | None:
+        artifact = self.get_artifact(artifact_id)
+        return artifact if artifact is not None and artifact.owner_user_id in {None, user_id} else None
+
     def save_memory(self, memory: MemoryItem) -> None:
         with self._connect() as db:
             db.execute(
-                """INSERT INTO memories(id,scope,memory_key,payload_json,updated_at) VALUES(?,?,?,?,?)
-                ON CONFLICT(scope,memory_key) DO UPDATE SET id=excluded.id,payload_json=excluded.payload_json,updated_at=excluded.updated_at""",
-                (memory.id, memory.scope, memory.key, memory.model_dump_json(), memory.updated_at.isoformat()),
+                """INSERT INTO memories(id,owner_user_id,scope,memory_key,payload_json,updated_at) VALUES(?,?,?,?,?,?)
+                ON CONFLICT(owner_user_id,scope,memory_key) DO UPDATE SET id=excluded.id,
+                payload_json=excluded.payload_json,updated_at=excluded.updated_at""",
+                (memory.id, memory.owner_user_id, memory.scope, memory.key, memory.model_dump_json(), memory.updated_at.isoformat()),
             )
             db.commit()
 
-    def list_memories(self, scope: str = "project") -> list[MemoryItem]:
+    def list_memories(self, scope: str = "project", *, owner_user_id: str | None = None) -> list[MemoryItem]:
+        query = "SELECT payload_json FROM memories WHERE scope=?"
+        args: tuple[Any, ...] = (scope,)
+        if owner_user_id is not None:
+            query += " AND owner_user_id=?"
+            args += (owner_user_id,)
+        query += " ORDER BY updated_at DESC"
         with self._connect() as db:
-            rows = db.execute("SELECT payload_json FROM memories WHERE scope=? ORDER BY updated_at DESC", (scope,)).fetchall()
+            rows = db.execute(query, args).fetchall()
         return [self._model(MemoryItem, row[0]) for row in rows]
 
     def record_event(self, event: TraceEvent) -> TraceEvent:

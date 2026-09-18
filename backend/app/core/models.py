@@ -216,6 +216,7 @@ class Dataset(StrictModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     source_dataset_ids: list[str] = Field(default_factory=list)
     created_by_run_id: str | None = None
+    owner_user_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
     @field_validator("name", "path", "format")
@@ -247,6 +248,7 @@ class Artifact(StrictModel):
     media_type: str | None = None
     dataset_id: str | None = None
     run_id: str | None = None
+    owner_user_id: str | None = None
     description: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
@@ -255,6 +257,7 @@ class Artifact(StrictModel):
 class AgentRequest(StrictModel):
     request_id: str = Field(default_factory=lambda: new_id("req"))
     conversation_id: str = Field(default_factory=lambda: new_id("conv"))
+    user_id: str | None = None
     user_input: str
     dataset_ids: list[str] = Field(default_factory=list)
     attachment_ids: list[str] = Field(default_factory=list)
@@ -445,6 +448,7 @@ class TraceEvent(StrictModel):
 class Conversation(StrictModel):
     id: str = Field(default_factory=lambda: new_id("conv"))
     title: str = "新对话"
+    user_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -460,11 +464,52 @@ class Message(StrictModel):
 
 class MemoryItem(StrictModel):
     id: str = Field(default_factory=lambda: new_id("mem"))
+    owner_user_id: str | None = None
     scope: str = "project"
     key: str
     value: str
     metadata: dict[str, Any] = Field(default_factory=dict)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class User(StrictModel):
+    """认证和资源归属使用的最小用户身份。"""
+
+    id: str = Field(default_factory=lambda: new_id("user"))
+    username: str
+    email: str | None = None
+    password_hash: str
+    display_name: str
+    is_active: bool = True
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class UserView(StrictModel):
+    """可返回给前端的安全用户视图，不包含密码哈希。"""
+
+    id: str
+    username: str
+    email: str | None = None
+    display_name: str
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_user(cls, user: User) -> UserView:
+        return cls.model_validate(user.model_dump(exclude={"password_hash"}))
+
+
+class UserSession(StrictModel):
+    """服务端 Session 记录；token 只以哈希形式持久化。"""
+
+    id: str = Field(default_factory=lambda: new_id("session"))
+    user_id: str
+    token_hash: str
+    expires_at: datetime
+    created_at: datetime = Field(default_factory=utc_now)
+    last_seen_at: datetime | None = None
 
 
 class ResolvedReference(StrictModel):

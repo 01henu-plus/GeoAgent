@@ -10,3 +10,4 @@ rasterio>=1.3,<2
 numpy>=1.26,<3
 pandas>=2.1,<3
 openai>=1.40,<3
+argon2-cffi>=23.1,<26

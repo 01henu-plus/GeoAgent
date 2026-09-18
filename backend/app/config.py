@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     max_execution_seconds: int = Field(default=300, ge=1)
     tool_timeout_seconds: int = Field(default=120, ge=1)
     model_profiles: str | None = None
+    auth_cookie_name: str = "geoagent_session"
+    auth_cookie_secure: bool = False
+    auth_session_ttl_hours: int = Field(default=168, ge=1)
+    bootstrap_user: str = ""
+    bootstrap_password: str = ""
+    bootstrap_email: str | None = None
+    bootstrap_display_name: str | None = None
 
     @property
     def database_path(self) -> Path:
