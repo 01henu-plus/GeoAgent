@@ -56,6 +56,8 @@ from app.decision import (
     ResultVerifier,
     TaskDecomposer,
 )
+from app.decision.model_provider import ModelDecisionProvider
+from app.decision.offline_provider import OfflineDecisionProvider
 from app.events import EventType
 from app.execution.tools import ToolExecutor
 from app.gis.crs.service import CRSService
@@ -66,11 +68,14 @@ from app.models import ModelAdapter, ModelRequest, ModelResponse
 from app.observability import TraceRecorder
 from app.profile import ProfilePreferenceExtractor, UserProfileService
 from app.run.lifecycle import PreparedRequest, RequestLifecycleBinder
+from app.runtime.action_dispatcher import RuntimeActionDispatcher
 from app.runtime.agent_loop import AgentLoop, PlanLoopOutcome, resolve_plan_arguments
 from app.runtime.agent_runtime import AgentRuntime, RuntimeTransition
 from app.runtime.agent_state import AgentStateBuilder
 from app.runtime.budget import BudgetExceeded, BudgetGuard
+from app.runtime.checkpoint_codec import RuntimeCheckpointCodec
 from app.runtime.context_manager import ContextManager
+from app.runtime.controller import AgentRuntimeController
 from app.runtime.lifecycle import finish_run
 from app.runtime.model_input_budget import ModelInputBudget
 from app.runtime.protocol_history import (
@@ -78,6 +83,7 @@ from app.runtime.protocol_history import (
     extract_protocol_messages,
     protocol_tool_message,
 )
+from app.runtime.session import AgentRuntimeSession, RuntimeResumeState
 from app.runtime.tool_execution_cycle import ExecutionOutcome, ToolExecutionCycle
 from app.state import StateStore, WorkingMemoryUpdater
 from app.task.service import TaskService
@@ -169,6 +175,46 @@ class MainAgent:
         self.decision_engine = DecisionEngine()
         self.agent_runtime = AgentRuntime(max_runtime_transitions=self.budget.max_runtime_transitions)
         self.lifecycle_binder = RequestLifecycleBinder(store, task_service)
+        self.runtime_checkpoint_codec = RuntimeCheckpointCodec()
+        self.model_decision_provider = ModelDecisionProvider(
+            decision_engine=self.decision_engine,
+            build_messages=self._build_model_messages,
+            refresh_datasets=self._refresh_model_datasets,
+            resolve_request_resources=self._resolve_request_resources,
+            max_tokens=self.budget.max_tokens,
+        )
+        self.offline_decision_provider = OfflineDecisionProvider(
+            legacy_intent_adapter=self.legacy_intent_adapter,
+            intent_resolver=self.intent_resolver,
+            router=self.router,
+            decomposer=self.decomposer,
+            knowledge=self.knowledge,
+            next_executable_step=self.loop.next_executable_step,
+            result_to_decision=lambda result, source: _decision_from_agent_result(result, source=source),
+            diagnose_runs=self._diagnose_runs,
+            interpret_result=self._interpret_result,
+            conversation_reply=_conversation_reply,
+        )
+        self.runtime_action_dispatcher = RuntimeActionDispatcher(
+            compatibility_handler=self._dispatch_runtime_decision,
+        )
+        self.runtime_controller = AgentRuntimeController(
+            store=self.store,
+            budget=self.budget,
+            guard=self.guard,
+            runtime=self.agent_runtime,
+            state_builder=self.state_builder,
+            decision_engine=self.decision_engine,
+            model_provider=self.model_decision_provider,
+            offline_provider=self.offline_decision_provider,
+            dispatcher=self.runtime_action_dispatcher,
+            plan_loop=self.loop,
+            model_adapter_for=self._model_adapter_for,
+            trace_decision=self._trace_runtime_decision,
+            checkpoint=self._checkpoint,
+            checkpoint_codec=self.runtime_checkpoint_codec,
+            plan_fast_path=self._execute_runtime_plan_step,
+        )
 
     async def prepare_request(
         self,
@@ -215,6 +261,7 @@ class MainAgent:
         on_model_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> AgentResult:
         resume_state = resume_from.state if resume_from else {}
+        runtime_resume = self.runtime_checkpoint_codec.decode(resume_state)
         prepared_request = prepared or await self.prepare_request(request, resume_from=resume_from)
         request = prepared_request.request
         task, run = prepared_request.task, prepared_request.run
@@ -252,9 +299,9 @@ class MainAgent:
         )
         try:
             datasets = self._resolve_datasets(request)
-            if resume_from and resume_state.get("intent") and resume_state.get("plan"):
+            if resume_from and resume_state.get("intent") and (resume_state.get("current_plan") or resume_state.get("plan")):
                 intent = IntentResult.model_validate(resume_state["intent"])
-                plan = Plan.model_validate(resume_state["plan"])
+                plan = runtime_resume.current_plan
                 phase = resume_from.phase
                 await self.trace.emit(run.id, EventType.RESUME_STARTED, f"从 Checkpoint 继续：{resume_from.phase}", payload={"checkpoint_id": resume_from.id, "phase": resume_from.phase}, agent_id="main")
             phase = "request_understood"
@@ -289,36 +336,49 @@ class MainAgent:
                 await self._checkpoint(run.id, "run_completed", {"status": run.status.value, "result": result.model_dump(mode="json")})
                 await self.trace.emit(run.id, EventType.RUN_FAILED, result.summary, payload={"status": run.status.value, "result": result.model_dump(mode="json")}, agent_id="main")
                 return result
-            run = run.model_copy(update={"status": RunStatus.PLANNING})
-            self.store.save_run(run)
             self.guard.check_execution_time(run)
-            # Model 与 Offline 只选择不同的 Decision Provider；执行控制统一进入 AgentRuntime。
+            # Model 与 Offline 只选择不同的 Decision Provider；执行控制统一进入
+            # AgentRuntimeController。_model_loop 仅作为旧调用方显式覆盖时的兼容入口。
             phase = "runtime_started"
-            result = await self._model_loop(
-                request,
-                run,
-                task,
-                datasets,
-                intent,
-                plan,
-                request_frame=request_frame,
-                initial_messages=resume_state.get("messages") if resume_from and resume_state.get("messages") else None,
-                initial_protocol_messages=resume_state.get("protocol_messages") if resume_from and isinstance(resume_state.get("protocol_messages"), list) else None,
-                initial_latest_observation=resume_state.get("latest_observation") if resume_from else None,
-                initial_latest_failure=resume_state.get("latest_failure") if resume_from and isinstance(resume_state.get("latest_failure"), dict) else None,
-                initial_findings=resume_state.get("model_findings") or resume_state.get("findings") if resume_from else None,
-                initial_dataset_ids=resume_state.get("model_dataset_ids") or resume_state.get("dataset_ids") if resume_from else None,
-                initial_artifact_ids=resume_state.get("model_artifact_ids") or resume_state.get("artifact_ids") if resume_from else None,
-                initial_subagent_results=resume_state.get("subagent_results") if resume_from and isinstance(resume_state.get("subagent_results"), list) else None,
-                initial_delegation_fingerprints=resume_state.get("completed_delegation_fingerprints") if resume_from and isinstance(resume_state.get("completed_delegation_fingerprints"), list) else None,
-                initial_legacy_delegation_result=resume_state.get("delegation_result") if resume_from and isinstance(resume_state.get("delegation_result"), dict) else None,
-                initial_original_plan=resume_state.get("original_plan") if resume_from and isinstance(resume_state.get("original_plan"), dict) else None,
-                working_memory=working_memory,
-                initial_plan_completed_steps=resume_state.get("completed_steps") if resume_from and isinstance(resume_state.get("completed_steps"), list) else None,
-                initial_plan_step_outputs=resume_state.get("step_outputs") if resume_from and isinstance(resume_state.get("step_outputs"), dict) else None,
-                initial_previous_replan_reasons=resume_state.get("previous_replan_reasons") if resume_from and isinstance(resume_state.get("previous_replan_reasons"), list) else None,
-                on_model_delta=on_model_delta,
-            )
+            if self._model_loop_is_overridden():
+                result = await self._model_loop(
+                    request,
+                    run,
+                    task,
+                    datasets,
+                    intent,
+                    plan,
+                    request_frame=request_frame,
+                    initial_protocol_messages=runtime_resume.protocol_messages,
+                    initial_latest_observation=runtime_resume.latest_observation,
+                    initial_latest_failure=runtime_resume.latest_failure,
+                    initial_findings=runtime_resume.findings,
+                    initial_dataset_ids=runtime_resume.dataset_ids,
+                    initial_artifact_ids=runtime_resume.artifact_ids,
+                    initial_subagent_results=runtime_resume.subagent_results,
+                    initial_delegation_fingerprints=runtime_resume.completed_delegation_fingerprints,
+                    initial_legacy_delegation_result=runtime_resume.legacy_delegation_result,
+                    initial_original_plan=runtime_resume.original_plan.model_dump(mode="json") if runtime_resume.original_plan else None,
+                    working_memory=working_memory,
+                    initial_plan_completed_steps=runtime_resume.completed_steps,
+                    initial_plan_step_outputs=runtime_resume.step_outputs,
+                    initial_previous_replan_reasons=runtime_resume.previous_replan_reasons,
+                    on_model_delta=on_model_delta,
+                )
+            else:
+                outcome = await self.runtime_controller.run(
+                    request,
+                    run=run,
+                    task=task,
+                    datasets=datasets,
+                    intent=intent,
+                    plan=plan,
+                    request_frame=request_frame,
+                    working_memory=working_memory,
+                    resume=runtime_resume,
+                    on_model_delta=on_model_delta,
+                )
+                result = self._finalize_runtime_outcome(outcome, task=task, run=run)
             final_status = _run_status_for_result(result.status, result.error)
             run = finish_run(self.store.get_run(run.id) or run, final_status, error=result.error)
             self.store.save_run(run.model_copy(update={"metadata": {**run.metadata, "result": result.model_dump(mode="json")}}))
@@ -399,6 +459,12 @@ class MainAgent:
             await self.trace.emit(run.id, EventType.RUN_FAILED, str(exc), payload={"error_type": exc.__class__.__name__}, agent_id="main")
             return AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.FAILED, summary="任务执行失败。", error=str(exc), trace_id=run.id)
 
+    def _model_loop_is_overridden(self) -> bool:
+        """仅识别旧调用方显式替换的 wrapper；默认生产路径不经过它。"""
+
+        bound = getattr(self._model_loop, "__func__", None)
+        return bound is not MainAgent._model_loop
+
     async def _model_loop(
         self,
         request: AgentRequest,
@@ -426,7 +492,7 @@ class MainAgent:
         initial_previous_replan_reasons: list[str] | None = None,
         on_model_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> AgentResult:
-        """兼容入口；模型和无模型请求都交给同一个 AgentRuntime。"""
+        """兼容入口；默认生产路径由 RuntimeController 直接承载。"""
 
         return await self._run_agent_runtime(
             request,
@@ -482,27 +548,30 @@ class MainAgent:
         on_model_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> AgentResult:
         model_adapter = self._model_adapter_for(request)
-        session: dict[str, Any] = {
-            "protocol_messages": extract_protocol_messages(protocol_messages=initial_protocol_messages, legacy_messages=initial_messages),
-            "findings": list(initial_findings or []),
-            "dataset_ids": set(initial_dataset_ids or []),
-            "artifact_ids": set(initial_artifact_ids or []),
-            "latest_observation": _observation_from_checkpoint(initial_latest_observation),
-            "latest_failure": dict(initial_latest_failure or {}) or None,
-            "datasets": list(datasets),
-            "plan": plan,
-            "original_plan": Plan.model_validate(initial_original_plan) if initial_original_plan else plan.model_copy(deep=True) if plan is not None else None,
-            "completed_steps": set(initial_plan_completed_steps or []),
-            "step_outputs": dict(initial_plan_step_outputs or {}),
-            "previous_replan_reasons": list(initial_previous_replan_reasons or []),
-            "subagent_results": list(initial_subagent_results or []),
-            "completed_delegation_fingerprints": set(initial_delegation_fingerprints or []),
-            "legacy_delegation_result": dict(initial_legacy_delegation_result) if initial_legacy_delegation_result else None,
-            "run": run,
-            "working_memory": working_memory,
-            "fast_path_enabled": plan is not None,
-            "decision_provider": "model" if model_adapter is not None else "offline",
-        }
+        resume = RuntimeResumeState(
+            protocol_messages=extract_protocol_messages(protocol_messages=initial_protocol_messages, legacy_messages=initial_messages),
+            findings=list(initial_findings or []),
+            dataset_ids=list(initial_dataset_ids or []),
+            artifact_ids=list(initial_artifact_ids or []),
+            latest_observation=_observation_from_checkpoint(initial_latest_observation),
+            latest_failure=dict(initial_latest_failure or {}) or None,
+            subagent_results=list(initial_subagent_results or []),
+            completed_delegation_fingerprints=list(initial_delegation_fingerprints or []),
+            legacy_delegation_result=dict(initial_legacy_delegation_result) if initial_legacy_delegation_result else None,
+            current_plan=plan,
+            original_plan=Plan.model_validate(initial_original_plan) if initial_original_plan else None,
+            completed_steps=list(initial_plan_completed_steps or []),
+            step_outputs=dict(initial_plan_step_outputs or {}),
+            previous_replan_reasons=list(initial_previous_replan_reasons or []),
+        )
+        session = AgentRuntimeSession.from_resume(
+            run=run,
+            datasets=list(datasets),
+            plan=plan,
+            working_memory=working_memory,
+            resume=resume,
+            decision_provider="model" if model_adapter is not None else "offline",
+        )
 
         await self._checkpoint(
             run.id,
@@ -640,7 +709,7 @@ class MainAgent:
         datasets,
         intent: IntentResult | None,
         request_frame: RequestFrame | None,
-        session: dict[str, Any],
+        session: AgentRuntimeSession,
         *,
         model_adapter: ModelAdapter,
         on_model_delta: Callable[[str], Awaitable[None]] | None = None,
@@ -704,7 +773,7 @@ class MainAgent:
         task: Task | None,
         intent: IntentResult | None,
         request_frame: RequestFrame | None,
-        session: dict[str, Any],
+        session: AgentRuntimeSession,
     ) -> AgentDecision:
         """Offline Decision Provider：只复用旧 Planner/Router 生成 AgentDecision。"""
 
@@ -830,7 +899,7 @@ class MainAgent:
         task: Task | None,
         intent: IntentResult | None,
         request_frame: RequestFrame | None,
-        session: dict[str, Any],
+        session: AgentRuntimeSession,
     ) -> RuntimeTransition:
         """把 AgentDecision 分派到已有执行能力，不在此处重复实现工具语义。"""
 
@@ -873,6 +942,8 @@ class MainAgent:
         if decision.type.value == "PLAN":
             if intent is None:
                 intent = self.legacy_intent_adapter.to_intent(request_frame, request, session["datasets"])
+            current_run = self.store.get_run(session["run"].id) or session["run"]
+            self.store.save_run(current_run.model_copy(update={"status": RunStatus.PLANNING}))
             new_plan = self.planner.build(decision.plan_goal or state.goal, intent, session["datasets"])
             session["plan"] = new_plan
             session["original_plan"] = new_plan.model_copy(deep=True)
@@ -880,6 +951,9 @@ class MainAgent:
             session["completed_steps"] = set()
             session["step_outputs"] = {}
             session["latest_failure"] = None
+            running = self.store.get_run(session["run"].id) or session["run"]
+            session["run"] = running.model_copy(update={"status": RunStatus.RUNNING})
+            self.store.save_run(session["run"])
             await self.trace.emit(run.id, EventType.PLAN_CREATED, f"生成运行时计划：{len(new_plan.steps)} 步", payload={**new_plan.model_dump(mode="json"), "source": "agent_runtime"}, agent_id="main")
             await self._checkpoint(run.id, "plan_created", self._runtime_checkpoint_state(request, intent, request_frame, session))
             return RuntimeTransition(current_plan=new_plan)
@@ -1013,6 +1087,9 @@ class MainAgent:
         session["latest_failure"] = batch_failure
         latest_observation = _batch_observation(batch_observations)
         session["latest_observation"] = latest_observation
+        current_run = self.store.get_run(session["run"].id) or session["run"]
+        session["run"] = current_run.model_copy(update={"status": RunStatus.RUNNING})
+        self.store.save_run(session["run"])
         bounded_protocol = compact_protocol_messages(session["protocol_messages"], max_tokens=self.budget.protocol_history_tokens)
         session["protocol_messages"] = bounded_protocol
         await self._checkpoint(
@@ -1038,7 +1115,7 @@ class MainAgent:
         task: Task | None,
         intent: IntentResult | None,
         request_frame: RequestFrame | None,
-        session: dict[str, Any],
+        session: AgentRuntimeSession,
     ) -> RuntimeTransition:
         if step.tool_name is None:
             session["completed_steps"].add(step.id)
@@ -1046,6 +1123,9 @@ class MainAgent:
             return RuntimeTransition(completed_steps=(step.id,), current_plan=session["plan"])
         arguments = self._complete_plan_arguments(step.tool_name, resolve_plan_arguments(step.arguments, session["step_outputs"]), user_id=request.user_id)
         outcome = await self.tool_execution_cycle.execute(session["run"], step.tool_name, arguments, user_id=request.user_id)
+        current_run = self.store.get_run(session["run"].id) or session["run"]
+        session["run"] = current_run.model_copy(update={"status": RunStatus.RUNNING})
+        self.store.save_run(session["run"])
         session["findings"].append(
             {
                 "step_id": step.id,
@@ -1186,6 +1266,8 @@ class MainAgent:
             "previous_replan_reasons": list(session.get("previous_replan_reasons", [])),
         }
         original_plan = session.get("original_plan") or current_plan.model_copy(deep=True)
+        current_run = self.store.get_run(run.id) or run
+        self.store.save_run(current_run.model_copy(update={"status": RunStatus.REPLANNING}))
         try:
             revised, next_state = await self._replan_plan(
                 request,
@@ -1226,6 +1308,8 @@ class MainAgent:
         session["latest_failure"] = None
         session["fast_path_enabled"] = True
         session["run"] = self.store.get_run(run.id) or run
+        session["run"] = session["run"].model_copy(update={"status": RunStatus.RUNNING})
+        self.store.save_run(session["run"])
         return RuntimeTransition(
             current_plan=revised,
             clear_failure=True,
@@ -1462,9 +1546,21 @@ class MainAgent:
         request: AgentRequest,
         intent: IntentResult | None,
         request_frame: RequestFrame | None,
-        session: dict[str, Any],
+        session: AgentRuntimeSession,
     ) -> dict[str, Any]:
         """Runtime 的统一恢复视图；Context 和完整 Tool 输出不写入其中。"""
+
+        if isinstance(session, AgentRuntimeSession):
+            current_run = self.store.get_run(session.run.id) if session.run is not None else None
+            if current_run is not None:
+                session.run = current_run
+            return self.runtime_checkpoint_codec.encode(
+                request,
+                intent,
+                request_frame,
+                session,
+                replan_count=current_run.replan_count if current_run is not None else None,
+            )
 
         current_run = self.store.get_run(session["run"].id) or session["run"]
         plan = session.get("plan")
@@ -1516,7 +1612,7 @@ class MainAgent:
         *,
         request_frame: RequestFrame | None = None,
         phase: str = "step_completed",
-        runtime_session: dict[str, Any] | None = None,
+        runtime_session: AgentRuntimeSession | None = None,
         **state: Any,
     ) -> None:
         if runtime_session is not None:
