@@ -5,9 +5,11 @@ from app.core.models import (
     AgentRequest,
     AgentResult,
     AgentResultStatus,
+    CRSInfo,
     Dataset,
     DatasetKind,
     ErrorCategory,
+    LoopDirective,
     Run,
     SubAgentExecutionResult,
     SubTask,
@@ -19,6 +21,7 @@ from app.core.models import (
     WorkingMemoryItem,
 )
 from app.demo import seed_demo
+from app.runtime.tool_execution_cycle import ExecutionOutcome
 from app.state import WorkingMemoryUpdater
 
 
@@ -186,7 +189,8 @@ def test_failed_subagent_without_outputs_does_not_add_resources(application):
 
 
 def test_subagent_partial_execution_returns_delta_without_persisting_parent_memory(application):
-    dataset = Dataset(id="dataset-subagent-partial", name="dem.tif", kind=DatasetKind.RASTER, path="dem.tif", format="tif")
+    dataset = Dataset(id="dataset-subagent-partial", name="dem.tif", kind=DatasetKind.RASTER, path="dem.tif", format="tif", crs=CRSInfo(authority="EPSG:4326"))
+    application.registry.register(dataset)
     task = application.task_service.create("计算坡度", conversation_id="conv-subagent-partial")
     parent_run = Run(task_id=task.id, conversation_id=task.conversation_id, agent_id="main")
     application.store.save_run(parent_run)
@@ -198,9 +202,10 @@ def test_subagent_partial_execution_returns_delta_without_persisting_parent_memo
             call_id="slope",
             status=ToolStatus.FAILED,
             error=ToolError(code="CRS_UNIT_MISMATCH", category=ErrorCategory.CRS, message="需要投影坐标系"),
-        ),
-        "crs.reproject": ToolResult(call_id="reproject", status=ToolStatus.SUCCESS, datasets=["projected-dem"]),
-    }
+            ),
+            "crs.reproject": ToolResult(call_id="reproject", status=ToolStatus.SUCCESS, datasets=["projected-dem"]),
+            "raster.reproject": ToolResult(call_id="reproject", status=ToolStatus.SUCCESS, datasets=["projected-dem"]),
+        }
 
     async def fake_call(run, name, arguments):
         if name == "raster.slope" and arguments["dataset_id"] == "projected-dem":
@@ -223,9 +228,193 @@ def test_subagent_partial_execution_returns_delta_without_persisting_parent_memo
         )
     )
 
-    assert execution.result.status is AgentResultStatus.PARTIAL
-    assert "projected-dem" in execution.working_memory_delta.added_dataset_ids
+    assert execution.result.status is AgentResultStatus.FAILED
+    assert execution.directive is LoopDirective.ABORT
+    assert "projected-dem" not in execution.working_memory_delta.added_dataset_ids
     assert application.store.get_working_memory(task.id).active_dataset_ids == [dataset.id]
+
+
+def test_subagent_retry_uses_shared_cycle_and_accepts_only_final_result(application):
+    dataset = Dataset(id="dataset-subagent-retry", name="roads.geojson", kind=DatasetKind.VECTOR, path="roads.geojson", format="geojson")
+    application.registry.register(dataset)
+    task = application.task_service.create("检查道路", conversation_id="conv-subagent-retry")
+    parent_run = Run(task_id=task.id, conversation_id=task.conversation_id, agent_id="main")
+    application.store.save_run(parent_run)
+    calls = []
+    responses = [
+        ToolResult(call_id="inspect", status=ToolStatus.SUCCESS, output={"ok": True}),
+        ToolResult(call_id="validate-failed", status=ToolStatus.FAILED, retryable=True, error=ToolError(code="EXECUTION_TIMEOUT", message="临时超时")),
+        ToolResult(call_id="validate-ok", status=ToolStatus.SUCCESS, output={"valid": True}),
+    ]
+
+    async def fake_call(run, name, arguments):
+        calls.append(name)
+        return responses.pop(0)
+
+    application.sub_agent._call = fake_call
+    execution = asyncio.run(
+        application.sub_agent.run(
+            AgentRequest(user_input="检查道路", conversation_id=task.conversation_id),
+            SubTask(goal="道路质量", description="检查道路数据", operation="vector.validate", dataset_ids=[dataset.id]),
+            [dataset],
+            parent_task_id=task.id,
+            parent_run_id=parent_run.id,
+            working_memory_snapshot=None,
+        )
+    )
+
+    assert execution.result.status is AgentResultStatus.SUCCESS
+    assert execution.directive is LoopDirective.CONTINUE
+    assert calls == ["dataset.inspect", "vector.validate", "vector.validate"]
+    assert execution.working_memory_delta.added_dataset_ids == []
+
+
+def test_subagent_repair_accepts_final_dataset_without_internal_repair_dataset(application):
+    dataset = Dataset(id="dataset-subagent-repair", name="dem.tif", kind=DatasetKind.RASTER, path="dem.tif", format="tif", crs=CRSInfo(authority="EPSG:4326"))
+    application.registry.register(dataset)
+    task = application.task_service.create("计算坡度", conversation_id="conv-subagent-repair")
+    parent_run = Run(task_id=task.id, conversation_id=task.conversation_id, agent_id="main")
+    application.store.save_run(parent_run)
+    responses = {
+        "dataset.inspect": ToolResult(call_id="inspect", status=ToolStatus.SUCCESS, output={"ok": True}),
+        "raster.slope": [
+            ToolResult(call_id="slope-failed", status=ToolStatus.FAILED, error=ToolError(code="CRS_UNIT_MISMATCH", message="需要投影坐标系")),
+            ToolResult(call_id="slope-final", status=ToolStatus.SUCCESS, datasets=["slope-final"], output={"ok": True}),
+        ],
+        "raster.reproject": ToolResult(call_id="reproject", status=ToolStatus.SUCCESS, datasets=["projected-dem"]),
+    }
+
+    async def fake_call(run, name, arguments):
+        value = responses[name]
+        return value.pop(0) if isinstance(value, list) else value
+
+    application.sub_agent._call = fake_call
+    application.sub_agent.tool_execution_cycle.verifier = type("Verifier", (), {"verify": lambda self, result, datasets: (True, [])})()
+    execution = asyncio.run(
+        application.sub_agent.run(
+            AgentRequest(user_input="计算坡度", conversation_id=task.conversation_id),
+            SubTask(goal="地形坡度", description="计算 DEM 坡度", operation="raster.slope", dataset_ids=[dataset.id]),
+            [dataset],
+            parent_task_id=task.id,
+            parent_run_id=parent_run.id,
+            working_memory_snapshot=None,
+        )
+    )
+
+    assert execution.result.status is AgentResultStatus.SUCCESS
+    assert execution.working_memory_delta.added_dataset_ids == ["slope-final"]
+    assert "projected-dem" not in execution.working_memory_delta.added_dataset_ids
+    assert execution.result.datasets == [dataset.id, "slope-final"]
+
+
+def test_subagent_directives_stop_local_execution_without_planner(application):
+    dataset = Dataset(id="dataset-subagent-directive", name="roads.geojson", kind=DatasetKind.VECTOR, path="roads.geojson", format="geojson")
+    application.registry.register(dataset)
+    task = application.task_service.create("执行子任务", conversation_id="conv-subagent-directive")
+    parent_run = Run(task_id=task.id, conversation_id=task.conversation_id, agent_id="main")
+    original = application.sub_agent.tool_execution_cycle.execute
+
+    async def run_directive(directive):
+        calls = []
+
+        async def execute(*args, **kwargs):
+            calls.append(args[1])
+            return ExecutionOutcome(
+                result=ToolResult(call_id="failed", status=ToolStatus.FAILED, error=ToolError(code="INPUT", message="需要补充条件")),
+                verified=False,
+                verification_problems=[],
+                recovery_action=None,
+                attempts=1,
+                accepted=False,
+                directive=directive,
+                rationale="执行层返回控制信号",
+            )
+
+        application.sub_agent.tool_execution_cycle.execute = execute
+        try:
+            execution = await application.sub_agent.run(
+                AgentRequest(user_input="执行子任务", conversation_id=task.conversation_id),
+                SubTask(goal="道路质量", description="检查道路", operation="vector.validate", dataset_ids=[dataset.id]),
+                [dataset],
+                parent_task_id=task.id,
+                parent_run_id=parent_run.id,
+                working_memory_snapshot=None,
+            )
+        finally:
+            application.sub_agent.tool_execution_cycle.execute = original
+        return execution, calls
+
+    ask, ask_calls = asyncio.run(run_directive(LoopDirective.ASK_USER))
+    replan, replan_calls = asyncio.run(run_directive(LoopDirective.REPLAN))
+    abort, abort_calls = asyncio.run(run_directive(LoopDirective.ABORT))
+
+    assert ask.result.status is AgentResultStatus.BLOCKED and ask.result.error == "WAITING_USER"
+    assert replan.result.status is AgentResultStatus.BLOCKED and replan.result.error == "REPLAN_REQUIRED"
+    assert abort.result.status is AgentResultStatus.FAILED
+    assert ask.directive is LoopDirective.ASK_USER
+    assert replan.directive is LoopDirective.REPLAN
+    assert abort.directive is LoopDirective.ABORT
+    assert ask_calls == replan_calls == abort_calls == ["dataset.inspect"]
+
+
+def test_mainagent_delegation_aggregates_required_directives(application):
+    task = application.task_service.create("聚合子任务", conversation_id="conv-delegation-directive")
+    parent_run = Run(task_id=task.id, conversation_id=task.conversation_id, agent_id="main")
+    application.store.save_run(parent_run)
+    request = AgentRequest(user_input="聚合子任务", conversation_id=task.conversation_id)
+    subtask = SubTask(id="required-subtask", goal="检查", description="检查数据", required=True)
+    original_manager = application.main_agent.agent_manager
+
+    def execution(directive, status, error):
+        return SubAgentExecutionResult(
+            result=AgentResult(agent_id="subagent", task_id=task.id, status=status, summary="子任务结果", error=error, trace_id="sub-run"),
+            directive=directive,
+            failure_rationale=error,
+        )
+
+    async def run_with(value):
+        class FakeManager:
+            async def run(self, *args, **kwargs):
+                return [value]
+
+        application.main_agent.agent_manager = FakeManager()
+        try:
+            return await application.main_agent._delegate(request, parent_run, task, [], [subtask], working_memory=None)
+        finally:
+            application.main_agent.agent_manager = original_manager
+
+    ask = asyncio.run(run_with(execution(LoopDirective.ASK_USER, AgentResultStatus.BLOCKED, "缺少字段")))
+    replan = asyncio.run(run_with(execution(LoopDirective.REPLAN, AgentResultStatus.BLOCKED, "算法不适用")))
+    abort = asyncio.run(run_with(execution(LoopDirective.ABORT, AgentResultStatus.FAILED, "工具失败")))
+
+    assert ask.status is AgentResultStatus.BLOCKED and ask.error == "WAITING_USER"
+    assert replan.status is AgentResultStatus.BLOCKED and replan.error == "REPLAN_REQUIRED"
+    assert abort.status is AgentResultStatus.FAILED
+
+
+def test_agent_manager_preserves_subagent_directive(application):
+    class FakeSubAgent:
+        async def run(self, request, subtask, datasets, **kwargs):
+            return SubAgentExecutionResult(
+                result=AgentResult(agent_id="subagent", task_id=kwargs["parent_task_id"], status=AgentResultStatus.BLOCKED, summary="等待用户", error="WAITING_USER", trace_id="sub-run"),
+                directive=LoopDirective.ASK_USER,
+                failure_rationale="缺少输入",
+            )
+
+    manager = AgentManager(FakeSubAgent(), max_parallel=1)
+    executions = asyncio.run(
+        manager.run(
+            AgentRequest(user_input="检查", conversation_id="conv-manager-directive"),
+            [SubTask(id="sub-directive", goal="检查", description="检查")],
+            [],
+            parent_task_id="task-manager-directive",
+            parent_run_id="run-manager-directive",
+            working_memory_snapshot=None,
+        )
+    )
+
+    assert executions[0].directive is LoopDirective.ASK_USER
+    assert executions[0].failure_rationale == "缺少输入"
 
 
 def test_main_agent_tool_outputs_are_also_reflected_in_working_memory(application):

@@ -83,7 +83,7 @@ def _run():
     return Run(task_id="task-1", conversation_id="conversation-1", agent_id="main")
 
 
-def _cycle(executor, *, verifier=None, failure_analyzer=None, produces_dataset=False, budget=None, registry=None, updater=None):
+def _cycle(executor, *, verifier=None, failure_analyzer=None, produces_dataset=False, budget=None, registry=None):
     return ToolExecutionCycle(
         raw_executor=executor,
         tool_registry=FakeToolRegistry(produces_dataset=produces_dataset),
@@ -92,15 +92,13 @@ def _cycle(executor, *, verifier=None, failure_analyzer=None, produces_dataset=F
         failure_analyzer=failure_analyzer or FailureAnalyzer(),
         verifier=verifier or ResultVerifier(),
         budget=budget or RunBudget(max_retry_per_action=1),
-        working_memory_updater=updater or FakeMemoryUpdater(),
     )
 
 
-def test_success_and_verification_update_working_memory():
+def test_success_and_verification_returns_accepted_outcome_without_state_side_effect():
     executor = SequenceExecutor([ToolResult(call_id="call", status=ToolStatus.SUCCESS, datasets=["out"])])
-    updater = FakeMemoryUpdater()
     verifier = SimpleNamespace(verify=lambda result, datasets: (True, []))
-    cycle = _cycle(executor, produces_dataset=True, verifier=verifier, updater=updater)
+    cycle = _cycle(executor, produces_dataset=True, verifier=verifier)
 
     outcome = asyncio.run(cycle.execute(_run(), "raster.slope", {"dataset_id": "dem"}, user_id="user-a"))
 
@@ -108,21 +106,18 @@ def test_success_and_verification_update_working_memory():
     assert outcome.verified is True
     assert outcome.directive is LoopDirective.CONTINUE
     assert outcome.attempts == 1
-    assert updater.accepted[0][1].datasets == ["out"]
 
 
 def test_verification_failure_does_not_update_working_memory():
     executor = SequenceExecutor([ToolResult(call_id="call", status=ToolStatus.SUCCESS, datasets=["bad"])])
-    updater = FakeMemoryUpdater()
     verifier = SimpleNamespace(verify=lambda result, datasets: (False, ["结果不可读"]))
-    cycle = _cycle(executor, produces_dataset=True, verifier=verifier, updater=updater)
+    cycle = _cycle(executor, produces_dataset=True, verifier=verifier)
 
     outcome = asyncio.run(cycle.execute(_run(), "raster.slope", {"dataset_id": "dem"}, user_id="user-a"))
 
     assert outcome.accepted is False
     assert outcome.verification_problems == ["结果不可读"]
     assert outcome.directive is LoopDirective.ABORT
-    assert updater.accepted == []
 
 
 def test_retry_success_accepts_only_final_result():
@@ -132,15 +127,13 @@ def test_retry_success_accepts_only_final_result():
             ToolResult(call_id="second", status=ToolStatus.SUCCESS, output={"ok": True}),
         ]
     )
-    updater = FakeMemoryUpdater()
-    cycle = _cycle(executor, updater=updater)
+    cycle = _cycle(executor)
 
     outcome = asyncio.run(cycle.execute(_run(), "dataset.inspect", {}, user_id="user-a"))
 
     assert outcome.accepted is True
     assert outcome.attempts == 2
     assert outcome.original_result.call_id == "first"
-    assert updater.accepted[0][1].call_id == "second"
 
 
 def test_retry_stops_at_budget():
@@ -183,7 +176,6 @@ def test_repair_success_retries_original_tool_without_accepting_repair_dataset()
         async def _repair_arguments(self, run, tool_name, arguments, error_code, *, user_id):
             return {**arguments, "dataset_id": "projected"}
 
-    updater = FakeMemoryUpdater()
     cycle = RepairCycle(
         raw_executor=executor,
         tool_registry=FakeToolRegistry(produces_dataset=True),
@@ -192,7 +184,6 @@ def test_repair_success_retries_original_tool_without_accepting_repair_dataset()
         failure_analyzer=FixedFailureAnalyzer(FailureAction.REPAIR),
         verifier=SimpleNamespace(verify=lambda result, datasets: (True, [])),
         budget=RunBudget(max_retry_per_action=1),
-        working_memory_updater=updater,
     )
 
     outcome = asyncio.run(cycle.execute(_run(), "raster.slope", {"dataset_id": "dem"}, user_id="user-a"))
@@ -200,7 +191,6 @@ def test_repair_success_retries_original_tool_without_accepting_repair_dataset()
     assert outcome.accepted is True
     assert outcome.attempts == 2
     assert [call[0] for call in executor.calls] == ["raster.slope", "raster.slope"]
-    assert updater.accepted[0][1].datasets == ["slope"]
 
 
 def test_repair_failure_does_not_loop():
@@ -218,7 +208,6 @@ def test_repair_failure_does_not_loop():
         failure_analyzer=FixedFailureAnalyzer(FailureAction.REPAIR),
         verifier=ResultVerifier(),
         budget=RunBudget(max_retry_per_action=1),
-        working_memory_updater=FakeMemoryUpdater(),
     )
 
     outcome = asyncio.run(cycle.execute(_run(), "raster.slope", {}, user_id="user-a"))
@@ -238,8 +227,7 @@ def test_crs_repair_tool_is_internal_and_only_final_result_is_accepted():
             ToolResult(call_id="final", status=ToolStatus.SUCCESS, datasets=["intersection"]),
         ]
     )
-    updater = FakeMemoryUpdater()
-    cycle = _cycle(executor, registry=FakeRegistry([left, right]), updater=updater)
+    cycle = _cycle(executor, registry=FakeRegistry([left, right]))
 
     outcome = asyncio.run(
         cycle.execute(
@@ -252,7 +240,6 @@ def test_crs_repair_tool_is_internal_and_only_final_result_is_accepted():
 
     assert outcome.accepted is True
     assert [call[0] for call in executor.calls] == ["vector.intersection", "crs.reproject", "vector.intersection"]
-    assert updater.accepted[0][1].datasets == ["intersection"]
 
 
 def test_cycle_uses_user_scoped_registry_for_verification():
