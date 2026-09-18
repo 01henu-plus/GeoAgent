@@ -42,8 +42,14 @@ def test_model_loop_passes_tools_and_executes_tool(application):
     assert result.summary == "模型已根据工具结果完成检查。"
     assert fake.requests[0].tools
     assert any(item["function"]["name"] == "dataset.inspect" for item in fake.requests[0].tools)
+    assert "input_schema" not in fake.requests[0].messages[1]["content"]
     assert any(message.get("role") == "tool" for message in fake.requests[1].messages)
     assert application.store.get_run(result.trace_id).turn_count == 2
+
+    first_context = json.loads(fake.requests[0].messages[1]["content"].split("\n", 1)[1])
+    second_context = json.loads(fake.requests[1].messages[1]["content"].split("\n", 1)[1])
+    assert first_context["run_state"]["turn_count"] == 1
+    assert second_context["run_state"]["turn_count"] == 2
 
 
 def test_model_runtime_gets_first_chance_when_offline_rules_would_ask(application):

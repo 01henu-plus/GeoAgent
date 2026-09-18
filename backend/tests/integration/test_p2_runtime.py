@@ -14,7 +14,7 @@ from app.runtime.context_manager import ContextManager
 def test_context_manager_keeps_large_context_bounded():
     from app.core.models import AgentRequest, Dataset, DatasetKind
 
-    context = ContextManager(max_chars=400).main_context(
+    context = ContextManager(max_tokens=120).main_context(
         AgentRequest(user_input="request " + "x" * 1000),
         [Dataset(name="roads", kind=DatasetKind.VECTOR, path="roads.geojson", format="geojson", metadata={"notes": "y" * 1000})],
         None,
@@ -22,7 +22,10 @@ def test_context_manager_keeps_large_context_bounded():
     )
 
     assert context["truncated"] is True
-    assert len(json.dumps(context, ensure_ascii=False, separators=(",", ":"), default=str)) <= 400
+    assert context["context_meta"]["over_budget"] is True
+    assert context["context_meta"]["overflow_tokens"] > 0
+    assert "request_frame" in context
+    assert "working_memory" in context
 
 
 def test_api_exposes_tool_schemas_memory_and_metrics(application, authenticated_client):
@@ -172,6 +175,11 @@ def test_model_checkpoint_resume_keeps_tool_outputs(application, authenticated_c
     application.main_agent._checkpoint = original_checkpoint
 
     assert cancelled.status is AgentResultStatus.CANCELLED
+    checkpoint = application.checkpoints.latest(cancelled.trace_id)
+    assert checkpoint is not None
+    assert checkpoint.state.get("protocol_messages")
+    assert checkpoint.state["latest_observation"]["call_id"] == "inspect-once"
+    assert "messages" not in checkpoint.state
     with authenticated_client as client:
         response = client.post(f"/api/v1/runs/{cancelled.trace_id}/resume")
 
@@ -179,4 +187,5 @@ def test_model_checkpoint_resume_keeps_tool_outputs(application, authenticated_c
     resumed = response.json()["result"]
     assert resumed["status"] == "SUCCESS"
     assert ids["roads"] in resumed["datasets"]
+    assert "inspect-once" in model.requests[1].messages[1]["content"]
     assert len(model.requests) == 2
