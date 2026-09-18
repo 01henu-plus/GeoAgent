@@ -228,7 +228,8 @@ class SubAgent:
         self.guard.check_turn(current)
         self.guard.check_tool(current)
         self.guard.check_execution_time(current)
-        current = current.model_copy(update={"turn_count": current.turn_count + 1, "tool_call_count": current.tool_call_count + 1, "status": RunStatus.WAITING_TOOL})
+        # SubAgent 当前是确定性执行器，没有独立认知回合；这里只累计工具调用。
+        current = current.model_copy(update={"tool_call_count": current.tool_call_count + 1, "status": RunStatus.WAITING_TOOL})
         self.store.save_run(current)
         call = ToolCall(id=call_id or new_id("call"), name=name, arguments=arguments, run_id=current.id, agent_id=current.agent_id, attempt=attempt)
         user_id = self.store.user_id_for_run(current.id)
