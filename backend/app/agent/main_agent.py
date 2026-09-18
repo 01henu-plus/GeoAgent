@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from app.agent.manager import AgentManager
@@ -31,6 +33,8 @@ from app.core.models import (
     Run,
     RunBudget,
     RunStatus,
+    SubAgentExecutionResult,
+    SubTask,
     Task,
     TaskStatus,
     ToolCall,
@@ -94,6 +98,22 @@ _MODEL_SYSTEM_PROMPT = """
 """.strip()
 
 _MODEL_CONTEXT_INSTRUCTION = "请优先依据当前请求、RequestFrame、WorkingMemory 和最新工具观察回答；只在确有必要时调用提供的空间工具。"
+
+
+@dataclass(frozen=True, slots=True)
+class DelegationExecutionResult:
+    """一次委派动作的观察结果，不等同于 MainAgent 最终 AgentResult。"""
+
+    tasks: tuple[SubTask, ...]
+    executions: tuple[SubAgentExecutionResult, ...]
+    directive: LoopDirective
+    findings: tuple[Any, ...]
+    dataset_ids: tuple[str, ...]
+    artifact_ids: tuple[str, ...]
+    observation: dict[str, Any]
+    subagent_results: tuple[dict[str, Any], ...]
+    latest_failure: dict[str, Any] | None
+    fingerprint: str
 
 
 class MainAgent:
@@ -292,6 +312,8 @@ class MainAgent:
                     initial_findings=resume_state.get("model_findings") if resume_from and resume_state.get("model_findings") else None,
                     initial_dataset_ids=resume_state.get("model_dataset_ids") if resume_from and resume_state.get("model_dataset_ids") else None,
                     initial_artifact_ids=resume_state.get("model_artifact_ids") if resume_from and resume_state.get("model_artifact_ids") else None,
+                    initial_subagent_results=resume_state.get("subagent_results") if resume_from and isinstance(resume_state.get("subagent_results"), list) else None,
+                    initial_delegation_fingerprints=resume_state.get("completed_delegation_fingerprints") if resume_from and isinstance(resume_state.get("completed_delegation_fingerprints"), list) else None,
                     working_memory=working_memory,
                     initial_plan_completed_steps=resume_state.get("completed_steps") if resume_from and isinstance(resume_state.get("completed_steps"), list) else None,
                     initial_plan_step_outputs=resume_state.get("step_outputs") if resume_from and isinstance(resume_state.get("step_outputs"), dict) else None,
@@ -333,7 +355,20 @@ class MainAgent:
                     elif decision.type.value == "ASK_USER":
                         result = AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.BLOCKED, summary=decision.final_response or decision.reasoning_summary, error="WAITING_USER", trace_id=run.id)
                     elif decision.type.value == "DELEGATE":
-                        result = await self._delegate(request, run, task, datasets, decision.subtasks, intent=intent, plan=plan, request_frame=request_frame, working_memory=working_memory)
+                        delegation_tasks = decision.subtasks or self.decomposer.decompose(request, datasets)
+                        fingerprint = _delegation_fingerprint(delegation_tasks)
+                        completed = set(resume_state.get("completed_delegation_fingerprints", []))
+                        if fingerprint in completed:
+                            result = AgentResult(
+                                agent_id="main",
+                                task_id=task.id if task else run.task_id,
+                                status=AgentResultStatus.BLOCKED,
+                                summary="相同委派已经完成，请提供新的目标或改变处理策略。",
+                                error="DELEGATION_NO_PROGRESS",
+                                trace_id=run.id,
+                            )
+                        else:
+                            result = await self._delegate(request, run, task, datasets, delegation_tasks, intent=intent, plan=plan, request_frame=request_frame, working_memory=working_memory)
                     elif decision.type.value == "TOOL":
                         result = await self._execute_plan(request, run, task, datasets, intent, plan, resume_state, request_frame=request_frame)
                     elif intent.intent.value == "RUN_DIAGNOSIS":
@@ -409,6 +444,8 @@ class MainAgent:
         initial_findings: list[Any] | None = None,
         initial_dataset_ids: list[str] | None = None,
         initial_artifact_ids: list[str] | None = None,
+        initial_subagent_results: list[Any] | None = None,
+        initial_delegation_fingerprints: list[str] | None = None,
         working_memory: WorkingMemory | None = None,
         initial_plan_completed_steps: list[str] | None = None,
         initial_plan_step_outputs: dict[str, Any] | None = None,
@@ -429,6 +466,8 @@ class MainAgent:
             "original_plan": plan.model_copy(deep=True) if plan is not None else None,
             "completed_steps": set(initial_plan_completed_steps or []),
             "step_outputs": dict(initial_plan_step_outputs or {}),
+            "subagent_results": list(initial_subagent_results or []),
+            "completed_delegation_fingerprints": set(initial_delegation_fingerprints or []),
             "run": run,
             "working_memory": working_memory,
             "fast_path_enabled": plan is not None,
@@ -445,6 +484,7 @@ class MainAgent:
             latest_observation=session["latest_observation"],
             active_dataset_ids=sorted(session["dataset_ids"]),
             active_artifact_ids=sorted(session["artifact_ids"]),
+            subagent_results=session["subagent_results"],
             working_memory=working_memory,
         )
 
@@ -462,6 +502,7 @@ class MainAgent:
                 latest_failure=session["latest_failure"],
                 active_dataset_ids=sorted(session["dataset_ids"]),
                 active_artifact_ids=sorted(session["artifact_ids"]),
+                subagent_results=session["subagent_results"],
                 working_memory=session["working_memory"],
             )
 
@@ -674,8 +715,55 @@ class MainAgent:
         if decision.type.value == "DELEGATE":
             if task is None:
                 return RuntimeTransition(terminal=True, status=AgentResultStatus.BLOCKED, error="WAITING_USER", final_response="当前请求没有可委派的业务任务。")
-            result = await self._delegate(request, run, task, session["datasets"], decision.subtasks, intent=intent, plan=session["plan"], request_frame=request_frame, working_memory=session["working_memory"])
-            return RuntimeTransition(terminal=True, status=result.status, final_response=result.summary, error=result.error, findings=tuple(result.findings), dataset_ids=tuple(result.datasets), artifact_ids=tuple(result.artifacts))
+            delegation_tasks = decision.subtasks or self.decomposer.decompose(request, session["datasets"])
+            fingerprint = _delegation_fingerprint(delegation_tasks)
+            if fingerprint in session["completed_delegation_fingerprints"]:
+                observation = {
+                    "type": "delegation",
+                    "code": "DELEGATION_NO_PROGRESS",
+                    "completed": 0,
+                    "total": len(delegation_tasks),
+                    "directive": LoopDirective.CONTINUE.value,
+                    "fingerprint": fingerprint,
+                    "message": "相同委派已经执行过，本轮没有新的资源或失败条件变化。",
+                }
+                session["latest_observation"] = observation
+                return RuntimeTransition(
+                    terminal=False,
+                    observation=observation,
+                    directive=LoopDirective.CONTINUE,
+                    subagent_results=tuple(session["subagent_results"]),
+                )
+            delegation = await self._execute_delegation(
+                request,
+                run,
+                task,
+                session["datasets"],
+                delegation_tasks,
+                intent=intent,
+                plan=session["plan"],
+                request_frame=request_frame,
+                working_memory=session["working_memory"],
+                fingerprint=fingerprint,
+            )
+            session["completed_delegation_fingerprints"].add(delegation.fingerprint)
+            session["subagent_results"] = _merge_subagent_views(session["subagent_results"], delegation.subagent_results)
+            session["findings"].extend(delegation.findings)
+            session["dataset_ids"].update(delegation.dataset_ids)
+            session["artifact_ids"].update(delegation.artifact_ids)
+            session["latest_observation"] = delegation.observation
+            session["latest_failure"] = delegation.latest_failure
+            return RuntimeTransition(
+                terminal=False,
+                observation=delegation.observation,
+                directive=delegation.directive,
+                latest_failure=delegation.latest_failure,
+                clear_failure=delegation.latest_failure is None,
+                findings=tuple(session["findings"]),
+                dataset_ids=tuple(sorted(session["dataset_ids"])),
+                artifact_ids=tuple(sorted(session["artifact_ids"])),
+                subagent_results=tuple(session["subagent_results"]),
+            )
         if decision.type.value == "REPLAN":
             return await self._dispatch_runtime_replan(
                 decision,
@@ -1443,28 +1531,46 @@ class MainAgent:
             trace_id=run.id,
         )
 
-    async def _delegate(self, request: AgentRequest, run: Run, task: Task, datasets, tasks=None, *, intent: IntentResult | None = None, plan: Plan | None = None, request_frame: RequestFrame | None = None, working_memory: WorkingMemory | None = None) -> AgentResult:
-        tasks = tasks or self.decomposer.decompose(request, datasets)
+    async def _execute_delegation(
+        self,
+        request: AgentRequest,
+        run: Run,
+        task: Task,
+        datasets,
+        tasks=None,
+        *,
+        intent: IntentResult | None = None,
+        plan: Plan | None = None,
+        request_frame: RequestFrame | None = None,
+        working_memory: WorkingMemory | None = None,
+        fingerprint: str | None = None,
+        completed_fingerprints: set[str] | None = None,
+        legacy_plan_progress: bool = False,
+    ) -> DelegationExecutionResult:
+        """只执行一次委派并返回 Observation；不构造 MainAgent 最终结果。"""
+
+        tasks = list(tasks or self.decomposer.decompose(request, datasets))
         self.guard.check_subagents(len(tasks))
+        fingerprint = fingerprint or _delegation_fingerprint(tasks)
         attached = self.task_service.attach_subtasks(task, tasks)
-        # MainAgent 后面还会更新整体 Task；把拆解结果同步回当前对象，避免
-        # 最终状态写回时把 subtasks 覆盖为空。
         task.subtasks = attached.subtasks
         task.updated_at = attached.updated_at
         for subtask in tasks:
             await self.trace.emit(run.id, EventType.SUBTASK_CREATED, subtask.goal, payload=subtask.model_dump(mode="json"), agent_id="main")
-        if plan is not None and intent is not None:
+        if legacy_plan_progress and plan is not None and intent is not None:
             _set_plan_step_status(plan, "decompose", TaskStatus.SUCCEEDED)
             _set_plan_step_status(plan, "parallel", TaskStatus.RUNNING)
-            await self._checkpoint(
-                run.id,
-                "delegation_started",
-                {
-                    **self._checkpoint_state(request, intent, plan, datasets, request_frame),
-                    "completed_steps": ["decompose"],
-                    "subtask_ids": [item.id for item in tasks],
-                },
-            )
+        await self._checkpoint(
+            run.id,
+            "delegation_started",
+            {
+                **self._checkpoint_state(request, intent, plan, datasets, request_frame),
+                "subtask_ids": [item.id for item in tasks],
+                "delegation_fingerprint": fingerprint,
+                "completed_delegation_fingerprints": sorted(completed_fingerprints or set()),
+                "runtime_delegation": not legacy_plan_progress,
+            },
+        )
         self.store.save_run(run.model_copy(update={"status": RunStatus.WAITING_SUBAGENT}))
         parent_memory = working_memory or self.store.get_working_memory(task.id)
         executions = await self.agent_manager.run(
@@ -1475,45 +1581,114 @@ class MainAgent:
             parent_run_id=run.id,
             working_memory_snapshot=parent_memory,
         )
-        results = [item.result for item in executions]
         deltas = [item.working_memory_delta for item in executions]
         if parent_memory is not None:
             parent_memory = self.working_memory_updater.merge_deltas(parent_memory, deltas)
             self.store.save_working_memory(parent_memory)
-        findings = [
-            {
-                "agent_id": item.agent_id,
-                "summary": item.summary,
-                "status": item.status.value,
-                "directive": execution.directive.value,
-                "failure_rationale": execution.failure_rationale,
-                "findings": item.findings,
-            }
-            for execution, item in zip(executions, results, strict=True)
-        ]
-        output_ids = sorted({dataset_id for item in results for dataset_id in item.datasets})
-        artifacts = sorted({artifact_id for item in results for artifact_id in item.artifacts})
-        failed_required = [item for item, subtask in zip(results, tasks, strict=True) if subtask.required and item.status in {AgentResultStatus.FAILED, AgentResultStatus.BLOCKED}]
-        failed_any = [item for item in results if item.status is not AgentResultStatus.SUCCESS]
-        status = AgentResultStatus.FAILED if failed_required and len(failed_any) == len(tasks) else AgentResultStatus.PARTIAL if failed_any else AgentResultStatus.SUCCESS
-        summary = f"已并行完成 {len(results) - len(failed_any)}/{len(results)} 个主题分析，并汇总结果。"
+        current_run = self.store.get_run(run.id) or run
+        self.store.save_run(current_run.model_copy(update={"status": RunStatus.RUNNING}))
+
+        views = tuple(_subagent_result_view(subtask, execution) for subtask, execution in zip(tasks, executions, strict=True))
+        findings = tuple(dict(item) for item in views)
+        output_ids = tuple(sorted({dataset_id for delta in deltas for dataset_id in delta.added_dataset_ids}))
+        artifact_ids = tuple(sorted({artifact_id for delta in deltas for artifact_id in delta.added_artifact_ids}))
         required_executions = [execution for execution, subtask in zip(executions, tasks, strict=True) if subtask.required]
         directive = _aggregate_subagent_directive(required_executions)
-        if directive is LoopDirective.ASK_USER:
-            status = AgentResultStatus.BLOCKED
-            summary = "部分子任务需要补充用户信息后才能继续。"
-            error = "WAITING_USER"
-        elif directive is LoopDirective.REPLAN:
-            status = AgentResultStatus.BLOCKED
-            summary = "部分子任务当前执行策略不适用，需要重新规划。"
-            error = "REPLAN_REQUIRED"
-        elif directive is LoopDirective.ABORT and required_executions and all(item.directive is LoopDirective.ABORT for item in required_executions):
-            status = AgentResultStatus.FAILED
-            summary = "所有必需子任务均执行失败。"
+        latest_failure = _delegation_failure(executions, tasks)
+        observation = {
+            "type": "delegation",
+            "completed": sum(1 for item in executions if item.result.status is AgentResultStatus.SUCCESS),
+            "total": len(executions),
+            "directive": directive.value,
+            "fingerprint": fingerprint,
+            "results": [dict(item) for item in views],
+        }
+        await self.trace.emit(
+            run.id,
+            EventType.DELEGATION_COMPLETED,
+            f"委派完成：{observation['completed']}/{observation['total']}",
+            payload={
+                "subtask_count": len(tasks),
+                "success_count": observation["completed"],
+                "blocked_count": sum(1 for item in executions if item.result.status is AgentResultStatus.BLOCKED),
+                "failed_count": sum(1 for item in executions if item.result.status is AgentResultStatus.FAILED),
+                "directive": directive.value,
+                "dataset_count": len(output_ids),
+                "artifact_count": len(artifact_ids),
+                "fingerprint": fingerprint,
+            },
+            agent_id="main",
+        )
+        await self._checkpoint(
+            run.id,
+            "delegation_completed",
+            {
+                **self._checkpoint_state(request, intent, plan, datasets, request_frame),
+                "subtask_ids": [item.id for item in tasks],
+                "delegation_fingerprint": fingerprint,
+                "completed_delegation_fingerprints": sorted(completed_fingerprints or {fingerprint}),
+                "subagent_results": [dict(item) for item in views],
+                "dataset_ids": list(output_ids),
+                "artifact_ids": list(artifact_ids),
+                "directive": directive.value,
+                "working_memory_refs": _working_memory_refs(parent_memory),
+                "runtime_delegation": not legacy_plan_progress,
+            },
+        )
+        return DelegationExecutionResult(
+            tasks=tuple(tasks),
+            executions=tuple(executions),
+            directive=directive,
+            findings=findings,
+            dataset_ids=output_ids,
+            artifact_ids=artifact_ids,
+            observation=observation,
+            subagent_results=views,
+            latest_failure=latest_failure,
+            fingerprint=fingerprint,
+        )
+
+    async def _delegate(self, request: AgentRequest, run: Run, task: Task, datasets, tasks=None, *, intent: IntentResult | None = None, plan: Plan | None = None, request_frame: RequestFrame | None = None, working_memory: WorkingMemory | None = None) -> AgentResult:
+        """旧离线路径兼容包装器；Runtime 路径使用 _execute_delegation。"""
+
+        delegation = await self._execute_delegation(
+            request,
+            run,
+            task,
+            datasets,
+            tasks,
+            intent=intent,
+            plan=plan,
+            request_frame=request_frame,
+            working_memory=working_memory,
+            legacy_plan_progress=True,
+        )
+        results = [item.result for item in delegation.executions]
+        failed_any = [item for item in results if item.status is not AgentResultStatus.SUCCESS]
+        required_executions = [execution for execution, subtask in zip(delegation.executions, delegation.tasks, strict=True) if subtask.required]
+        status = AgentResultStatus.FAILED if delegation.directive is LoopDirective.ABORT and required_executions and all(item.directive is LoopDirective.ABORT for item in required_executions) else AgentResultStatus.PARTIAL if failed_any else AgentResultStatus.SUCCESS
+        summary = f"已并行完成 {len(results) - len(failed_any)}/{len(results)} 个主题分析，并汇总结果。"
+        if delegation.directive is LoopDirective.ASK_USER:
+            status, summary, error = AgentResultStatus.BLOCKED, "部分子任务需要补充用户信息后才能继续。", "WAITING_USER"
+        elif delegation.directive is LoopDirective.REPLAN:
+            status, summary, error = AgentResultStatus.BLOCKED, "部分子任务当前执行策略不适用，需要重新规划。", "REPLAN_REQUIRED"
+        elif status is AgentResultStatus.FAILED:
             error = next((item.result.error for item in required_executions if item.result.error), "SubAgent 执行失败")
+            summary = "所有必需子任务均执行失败。"
         else:
             error = next((item.error for item in failed_any if item.error), None)
-        result = AgentResult(agent_id="main", task_id=run.task_id, status=status, summary=summary, findings=findings, datasets=output_ids, artifacts=artifacts, warnings=[item.error for item in failed_any if item.error], error=error, trace_id=run.id)
+        result = AgentResult(
+            agent_id="main",
+            task_id=run.task_id,
+            status=status,
+            summary=summary,
+            findings=list(delegation.findings),
+            datasets=list(delegation.dataset_ids),
+            artifacts=list(delegation.artifact_ids),
+            warnings=[item.error for item in failed_any if item.error],
+            error=error,
+            trace_id=run.id,
+        )
         if plan is not None and intent is not None:
             _set_plan_step_status(plan, "parallel", TaskStatus.SUCCEEDED)
             _set_plan_step_status(plan, "synthesize", TaskStatus.SUCCEEDED)
@@ -1523,9 +1698,10 @@ class MainAgent:
                 {
                     **self._checkpoint_state(request, intent, plan, datasets, request_frame),
                     "completed_steps": [item.id for item in plan.steps],
-                    "subtask_ids": [item.id for item in tasks],
+                    "subtask_ids": [item.id for item in delegation.tasks],
                     "delegation_result": result.model_dump(mode="json"),
-                    "working_memory": parent_memory.model_dump(mode="json") if parent_memory else None,
+                    "working_memory_refs": _working_memory_refs(self.store.get_working_memory(task.id)),
+                    "runtime_delegation": False,
                 },
             )
         return result
@@ -1642,6 +1818,107 @@ def _aggregate_subagent_directive(executions: list[Any]) -> LoopDirective:
     if LoopDirective.ABORT in directives:
         return LoopDirective.ABORT
     return LoopDirective.CONTINUE
+
+
+def _subagent_result_view(subtask: SubTask, execution: SubAgentExecutionResult) -> dict[str, Any]:
+    """把 SubAgent 结果裁成下一次 Decision 所需的轻量证据。"""
+
+    result = execution.result
+    return {
+        "subtask_id": subtask.id,
+        "agent_id": result.agent_id,
+        "goal": subtask.goal,
+        "operation": subtask.operation,
+        "required": subtask.required,
+        "status": result.status.value,
+        "summary": result.summary,
+        "directive": execution.directive.value,
+        "dataset_ids": list(execution.working_memory_delta.added_dataset_ids),
+        "artifact_ids": list(execution.working_memory_delta.added_artifact_ids),
+        "key_findings": _compact_subagent_findings(result.findings),
+        "failure_rationale": execution.failure_rationale or result.error,
+    }
+
+
+def _compact_subagent_findings(findings: list[Any]) -> list[Any]:
+    compacted: list[Any] = []
+    for item in findings[:6]:
+        if isinstance(item, dict):
+            compacted.append({str(key): _compact_subagent_value(value) for key, value in list(item.items())[:8]})
+        else:
+            compacted.append(_compact_subagent_value(item))
+    return compacted
+
+
+def _compact_subagent_value(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 2:
+        return str(value)[:240]
+    if isinstance(value, dict):
+        return {str(key): _compact_subagent_value(item, depth=depth + 1) for key, item in list(value.items())[:8]}
+    if isinstance(value, (list, tuple)):
+        return [_compact_subagent_value(item, depth=depth + 1) for item in list(value)[:8]]
+    if isinstance(value, str):
+        return value if len(value) <= 500 else value[:499] + "…"
+    return value
+
+
+def _delegation_failure(executions: list[SubAgentExecutionResult], tasks: list[SubTask]) -> dict[str, Any] | None:
+    for subtask, execution in zip(tasks, executions, strict=True):
+        if not subtask.required or execution.directive is LoopDirective.CONTINUE:
+            continue
+        return {
+            "directive": execution.directive.value,
+            "action": execution.directive.value,
+            "deterministic": True,
+            "subtask_id": subtask.id,
+            "tool_name": subtask.operation,
+            "error": execution.failure_rationale or execution.result.error or execution.result.summary,
+            "recovery_action": execution.directive.value,
+            "attempts": 1,
+        }
+    return None
+
+
+def _merge_subagent_views(current: list[Any], incoming: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
+    merged = [dict(item) for item in current if isinstance(item, dict)]
+    positions = {(item.get("subtask_id"), item.get("agent_id")): index for index, item in enumerate(merged)}
+    for item in incoming:
+        key = (item.get("subtask_id"), item.get("agent_id"))
+        if key in positions:
+            merged[positions[key]] = dict(item)
+        else:
+            positions[key] = len(merged)
+            merged.append(dict(item))
+    return merged
+
+
+def _delegation_fingerprint(tasks: list[SubTask]) -> str:
+    payload = sorted(
+        [
+            {
+                "goal": task.goal,
+                "operation": task.operation,
+                "dataset_ids": sorted(task.dataset_ids),
+                "dependencies": sorted(task.dependencies),
+                "required": task.required,
+            }
+            for task in tasks
+        ],
+        key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True),
+    )
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+
+
+def _working_memory_refs(memory: WorkingMemory | None) -> dict[str, Any] | None:
+    if memory is None:
+        return None
+    return {
+        "task_id": memory.task_id,
+        "conversation_id": memory.conversation_id,
+        "active_dataset_ids": list(memory.active_dataset_ids),
+        "active_artifact_ids": list(memory.active_artifact_ids),
+        "unresolved_questions": list(memory.unresolved_questions),
+    }
 
 
 def _plan_result_summary(operation: str, plan: Plan, findings: list[Any], datasets: list[str], artifacts: list[str]) -> str:

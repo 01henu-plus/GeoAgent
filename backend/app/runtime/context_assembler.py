@@ -561,6 +561,13 @@ def _observation_item_view(raw: dict[str, Any]) -> dict[str, Any]:
     return {
         key: _compact_value(raw.get(key))
         for key in (
+            "type",
+            "code",
+            "completed",
+            "total",
+            "fingerprint",
+            "results",
+            "message",
             "call_id",
             "status",
             "output",

@@ -26,6 +26,7 @@ class RuntimeTransition:
     findings: tuple[Any, ...] = ()
     dataset_ids: tuple[str, ...] = ()
     artifact_ids: tuple[str, ...] = ()
+    subagent_results: tuple[Any, ...] = ()
     current_plan: Plan | None = None
     clear_plan: bool = False
     completed_steps: tuple[str, ...] = ()
@@ -129,6 +130,8 @@ class AgentRuntime:
             updates["latest_failure"] = None
         elif transition.latest_failure is not None:
             updates["latest_failure"] = transition.latest_failure
+        if transition.subagent_results:
+            updates["subagent_results"] = [dict(item) if isinstance(item, dict) else item for item in transition.subagent_results]
         if transition.clear_plan:
             updates["current_plan"] = None
         elif transition.current_plan is not None:

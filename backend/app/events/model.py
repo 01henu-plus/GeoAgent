@@ -21,6 +21,7 @@ class EventType(StrEnum):
     VERIFICATION_STARTED = "VerificationStarted"
     VERIFICATION_FAILED = "VerificationFailed"
     SUBAGENT_COMPLETED = "SubAgentCompleted"
+    DELEGATION_COMPLETED = "DelegationCompleted"
     CHECKPOINT_SAVED = "CheckpointSaved"
     RESUME_STARTED = "ResumeStarted"
     RUN_COMPLETED = "RunCompleted"
