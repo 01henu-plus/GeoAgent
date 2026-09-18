@@ -20,6 +20,11 @@ class WorkspaceManager:
         for directory in (self.input_dir, self.intermediate_dir, self.output_dir, self.temp_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
+    def for_user(self, user_id: str | None) -> WorkspaceManager:
+        """返回用户专属工作区；None 仅用于内部离线/系统数据。"""
+
+        return WorkspaceManager(self.root / "users" / user_id) if user_id else self
+
     def resolve(self, path: str | Path, *, allow_missing: bool = True) -> Path:
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():

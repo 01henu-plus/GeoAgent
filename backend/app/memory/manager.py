@@ -21,8 +21,8 @@ class MemoryManager:
         self.store = store
         self.policy = policy or MemoryWritePolicy()
 
-    def set(self, key: str, value: str, *, scope: str = "project", metadata: dict | None = None) -> MemoryItem:
-        item = MemoryItem(scope=scope, key=key, value=value, metadata=metadata or {})
+    def set(self, key: str, value: str, *, scope: str = "project", metadata: dict | None = None, user_id: str | None = None) -> MemoryItem:
+        item = MemoryItem(owner_user_id=user_id, scope=scope, key=key, value=value, metadata=metadata or {})
         self.store.save_memory(item)
         return item
 
@@ -31,7 +31,7 @@ class MemoryManager:
 
         if not self.policy.accepts(candidate):
             return None
-        existing = self.get(candidate.key, scope="project")
+        existing = self.get(candidate.key, scope="project", user_id=candidate.owner_user_id)
         metadata = {
             **candidate.metadata,
             "category": candidate.category,
@@ -45,6 +45,7 @@ class MemoryManager:
             return existing
         item = MemoryItem(
             id=existing.id if existing is not None else MemoryItem(key=candidate.key, value=candidate.value).id,
+            owner_user_id=candidate.owner_user_id,
             scope="project",
             key=candidate.key,
             value=candidate.value,
@@ -61,20 +62,20 @@ class MemoryManager:
                 written.append(item)
         return written
 
-    def get(self, key: str, *, scope: str = "project") -> MemoryItem | None:
-        return next((item for item in self.store.list_memories(scope) if item.key == key), None)
+    def get(self, key: str, *, scope: str = "project", user_id: str | None = None) -> MemoryItem | None:
+        return next((item for item in self.store.list_memories(scope, owner_user_id=user_id) if item.key == key), None)
 
-    def list(self, scope: str = "project") -> list[MemoryItem]:
-        return self.store.list_memories(scope)
+    def list(self, scope: str = "project", *, user_id: str | None = None) -> list[MemoryItem]:
+        return self.store.list_memories(scope, owner_user_id=user_id)
 
-    def recall(self, query: str, *, scope: str = "project", limit: int = 5) -> list[MemoryItem]:
+    def recall(self, query: str, *, scope: str = "project", user_id: str | None = None, limit: int = 5) -> list[MemoryItem]:
         """按简单词项重合召回相关记忆；没有命中时不返回全部记忆。"""
 
         if limit < 1:
             return []
         query_terms = _terms(query)
         scored: list[tuple[int, MemoryItem]] = []
-        for item in self.list(scope):
+        for item in self.list(scope, user_id=user_id):
             terms = _terms(f"{item.key} {item.value} {item.metadata}")
             score = len(query_terms.intersection(terms))
             if item.key.casefold() in query.casefold():

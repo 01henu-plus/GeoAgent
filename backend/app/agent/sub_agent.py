@@ -37,13 +37,14 @@ from app.state import StateStore, WorkingMemoryUpdater
 
 
 class SubAgent:
-    def __init__(self, executor: ToolExecutor, store: StateStore, trace: TraceRecorder, *, context_manager: ContextManager | None = None, budget: RunBudget | None = None) -> None:
+    def __init__(self, executor: ToolExecutor, store: StateStore, trace: TraceRecorder, *, context_manager: ContextManager | None = None, budget: RunBudget | None = None, services_factory=None) -> None:
         self.executor = executor
         self.store = store
         self.trace = trace
         self.context_manager = context_manager or ContextManager(max_chars=10000)
         self.budget = budget or RunBudget(max_agent_turns=10)
         self.guard = BudgetGuard(self.budget)
+        self.services_factory = services_factory
 
     async def run(
         self,
@@ -150,7 +151,9 @@ class SubAgent:
         current = current.model_copy(update={"turn_count": current.turn_count + 1, "tool_call_count": current.tool_call_count + 1})
         self.store.save_run(current)
         call = ToolCall(name=name, arguments=arguments, run_id=current.id, agent_id=current.agent_id)
-        return await self.executor.execute(call, agent_id=run.agent_id, services=self.executor.services if hasattr(self.executor, "services") else {})
+        user_id = self.store.user_id_for_run(current.id)
+        services = self.services_factory(user_id) if self.services_factory else self.executor.services if hasattr(self.executor, "services") else {}
+        return await self.executor.execute(call, agent_id=run.agent_id, services=services)
 
 
 def _dataset_for_subtask(subtask: SubTask, datasets: list[Dataset]) -> Dataset | None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import uuid
 from threading import Event
@@ -20,6 +21,8 @@ class PythonExecutor:
     def execute(self, code: str, *, cancel_event: Event | None = None) -> PythonExecutionResult:
         if not code.strip():
             raise ValueError("Python code 不能为空。")
+        if re.search(r"(?:\.\.[\\/]|[A-Za-z]:[\\/]|\\\\)", code):
+            raise PermissionError("Python 代码中的路径必须位于当前用户 workspace 内。")
         before = self.workspace.snapshot()
         script = self.workspace.temp_dir / f"run_{uuid.uuid4().hex[:10]}.py"
         script.write_text(code, encoding="utf-8")

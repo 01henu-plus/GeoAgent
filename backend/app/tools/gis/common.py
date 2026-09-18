@@ -14,7 +14,7 @@ def dataset_from_context(context: ToolContext, identifier: str | None) -> Datase
     registry = context.services["registry"]
     if not identifier:
         raise GISFailure("MISSING_DATASET", "Tool 缺少 dataset_id。", category=ErrorCategory.DATA)
-    dataset = registry.resolve(identifier)
+    dataset = registry.resolve(identifier, user_id=context.services.get("user_id"))
     if dataset is None:
         raise GISFailure("MISSING_DATASET", f"未注册的数据集：{identifier}", category=ErrorCategory.DATA)
     return dataset

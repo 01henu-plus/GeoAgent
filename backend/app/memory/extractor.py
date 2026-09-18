@@ -19,6 +19,8 @@ class MemoryExtractor:
         frame: RequestFrame | None,
         run: Run,
         result: AgentResult,
+        *,
+        user_id: str | None = None,
     ) -> list[MemoryCandidate]:
         text = request.user_input.strip()
         if not _is_durable_request(text):
@@ -32,6 +34,7 @@ class MemoryExtractor:
             MemoryCandidate(
                 key=key,
                 value=value,
+                owner_user_id=user_id,
                 category=category,
                 source_task_id=run.task_id,
                 source_run_id=run.id,

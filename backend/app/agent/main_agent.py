@@ -75,7 +75,7 @@ _MODEL_SYSTEM_PROMPT = """
 class MainAgent:
     """负责用户目标、策略循环和结果汇总；确定性 GIS 计算委托给 Tools。"""
 
-    def __init__(self, *, store: StateStore, trace: TraceRecorder, executor: ToolExecutor, registry, task_service: TaskService, agent_manager: AgentManager, settings, budget: RunBudget | None = None, checkpoint_store: CheckpointStore | None = None, memory: MemoryManager | None = None, knowledge: KnowledgeRetriever | None = None, model_adapter: ModelAdapter | None = None, model_adapters: dict[str, ModelAdapter] | None = None, default_model_profile: str | None = None, context_manager: ContextManager | None = None) -> None:
+    def __init__(self, *, store: StateStore, trace: TraceRecorder, executor: ToolExecutor, registry, task_service: TaskService, agent_manager: AgentManager, settings, budget: RunBudget | None = None, checkpoint_store: CheckpointStore | None = None, memory: MemoryManager | None = None, knowledge: KnowledgeRetriever | None = None, model_adapter: ModelAdapter | None = None, model_adapters: dict[str, ModelAdapter] | None = None, default_model_profile: str | None = None, context_manager: ContextManager | None = None, services_factory=None) -> None:
         self.store = store
         self.trace = trace
         self.executor = executor
@@ -105,6 +105,7 @@ class MainAgent:
         self.model_adapters = model_adapters if model_adapters is not None else {}
         self.default_model_profile = default_model_profile
         self.context_manager = context_manager or ContextManager()
+        self.services_factory = services_factory
         self.loop = AgentLoop()
         self.lifecycle_binder = RequestLifecycleBinder(store, task_service)
 
@@ -297,7 +298,7 @@ class MainAgent:
                 questions = request_frame.blocking_issues if request_frame and request_frame.blocking_issues else [result.summary]
                 self.working_memory_updater.add_unresolved_questions(task.id, questions, run_id=run.id)
             if self.memory:
-                candidates = self.memory_extractor.extract(request, request_frame, run, result)
+                candidates = self.memory_extractor.extract(request, request_frame, run, result, user_id=request.user_id)
                 self.memory.write_candidates(candidates)
             await self._checkpoint(run.id, "run_completed", {"status": final_status.value, "result": result.model_dump(mode="json")})
             if task is not None and prepared_request.action in {"create_task", "bind_task", "retry_run"}:
@@ -448,7 +449,7 @@ class MainAgent:
                     "parameters": list(properties) if isinstance(properties, dict) else [],
                 }
             )
-        memories = self.memory.recall(request.user_input, scope="project", limit=5) if self.memory else []
+        memories = self.memory.recall(request.user_input, scope="project", user_id=request.user_id, limit=5) if self.memory else []
         referenced_runs = [
             item.model_dump(mode="json")
             for item in self.request_understanding.reference_resolver.resolve_runs(request.referenced_run_ids, conversation_id=request.conversation_id, exclude_run_id=run.id)
@@ -530,14 +531,14 @@ class MainAgent:
         step_outputs = dict(resume_state.get("step_outputs", {})) if isinstance(resume_state.get("step_outputs"), dict) else {}
 
         async def execute_step(step, arguments):
-            completed_arguments = self._complete_plan_arguments(step.tool_name or "", arguments)
+            completed_arguments = self._complete_plan_arguments(step.tool_name or "", arguments, user_id=request.user_id)
             result = await self._tool(run, step.tool_name or "", completed_arguments)
-            return await self._recover_plan_failure(run, step.tool_name or "", completed_arguments, result)
+            return await self._recover_plan_failure(run, step.tool_name or "", completed_arguments, result, user_id=request.user_id)
 
         async def verify_step(step, result):
             if result.status in {ToolStatus.SUCCESS, ToolStatus.PARTIAL_SUCCESS} and result.datasets and self._tool_produces_dataset(step.tool_name or ""):
                 await self.trace.emit(run.id, EventType.VERIFICATION_STARTED, f"开始验证 {step.title} 的输出", payload={"tool": step.tool_name, "dataset_ids": result.datasets}, agent_id="main")
-            problems = self._verification_problems(step.tool_name or "", result)
+            problems = self._verification_problems(step.tool_name or "", result, user_id=request.user_id)
             if problems:
                 await self.trace.emit(run.id, EventType.VERIFICATION_FAILED, "；".join(problems), payload={"tool": step.tool_name, "problems": problems}, agent_id="main")
             return problems
@@ -568,12 +569,12 @@ class MainAgent:
         status = AgentResultStatus.PARTIAL if outcome.errors else AgentResultStatus.SUCCESS
         return AgentResult(agent_id="main", task_id=task.id, status=status, summary=_plan_result_summary(operation, plan, list(outcome.findings), list(outcome.output_ids), list(outcome.artifacts)), findings=list(outcome.findings), datasets=list(outcome.output_ids), artifacts=list(outcome.artifacts), warnings=list(outcome.errors), error=outcome.errors[0] if outcome.errors and not outcome.findings else None, trace_id=run.id)
 
-    def _verification_problems(self, tool_name: str, result: ToolResult) -> list[str]:
+    def _verification_problems(self, tool_name: str, result: ToolResult, *, user_id: str | None = None) -> list[str]:
         if result.status not in {ToolStatus.SUCCESS, ToolStatus.PARTIAL_SUCCESS} or not result.datasets:
             return []
         if not self._tool_produces_dataset(tool_name):
             return []
-        verified, problems = self.verifier.verify(result, {item.id: item for item in self.registry.list()})
+        verified, problems = self.verifier.verify(result, {item.id: item for item in self.registry.for_user(user_id).list()})
         if verified:
             return []
         return problems
@@ -584,17 +585,17 @@ class MainAgent:
         except KeyError:
             return False
 
-    def _complete_plan_arguments(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _complete_plan_arguments(self, tool_name: str, arguments: dict[str, Any], *, user_id: str | None = None) -> dict[str, Any]:
         """补齐只有运行时才能确定的参数，例如自动选择投影 CRS。"""
 
         completed = dict(arguments)
         if tool_name in {"crs.reproject", "raster.reproject"} and completed.get("target_crs") == "auto":
-            dataset = self.registry.resolve(str(completed.get("dataset_id", "")))
+            dataset = self.registry.for_user(user_id).resolve(str(completed.get("dataset_id", "")))
             if dataset is not None:
                 completed["target_crs"] = CRSService(default_crs=self.settings.default_crs).choose_projected_crs(dataset)
         return completed
 
-    async def _recover_plan_failure(self, run: Run, tool_name: str, arguments: dict[str, Any], result: ToolResult) -> ToolResult:
+    async def _recover_plan_failure(self, run: Run, tool_name: str, arguments: dict[str, Any], result: ToolResult, *, user_id: str | None = None) -> ToolResult:
         """只对已知且可证明安全的 GIS 条件做一次修复后重试。"""
 
         if result.status is not ToolStatus.FAILED or result.error is None:
@@ -624,15 +625,16 @@ class MainAgent:
         if action.value != "REPAIR":
             return result
 
-        repaired_arguments = await self._repair_arguments(run, tool_name, arguments, result.error.code)
+        repaired_arguments = await self._repair_arguments(run, tool_name, arguments, result.error.code, user_id=user_id)
         if repaired_arguments is None:
             return result
         await self.trace.emit(run.id, EventType.RETRY_STARTED, f"修复输入后重试 {tool_name}", payload={"tool": tool_name, "arguments": repaired_arguments}, agent_id="main")
         return await self._tool(run, tool_name, repaired_arguments)
 
-    async def _repair_arguments(self, run: Run, tool_name: str, arguments: dict[str, Any], error_code: str) -> dict[str, Any] | None:
+    async def _repair_arguments(self, run: Run, tool_name: str, arguments: dict[str, Any], error_code: str, *, user_id: str | None = None) -> dict[str, Any] | None:
+        registry = self.registry.for_user(user_id)
         if error_code in {"CRS_UNIT_MISMATCH", "CRS_MISSING"} and "dataset_id" in arguments:
-            dataset = self.registry.resolve(str(arguments["dataset_id"]))
+            dataset = registry.resolve(str(arguments["dataset_id"]))
             if dataset is None or dataset.crs is None:
                 return None
             target_crs = CRSService(default_crs=self.settings.default_crs).choose_projected_crs(dataset)
@@ -644,14 +646,14 @@ class MainAgent:
             updated["dataset_id"] = repaired.datasets[-1]
             return updated
         if error_code == "CRS_UNIT_MISMATCH" and "source_dataset_id" in arguments:
-            source = self.registry.resolve(str(arguments["source_dataset_id"]))
+            source = registry.resolve(str(arguments["source_dataset_id"]))
             if source is None or source.crs is None:
                 return None
             target_crs = CRSService(default_crs=self.settings.default_crs).choose_projected_crs(source)
             updated = dict(arguments)
             for key in ("source_dataset_id", "target_dataset_id"):
                 identifier = updated.get(key)
-                dataset = self.registry.resolve(str(identifier)) if identifier else None
+                dataset = registry.resolve(str(identifier)) if identifier else None
                 if dataset is None:
                     continue
                 reprojection_tool = "raster.reproject" if dataset.kind.value == "RASTER" else "crs.reproject"
@@ -664,8 +666,8 @@ class MainAgent:
             left_id = arguments.get("left_dataset_id") or arguments.get("source_dataset_id")
             right_key = "right_dataset_id" if arguments.get("right_dataset_id") else "mask_dataset_id" if arguments.get("mask_dataset_id") else "target_dataset_id"
             right_id = arguments.get(right_key)
-            left = self.registry.resolve(str(left_id)) if left_id else None
-            right = self.registry.resolve(str(right_id)) if right_id else None
+            left = registry.resolve(str(left_id)) if left_id else None
+            right = registry.resolve(str(right_id)) if right_id else None
             if left is None or right is None or left.crs is None:
                 return None
             target_crs = left.crs.authority
@@ -683,7 +685,7 @@ class MainAgent:
             input_keys = [key for key in ("dataset_id", "left_dataset_id", "right_dataset_id", "mask_dataset_id") if key in updated]
             changed = False
             for key in input_keys:
-                dataset = self.registry.resolve(str(updated[key]))
+                dataset = registry.resolve(str(updated[key]))
                 if dataset is None or dataset.kind.value != "VECTOR":
                     continue
                 repaired = await self._tool(run, "vector.repair", {"dataset_id": dataset.id})
@@ -713,12 +715,12 @@ class MainAgent:
     def _resolve_datasets(self, request: AgentRequest):
         from app.entry.dataset_resolver import DatasetResolver
 
-        return DatasetResolver().resolve(request, self.registry, store=self.store)
+        return DatasetResolver().resolve(request, self.registry.for_user(request.user_id), store=self.store)
 
     def _resolve_request_resources(self, request: AgentRequest) -> RequestResources:
         from app.entry.dataset_resolver import DatasetResolver
 
-        return DatasetResolver.request_resources(request, self.registry, self.store)
+        return DatasetResolver.request_resources(request, self.registry.for_user(request.user_id), self.store)
 
     def _diagnose_runs(self, request: AgentRequest, run: Run) -> AgentResult:
         identifiers = list(request.referenced_run_ids)
@@ -821,7 +823,9 @@ class MainAgent:
         next_run = current.model_copy(update={"tool_call_count": current.tool_call_count + 1, "status": RunStatus.WAITING_TOOL})
         self.store.save_run(next_run)
         call = ToolCall(id=call_id or new_id("call"), name=name, arguments=arguments, run_id=run.id, agent_id="main")
-        result = await self.executor.execute(call, agent_id="main", services=self.executor.services)
+        user_id = self.store.user_id_for_run(current.id)
+        services = self.services_factory(user_id) if self.services_factory else self.executor.services
+        result = await self.executor.execute(call, agent_id="main", services=services)
         self.working_memory_updater.update_from_tool_result(current.task_id, result, run_id=current.id)
         return result
 

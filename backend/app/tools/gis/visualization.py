@@ -19,6 +19,6 @@ def render(arguments: dict[str, Any], context: ToolContext) -> dict:
     dataset = dataset_from_context(context, arguments.get("dataset_id"))
     target = output_path(context, arguments.get("output_path"), f"{dataset.name}_map", ".html", intermediate=False)
     path = context.services["renderer"].render(dataset, target, title=arguments.get("title"))
-    artifact = Artifact(name=path.name, kind=ArtifactKind.MAP, path=str(path), media_type="text/html", dataset_id=dataset.id, run_id=context.run_id, description="GeoAgent 生成的地图结果")
+    artifact = Artifact(name=path.name, kind=ArtifactKind.MAP, path=str(path), media_type="text/html", dataset_id=dataset.id, run_id=context.run_id, owner_user_id=context.services.get("user_id"), description="GeoAgent 生成的地图结果")
     context.services["store"].save_artifact(artifact)
     return {"output": artifact.model_dump(mode="json"), "artifacts": [artifact.id], "datasets": [dataset.id]}

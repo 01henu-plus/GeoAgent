@@ -21,7 +21,13 @@ class DatasetResolver:
 
     def resolve(self, request: AgentRequest, registry, *, store=None) -> list[Dataset]:
         identifiers = [*request.dataset_ids, *request.attachment_ids]
-        explicit = _unique(item for identifier in identifiers if (item := registry.resolve(identifier)))
+        explicit: list[Dataset] = []
+        for identifier in dict.fromkeys(identifiers):
+            item = registry.resolve(identifier)
+            if item is None and request.user_id and registry.store.get_dataset(identifier) is not None:
+                raise PermissionError("请求包含不属于当前用户的数据集")
+            if item is not None:
+                explicit.append(item)
 
         text = request.user_input.casefold()
         if store is not None and any(term in text for term in _LATEST_REFERENCES):
@@ -56,11 +62,13 @@ class DatasetResolver:
     @staticmethod
     def request_resources(request: AgentRequest, registry, store=None) -> RequestResources:
         """只解析本轮显式传入的资源，不读取历史数据集或全局 latest。"""
-        datasets = _unique(
-            item
-            for identifier in [*request.dataset_ids, *request.attachment_ids]
-            if (item := registry.resolve(identifier))
-        )
+        datasets: list[Dataset] = []
+        for identifier in dict.fromkeys([*request.dataset_ids, *request.attachment_ids]):
+            item = registry.resolve(identifier)
+            if item is None and request.user_id and registry.store.get_dataset(identifier) is not None:
+                raise PermissionError("请求包含不属于当前用户的数据集")
+            if item is not None:
+                datasets.append(item)
         runs: list[Run] = []
         if store is not None:
             for identifier in dict.fromkeys(request.referenced_run_ids):

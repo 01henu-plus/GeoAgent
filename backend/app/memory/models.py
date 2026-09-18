@@ -12,6 +12,7 @@ class MemoryCandidate(StrictModel):
 
     key: str
     value: str
+    owner_user_id: str | None = None
     category: str = "project_fact"
     source_task_id: str | None = None
     source_run_id: str | None = None

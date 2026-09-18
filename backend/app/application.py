@@ -12,6 +12,7 @@ from pathlib import Path
 from app.agent import AgentManager, MainAgent
 from app.agent.sub_agent import SubAgent
 from app.artifact import ArtifactService
+from app.auth import AuthService
 from app.checkpoint.store import CheckpointStore
 from app.config import Settings
 from app.core.models import AgentRequest, RunBudget
@@ -46,6 +47,7 @@ class Application:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or Settings()
         self.store = StateStore(self.settings.database_path)
+        self.auth = AuthService(self.store, self.settings)
         self.bus = EventBus()
         self.metrics = Metrics()
         self.trace = TraceRecorder(self.store, self.bus, self.metrics)
@@ -99,14 +101,35 @@ class Application:
             max_execution_seconds=self.settings.max_execution_seconds,
         )
         self.task_service = TaskService(TaskRepository(self.store))
-        self.sub_agent = SubAgent(self.tool_executor, self.store, self.trace, context_manager=ContextManager(max_chars=10000), budget=self.budget)
+        self.sub_agent = SubAgent(self.tool_executor, self.store, self.trace, context_manager=ContextManager(max_chars=10000), budget=self.budget, services_factory=self.execution_services)
         self.agent_manager = AgentManager(self.sub_agent, max_parallel=self.settings.max_parallel_agents, max_subagents=self.settings.max_subagents, timeout_seconds=self.settings.max_execution_seconds)
-        self.main_agent = MainAgent(store=self.store, trace=self.trace, executor=self.tool_executor, registry=self.registry, task_service=self.task_service, agent_manager=self.agent_manager, settings=self.settings, checkpoint_store=self.checkpoints, memory=self.memory, knowledge=self.knowledge, model_adapter=self.model_adapter, model_adapters=self.model_adapters, default_model_profile=self.default_model_profile, context_manager=self.context_manager, budget=self.budget)
+        self.main_agent = MainAgent(store=self.store, trace=self.trace, executor=self.tool_executor, registry=self.registry, task_service=self.task_service, agent_manager=self.agent_manager, settings=self.settings, checkpoint_store=self.checkpoints, memory=self.memory, knowledge=self.knowledge, model_adapter=self.model_adapter, model_adapters=self.model_adapters, default_model_profile=self.default_model_profile, context_manager=self.context_manager, budget=self.budget, services_factory=self.execution_services)
         self.run_manager = RunManager(self.main_agent, self.store, self.metrics)
         self.conversations = ConversationService(self.store, self.run_manager)
 
     def start(self) -> None:
         self.store.initialize()
+        self.auth.bootstrap_if_configured()
+
+    def workspace_for_user(self, user_id: str | None):
+        return self.workspace.for_user(user_id)
+
+    def execution_services(self, user_id: str | None = None) -> dict[str, object]:
+        """为一次执行构造同一用户的 Registry、Workspace 和执行器。"""
+
+        workspace = self.workspace.for_user(user_id)
+        services = dict(self.tool_executor.services)
+        services.update(
+            {
+                "workspace": workspace,
+                "registry": self.registry.for_user(user_id),
+                "python": PythonExecutor(workspace, timeout_seconds=self.settings.tool_timeout_seconds),
+                "shell": ShellExecutor(workspace, timeout_seconds=self.settings.tool_timeout_seconds),
+                "artifacts": ArtifactService(self.store, workspace),
+                "user_id": user_id,
+            }
+        )
+        return services
 
     def _load_model_profiles(self) -> None:
         profiles: list[ModelProfile] = []
@@ -169,6 +192,7 @@ class Application:
         request = normalize_request(user_input, conversation_id=conversation_id, dataset_ids=dataset_ids or (), model_profile=model_profile)
         return await self.conversations.ask(request)
 
-    def register_dataset(self, path: str | Path, *, name: str | None = None):
-        target = self.workspace.resolve(path, allow_missing=False)
-        return self.registry.register_path(target, name=name)
+    def register_dataset(self, path: str | Path, *, name: str | None = None, user_id: str | None = None):
+        workspace = self.workspace.for_user(user_id)
+        target = workspace.resolve(path, allow_missing=False)
+        return self.registry.for_user(user_id).register_path(target, name=name)
