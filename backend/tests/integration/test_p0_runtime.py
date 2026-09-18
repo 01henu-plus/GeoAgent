@@ -1,9 +1,6 @@
 import asyncio
 import json
 
-from fastapi.testclient import TestClient
-
-from app.api import create_app
 from app.application import Application
 from app.checkpoint.context import make_checkpoint
 from app.config import Settings
@@ -68,7 +65,7 @@ def test_model_runtime_gets_first_chance_when_offline_rules_would_ask(applicatio
     assert not any(event.event_type == "ToolStarted" for event in application.store.list_events(result.trace_id))
 
 
-def test_model_profiles_api_is_available_without_exposing_key(application):
+def test_model_profiles_api_is_available_without_exposing_key(application, authenticated_client):
     profile = ModelProfile(
         id="local-qwen",
         label="本地千问",
@@ -91,7 +88,7 @@ def test_model_profiles_api_is_available_without_exposing_key(application):
     application.main_agent.default_model_profile = profile.id
     application.main_agent.model_adapter = adapter
 
-    with TestClient(create_app(application)) as client:
+    with authenticated_client as client:
         response = client.get("/api/v1/models")
 
     assert response.status_code == 200
@@ -162,9 +159,12 @@ def test_model_profiles_load_from_environment_settings(tmp_path):
     assert status["default_profile"] == "one"
 
 
-def test_resume_uses_saved_checkpoint_plan(application):
+def test_resume_uses_saved_checkpoint_plan(application, authenticated_client):
     ids = seed_demo(application)
-    request = AgentRequest(user_input="检查 roads", conversation_id="conv_resume", dataset_ids=[ids["roads"]])
+    with authenticated_client:
+        user_id = application.store.get_user_by_username("test-user").id
+    conversation = application.conversations.create("恢复测试", user_id=user_id)
+    request = AgentRequest(user_input="检查 roads", conversation_id=conversation.id, user_id=user_id, dataset_ids=[ids["roads"]])
     prepared = asyncio.run(application.main_agent.prepare_request(request))
     assert prepared.task is not None and prepared.run is not None
     old_run = prepared.run
@@ -176,7 +176,7 @@ def test_resume_uses_saved_checkpoint_plan(application):
     checkpoint = make_checkpoint(old_run.id, "plan_created", application.main_agent._checkpoint_state(request, intent, plan, datasets))
     application.checkpoints.save(checkpoint)
 
-    with TestClient(create_app(application)) as client:
+    with authenticated_client as client:
         response = client.post(f"/api/v1/runs/{old_run.id}/resume")
 
     assert response.status_code == 200
@@ -226,9 +226,9 @@ def test_run_manager_does_not_cancel_completed_run(application):
     assert application.store.get_run(run.id).status is RunStatus.COMPLETED
 
 
-def test_websocket_streams_run_events_before_result(application):
+def test_websocket_streams_run_events_before_result(application, authenticated_client):
     seed_demo(application)
-    with TestClient(create_app(application)) as client:
+    with authenticated_client as client:
         with client.websocket_connect("/ws") as socket:
             socket.send_json({"type": "ask", "message": "检查 roads"})
             messages = []
@@ -244,7 +244,7 @@ def test_websocket_streams_run_events_before_result(application):
     assert messages[-1]["data"]["status"] == "SUCCESS"
 
 
-def test_websocket_streams_model_deltas(application):
+def test_websocket_streams_model_deltas(application, authenticated_client):
     class StreamingModel(ModelAdapter):
         async def complete(self, request: ModelRequest) -> ModelResponse:
             return ModelResponse(model="fake", content="第一段第二段")
@@ -254,7 +254,7 @@ def test_websocket_streams_model_deltas(application):
             yield ModelStreamChunk(model="fake", content="第二段", done=True)
 
     application.main_agent.model_adapter = StreamingModel()
-    with TestClient(create_app(application)) as client:
+    with authenticated_client as client:
         with client.websocket_connect("/ws") as socket:
             socket.send_json({"type": "ask", "message": "你好"})
             messages = []

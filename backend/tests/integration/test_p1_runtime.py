@@ -1,14 +1,14 @@
 import asyncio
 
-from fastapi.testclient import TestClient
-
-from app.api import create_app
-from app.core.models import AgentResultStatus
+from app.core.models import AgentRequest, AgentResultStatus
 from app.demo import seed_demo
 
 
-def test_resume_skips_completed_offline_steps(application):
+def test_resume_skips_completed_offline_steps(application, authenticated_client):
     ids = seed_demo(application)
+    with authenticated_client:
+        user_id = application.store.get_user_by_username("test-user").id
+    conversation = application.conversations.create("恢复测试", user_id=user_id)
     original_checkpoint = application.main_agent._step_checkpoint
     stopped = False
 
@@ -21,7 +21,7 @@ def test_resume_skips_completed_offline_steps(application):
             raise asyncio.CancelledError()
 
     application.main_agent._step_checkpoint = stop_after_inspection
-    cancelled = asyncio.run(application.ask("检查 roads 并生成 500 米缓冲区", dataset_ids=[ids["roads"]]))
+    cancelled = asyncio.run(application.ask(AgentRequest(user_input="检查 roads 并生成 500 米缓冲区", conversation_id=conversation.id, user_id=user_id, dataset_ids=[ids["roads"]])))
     application.main_agent._step_checkpoint = original_checkpoint
 
     assert cancelled.status is AgentResultStatus.CANCELLED
@@ -29,7 +29,7 @@ def test_resume_skips_completed_offline_steps(application):
     assert checkpoint is not None
     assert "inspect" in checkpoint.state["completed_steps"]
 
-    with TestClient(create_app(application)) as client:
+    with authenticated_client as client:
         response = client.post(f"/api/v1/runs/{cancelled.trace_id}/resume")
 
     assert response.status_code == 200

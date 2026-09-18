@@ -3,11 +3,9 @@ import json
 from pathlib import Path
 
 import geopandas as gpd
-from fastapi.testclient import TestClient
 from shapely.geometry import Point
 
-from app.api import create_app
-from app.core.models import AgentResultStatus
+from app.core.models import AgentRequest, AgentResultStatus
 from app.demo import seed_demo
 from app.models import ModelAdapter, ModelRequest, ModelResponse
 from app.runtime.context_manager import ContextManager
@@ -27,9 +25,9 @@ def test_context_manager_keeps_large_context_bounded():
     assert len(json.dumps(context, ensure_ascii=False, separators=(",", ":"), default=str)) <= 400
 
 
-def test_api_exposes_tool_schemas_memory_and_metrics(application):
+def test_api_exposes_tool_schemas_memory_and_metrics(application, authenticated_client):
     ids = seed_demo(application)
-    with TestClient(create_app(application)) as client:
+    with authenticated_client as client:
         tools = client.get("/api/v1/tools")
         assert tools.status_code == 200
         buffer_tool = next(item for item in tools.json() if item["name"] == "vector.buffer")
@@ -46,7 +44,7 @@ def test_api_exposes_tool_schemas_memory_and_metrics(application):
         assert metrics["tool_calls.completed"] > 0
 
 
-def test_api_uploads_file_registers_dataset_and_accepts_attachment_reference(application):
+def test_api_uploads_file_registers_dataset_and_accepts_attachment_reference(application, authenticated_client):
     content = json.dumps(
         {
             "type": "FeatureCollection",
@@ -61,7 +59,7 @@ def test_api_uploads_file_registers_dataset_and_accepts_attachment_reference(app
         ensure_ascii=False,
     ).encode("utf-8")
 
-    with TestClient(create_app(application)) as client:
+    with authenticated_client as client:
         first = client.post(
             "/api/v1/attachments",
             files={"file": ("roads.geojson", content, "application/geo+json")},
@@ -108,9 +106,9 @@ def test_basic_conversation_returns_a_chat_reply(application):
     assert result.summary.startswith("你好！")
 
 
-def test_api_preserves_basic_conversation_messages(application):
+def test_api_preserves_basic_conversation_messages(application, authenticated_client):
     conversation_id = "chat-history-check"
-    with TestClient(create_app(application)) as client:
+    with authenticated_client as client:
         response = client.post(f"/api/v1/conversations/{conversation_id}/messages", json={"message": "你好"})
         messages = client.get(f"/api/v1/conversations/{conversation_id}/messages")
 
@@ -136,8 +134,11 @@ def test_distance_analysis_does_not_run_buffer(application):
     assert not any(event.payload.get("tool") == "vector.buffer" for event in events)
 
 
-def test_model_checkpoint_resume_keeps_tool_outputs(application):
+def test_model_checkpoint_resume_keeps_tool_outputs(application, authenticated_client):
     ids = seed_demo(application)
+    with authenticated_client:
+        user_id = application.store.get_user_by_username("test-user").id
+    conversation = application.conversations.create("模型恢复测试", user_id=user_id)
 
     class ResumableModel(ModelAdapter):
         def __init__(self):
@@ -167,11 +168,11 @@ def test_model_checkpoint_resume_keeps_tool_outputs(application):
             raise asyncio.CancelledError()
 
     application.main_agent._checkpoint = stop_after_model_checkpoint
-    cancelled = asyncio.run(application.ask("请检查道路数据", dataset_ids=[ids["roads"]]))
+    cancelled = asyncio.run(application.ask(AgentRequest(user_input="请检查道路数据", conversation_id=conversation.id, user_id=user_id, dataset_ids=[ids["roads"]])))
     application.main_agent._checkpoint = original_checkpoint
 
     assert cancelled.status is AgentResultStatus.CANCELLED
-    with TestClient(create_app(application)) as client:
+    with authenticated_client as client:
         response = client.post(f"/api/v1/runs/{cancelled.trace_id}/resume")
 
     assert response.status_code == 200
