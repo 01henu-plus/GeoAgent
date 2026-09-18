@@ -292,94 +292,33 @@ class MainAgent:
             run = run.model_copy(update={"status": RunStatus.PLANNING})
             self.store.save_run(run)
             self.guard.check_execution_time(run)
-            if isinstance(resume_state.get("delegation_result"), dict):
-                result = AgentResult.model_validate(resume_state["delegation_result"]).model_copy(update={"task_id": task.id if task else run.task_id, "trace_id": run.id})
-            else:
-                # 参考项目的核心：模型先基于完整会话和工具结果自行判断。
-                # 规则 IntentResolver/Planner 只作为无模型时的离线兜底，不能
-                # 提前阻断模型，也不能把固定计划当成模型已经作出的决定。
-                model_result = await self._model_loop(
-                    request,
-                    run,
-                    task,
-                    datasets,
-                    intent,
-                    plan,
-                    request_frame=request_frame,
-                    initial_messages=resume_state.get("messages") if resume_from and resume_state.get("messages") else None,
-                    initial_protocol_messages=resume_state.get("protocol_messages") if resume_from and isinstance(resume_state.get("protocol_messages"), list) else None,
-                    initial_latest_observation=resume_state.get("latest_observation") if resume_from else None,
-                    initial_findings=resume_state.get("model_findings") if resume_from and resume_state.get("model_findings") else None,
-                    initial_dataset_ids=resume_state.get("model_dataset_ids") if resume_from and resume_state.get("model_dataset_ids") else None,
-                    initial_artifact_ids=resume_state.get("model_artifact_ids") if resume_from and resume_state.get("model_artifact_ids") else None,
-                    initial_subagent_results=resume_state.get("subagent_results") if resume_from and isinstance(resume_state.get("subagent_results"), list) else None,
-                    initial_delegation_fingerprints=resume_state.get("completed_delegation_fingerprints") if resume_from and isinstance(resume_state.get("completed_delegation_fingerprints"), list) else None,
-                    working_memory=working_memory,
-                    initial_plan_completed_steps=resume_state.get("completed_steps") if resume_from and isinstance(resume_state.get("completed_steps"), list) else None,
-                    initial_plan_step_outputs=resume_state.get("step_outputs") if resume_from and isinstance(resume_state.get("step_outputs"), dict) else None,
-                    on_model_delta=on_model_delta,
-                )
-                if model_result is not None:
-                    result = model_result
-                else:
-                    if intent is None or plan is None:
-                        plan = self.planner.build(request_frame.goal, intent, datasets)
-                        phase = "plan_created"
-                        await self.trace.emit(
-                            run.id,
-                            EventType.PLAN_CREATED,
-                            f"生成离线兜底计划：{len(plan.steps)} 步",
-                            payload={**plan.model_dump(mode="json"), "source": "offline_fallback"},
-                            agent_id="main",
-                        )
-                        await self._checkpoint(run.id, "plan_created", self._checkpoint_state(request, intent, plan, datasets, request_frame))
-                    if request_frame.mode is InteractionMode.CANCEL_TASK:
-                        result = AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.SUCCESS, summary="已识别为取消当前任务的请求。", trace_id=run.id)
-                        decision = None
-                    else:
-                        decision = self.router.route(intent, plan, datasets)
-                    if decision is None:
-                        pass
-                    elif decision.type.value == "DELEGATE":
-                        decision = decision.model_copy(update={"subtasks": self.decomposer.decompose(request, datasets)})
-                    if decision is not None:
-                        await self.trace.emit(
-                            run.id,
-                            EventType.DECISION_MADE,
-                            decision.reasoning_summary,
-                            payload={**decision.model_dump(mode="json"), "source": "offline_fallback"},
-                            agent_id="main",
-                        )
-                    if decision is None:
-                        pass
-                    elif decision.type.value == "ASK_USER":
-                        result = AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.BLOCKED, summary=decision.final_response or decision.reasoning_summary, error="WAITING_USER", trace_id=run.id)
-                    elif decision.type.value == "DELEGATE":
-                        delegation_tasks = decision.subtasks or self.decomposer.decompose(request, datasets)
-                        fingerprint = _delegation_fingerprint(delegation_tasks)
-                        completed = set(resume_state.get("completed_delegation_fingerprints", []))
-                        if fingerprint in completed:
-                            result = AgentResult(
-                                agent_id="main",
-                                task_id=task.id if task else run.task_id,
-                                status=AgentResultStatus.BLOCKED,
-                                summary="相同委派已经完成，请提供新的目标或改变处理策略。",
-                                error="DELEGATION_NO_PROGRESS",
-                                trace_id=run.id,
-                            )
-                        else:
-                            result = await self._delegate(request, run, task, datasets, delegation_tasks, intent=intent, plan=plan, request_frame=request_frame, working_memory=working_memory)
-                    elif decision.type.value == "TOOL":
-                        result = await self._execute_plan(request, run, task, datasets, intent, plan, resume_state, request_frame=request_frame)
-                    elif intent.intent.value == "RUN_DIAGNOSIS":
-                        result = self._diagnose_runs(request, run)
-                    elif intent.intent.value == "RESULT_INTERPRETATION":
-                        result = self._interpret_result(request, run)
-                    elif intent.intent.value == "UNKNOWN":
-                        result = AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.SUCCESS, summary=_conversation_reply(request.user_input), trace_id=run.id)
-                    else:
-                        findings = self.knowledge.retrieve(request.user_input) if intent.intent.value == "KNOWLEDGE_QUERY" else []
-                        result = AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.SUCCESS, summary="已整理 GIS 知识上下文。" if findings else "已理解请求，但当前计划没有需要执行的 GIS 操作。", findings=findings, trace_id=run.id, warnings=[] if findings else ["当前未配置大模型，离线模式只支持有限的 GIS 操作。"])
+            # Model 与 Offline 只选择不同的 Decision Provider；执行控制统一进入 AgentRuntime。
+            phase = "runtime_started"
+            result = await self._model_loop(
+                request,
+                run,
+                task,
+                datasets,
+                intent,
+                plan,
+                request_frame=request_frame,
+                initial_messages=resume_state.get("messages") if resume_from and resume_state.get("messages") else None,
+                initial_protocol_messages=resume_state.get("protocol_messages") if resume_from and isinstance(resume_state.get("protocol_messages"), list) else None,
+                initial_latest_observation=resume_state.get("latest_observation") if resume_from else None,
+                initial_latest_failure=resume_state.get("latest_failure") if resume_from and isinstance(resume_state.get("latest_failure"), dict) else None,
+                initial_findings=resume_state.get("model_findings") or resume_state.get("findings") if resume_from else None,
+                initial_dataset_ids=resume_state.get("model_dataset_ids") or resume_state.get("dataset_ids") if resume_from else None,
+                initial_artifact_ids=resume_state.get("model_artifact_ids") or resume_state.get("artifact_ids") if resume_from else None,
+                initial_subagent_results=resume_state.get("subagent_results") if resume_from and isinstance(resume_state.get("subagent_results"), list) else None,
+                initial_delegation_fingerprints=resume_state.get("completed_delegation_fingerprints") if resume_from and isinstance(resume_state.get("completed_delegation_fingerprints"), list) else None,
+                initial_legacy_delegation_result=resume_state.get("delegation_result") if resume_from and isinstance(resume_state.get("delegation_result"), dict) else None,
+                initial_original_plan=resume_state.get("original_plan") if resume_from and isinstance(resume_state.get("original_plan"), dict) else None,
+                working_memory=working_memory,
+                initial_plan_completed_steps=resume_state.get("completed_steps") if resume_from and isinstance(resume_state.get("completed_steps"), list) else None,
+                initial_plan_step_outputs=resume_state.get("step_outputs") if resume_from and isinstance(resume_state.get("step_outputs"), dict) else None,
+                initial_previous_replan_reasons=resume_state.get("previous_replan_reasons") if resume_from and isinstance(resume_state.get("previous_replan_reasons"), list) else None,
+                on_model_delta=on_model_delta,
+            )
             final_status = _run_status_for_result(result.status, result.error)
             run = finish_run(self.store.get_run(run.id) or run, final_status, error=result.error)
             self.store.save_run(run.model_copy(update={"metadata": {**run.metadata, "result": result.model_dump(mode="json")}}))
@@ -394,7 +333,30 @@ class MainAgent:
             completion_state = {"status": final_status.value, "result": result.model_dump(mode="json")}
             previous_checkpoint = self.checkpoint_store.latest(run.id) if self.checkpoint_store else None
             if previous_checkpoint is not None:
-                for key in ("protocol_messages", "latest_observation", "model_findings", "model_dataset_ids", "model_artifact_ids"):
+                for key in (
+                    "request",
+                    "request_frame",
+                    "intent",
+                    "plan",
+                    "current_plan",
+                    "original_plan",
+                    "completed_steps",
+                    "step_outputs",
+                    "protocol_messages",
+                    "latest_observation",
+                    "latest_failure",
+                    "findings",
+                    "dataset_ids",
+                    "artifact_ids",
+                    "subagent_results",
+                    "completed_delegation_fingerprints",
+                    "replan_count",
+                    "previous_replan_reasons",
+                    "runtime_mode",
+                    "model_findings",
+                    "model_dataset_ids",
+                    "model_artifact_ids",
+                ):
                     if key in previous_checkpoint.state:
                         completion_state[key] = previous_checkpoint.state[key]
             await self._checkpoint(run.id, "run_completed", completion_state)
@@ -406,7 +368,16 @@ class MainAgent:
             run = finish_run(self.store.get_run(run.id) or run, RunStatus.CANCELLED, error="CANCELLED")
             self.store.save_run(run)
             previous_checkpoint = self.checkpoint_store.latest(run.id) if self.checkpoint_store else None
-            state = {**(previous_checkpoint.state if previous_checkpoint else {}), **self._checkpoint_state(request, intent, plan, datasets, request_frame)}
+            state = dict(previous_checkpoint.state) if previous_checkpoint else {}
+            state.update(
+                {
+                    "request": request.model_dump(mode="json"),
+                    "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
+                    "intent": intent.model_dump(mode="json") if intent else None,
+                }
+            )
+            if plan is not None or "plan" not in state:
+                state["plan"] = plan.model_dump(mode="json") if plan is not None else None
             state["phase"] = phase
             await self._checkpoint(run.id, "run_cancelled", state)
             if task is not None and prepared_request.action in {"create_task", "bind_task", "retry_run"}:
@@ -441,37 +412,103 @@ class MainAgent:
         initial_messages: list[dict[str, Any]] | None = None,
         initial_protocol_messages: list[dict[str, Any]] | None = None,
         initial_latest_observation: dict[str, Any] | None = None,
+        initial_latest_failure: dict[str, Any] | None = None,
         initial_findings: list[Any] | None = None,
         initial_dataset_ids: list[str] | None = None,
         initial_artifact_ids: list[str] | None = None,
         initial_subagent_results: list[Any] | None = None,
         initial_delegation_fingerprints: list[str] | None = None,
+        initial_legacy_delegation_result: dict[str, Any] | None = None,
+        initial_original_plan: dict[str, Any] | None = None,
         working_memory: WorkingMemory | None = None,
         initial_plan_completed_steps: list[str] | None = None,
         initial_plan_step_outputs: dict[str, Any] | None = None,
+        initial_previous_replan_reasons: list[str] | None = None,
         on_model_delta: Callable[[str], Awaitable[None]] | None = None,
-    ) -> AgentResult | None:
+    ) -> AgentResult:
+        """兼容入口；模型和无模型请求都交给同一个 AgentRuntime。"""
+
+        return await self._run_agent_runtime(
+            request,
+            run,
+            task,
+            datasets,
+            intent,
+            plan,
+            request_frame=request_frame,
+            initial_messages=initial_messages,
+            initial_protocol_messages=initial_protocol_messages,
+            initial_latest_observation=initial_latest_observation,
+            initial_latest_failure=initial_latest_failure,
+            initial_findings=initial_findings,
+            initial_dataset_ids=initial_dataset_ids,
+            initial_artifact_ids=initial_artifact_ids,
+            initial_subagent_results=initial_subagent_results,
+            initial_delegation_fingerprints=initial_delegation_fingerprints,
+            initial_legacy_delegation_result=initial_legacy_delegation_result,
+            initial_original_plan=initial_original_plan,
+            working_memory=working_memory,
+            initial_plan_completed_steps=initial_plan_completed_steps,
+            initial_plan_step_outputs=initial_plan_step_outputs,
+            initial_previous_replan_reasons=initial_previous_replan_reasons,
+            on_model_delta=on_model_delta,
+        )
+
+    async def _run_agent_runtime(
+        self,
+        request: AgentRequest,
+        run: Run,
+        task: Task | None,
+        datasets,
+        intent: IntentResult | None,
+        plan: Plan | None,
+        *,
+        request_frame: RequestFrame | None = None,
+        initial_messages: list[dict[str, Any]] | None = None,
+        initial_protocol_messages: list[dict[str, Any]] | None = None,
+        initial_latest_observation: dict[str, Any] | None = None,
+        initial_latest_failure: dict[str, Any] | None = None,
+        initial_findings: list[Any] | None = None,
+        initial_dataset_ids: list[str] | None = None,
+        initial_artifact_ids: list[str] | None = None,
+        initial_subagent_results: list[Any] | None = None,
+        initial_delegation_fingerprints: list[str] | None = None,
+        initial_legacy_delegation_result: dict[str, Any] | None = None,
+        initial_original_plan: dict[str, Any] | None = None,
+        working_memory: WorkingMemory | None = None,
+        initial_plan_completed_steps: list[str] | None = None,
+        initial_plan_step_outputs: dict[str, Any] | None = None,
+        initial_previous_replan_reasons: list[str] | None = None,
+        on_model_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> AgentResult:
         model_adapter = self._model_adapter_for(request)
-        if model_adapter is None:
-            return None
         session: dict[str, Any] = {
             "protocol_messages": extract_protocol_messages(protocol_messages=initial_protocol_messages, legacy_messages=initial_messages),
             "findings": list(initial_findings or []),
             "dataset_ids": set(initial_dataset_ids or []),
             "artifact_ids": set(initial_artifact_ids or []),
             "latest_observation": _observation_from_checkpoint(initial_latest_observation),
-            "latest_failure": None,
+            "latest_failure": dict(initial_latest_failure or {}) or None,
             "datasets": list(datasets),
             "plan": plan,
-            "original_plan": plan.model_copy(deep=True) if plan is not None else None,
+            "original_plan": Plan.model_validate(initial_original_plan) if initial_original_plan else plan.model_copy(deep=True) if plan is not None else None,
             "completed_steps": set(initial_plan_completed_steps or []),
             "step_outputs": dict(initial_plan_step_outputs or {}),
+            "previous_replan_reasons": list(initial_previous_replan_reasons or []),
             "subagent_results": list(initial_subagent_results or []),
             "completed_delegation_fingerprints": set(initial_delegation_fingerprints or []),
+            "legacy_delegation_result": dict(initial_legacy_delegation_result) if initial_legacy_delegation_result else None,
             "run": run,
             "working_memory": working_memory,
             "fast_path_enabled": plan is not None,
+            "decision_provider": "model" if model_adapter is not None else "offline",
         }
+
+        await self._checkpoint(
+            run.id,
+            "runtime_started",
+            self._runtime_checkpoint_state(request, intent, request_frame, session),
+        )
 
         initial_state = self.state_builder.build(
             request,
@@ -519,54 +556,27 @@ class MainAgent:
             session["run"] = current
             current_memory = self.store.get_working_memory(current.task_id) if current.task_id else None
             session["working_memory"] = current_memory or session["working_memory"]
-            refreshed_datasets = self._refresh_model_datasets(
-                request,
-                datasets,
-                session["dataset_ids"],
-                session["working_memory"],
-                session["latest_observation"],
-            )
-            session["datasets"] = refreshed_datasets
-            request_resources = self._resolve_request_resources(request)
-            messages, bounded_protocol, tools = self._build_model_messages(
-                request,
-                current,
-                task,
-                refreshed_datasets,
-                intent,
-                session["plan"],
-                request_frame,
-                session["protocol_messages"],
-                working_memory=session["working_memory"],
-                request_resources=request_resources,
-                current_observation=session["latest_observation"],
-                plan_progress={"completed_steps": sorted(session["completed_steps"]), "step_outputs": session["step_outputs"]},
-                latest_failure=session["latest_failure"],
-            )
-            session["protocol_messages"] = bounded_protocol
-            content_parts: list[str] = []
-            tool_calls: list[dict[str, Any]] = []
-            input_tokens = output_tokens = 0
-            model_name: str | None = None
-            async for chunk in model_adapter.stream(ModelRequest(messages=messages, tools=tools, max_tokens=self.budget.max_tokens)):
-                if chunk.content:
-                    content_parts.append(chunk.content)
-                    if on_model_delta is not None:
-                        await on_model_delta(chunk.content)
-                if chunk.tool_calls:
-                    tool_calls = chunk.tool_calls
-                input_tokens = chunk.input_tokens or input_tokens
-                output_tokens = chunk.output_tokens or output_tokens
-                model_name = chunk.model or model_name
-            response = ModelResponse(
-                content="".join(content_parts),
-                tool_calls=tool_calls,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                model=model_name,
-            )
-            session["last_response"] = response
-            decision = self.decision_engine.from_model_response(response, source="model")
+            if model_adapter is not None:
+                decision = await self._model_decision(
+                    request,
+                    current,
+                    task,
+                    datasets,
+                    intent,
+                    request_frame,
+                    session,
+                    model_adapter=model_adapter,
+                    on_model_delta=on_model_delta,
+                )
+            else:
+                decision = self._offline_decision(
+                    state,
+                    request=request,
+                    task=task,
+                    intent=intent,
+                    request_frame=request_frame,
+                    session=session,
+                )
             await self._trace_runtime_decision(decision, state)
             return decision
 
@@ -584,6 +594,11 @@ class MainAgent:
 
         async def fast_path(state):
             if not session["fast_path_enabled"] or session["plan"] is None:
+                return None
+            if session["decision_provider"] == "offline" and session["plan"].metadata.get("delegated_roles") and not session["subagent_results"]:
+                # 委派计划的控制动作由 Offline Decision Provider 产生，不能被
+                # 旧的无工具 PlanStep 直接消费。
+                session["fast_path_enabled"] = False
                 return None
             step = self.loop.next_executable_step(session["plan"], session["completed_steps"])
             if step is None:
@@ -615,17 +630,165 @@ class MainAgent:
             fast_path=fast_path,
             max_runtime_transitions=self.budget.max_runtime_transitions,
         )
-        if outcome.error == "EMPTY_MODEL_RESPONSE":
-            return None
+        return self._finalize_runtime_outcome(outcome, task=task, run=run)
+
+    async def _model_decision(
+        self,
+        request: AgentRequest,
+        run: Run,
+        task: Task | None,
+        datasets,
+        intent: IntentResult | None,
+        request_frame: RequestFrame | None,
+        session: dict[str, Any],
+        *,
+        model_adapter: ModelAdapter,
+        on_model_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> AgentDecision:
+        """Model Decision Provider：只构造模型输入并返回 AgentDecision。"""
+
+        refreshed_datasets = self._refresh_model_datasets(
+            request,
+            datasets,
+            session["dataset_ids"],
+            session["working_memory"],
+            session["latest_observation"],
+        )
+        session["datasets"] = refreshed_datasets
+        request_resources = self._resolve_request_resources(request)
+        messages, bounded_protocol, tools = self._build_model_messages(
+            request,
+            run,
+            task,
+            refreshed_datasets,
+            intent,
+            session["plan"],
+            request_frame,
+            session["protocol_messages"],
+            working_memory=session["working_memory"],
+            request_resources=request_resources,
+            current_observation=session["latest_observation"],
+            plan_progress={"completed_steps": sorted(session["completed_steps"]), "step_outputs": session["step_outputs"]},
+            latest_failure=session["latest_failure"],
+        )
+        session["protocol_messages"] = bounded_protocol
+        content_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        input_tokens = output_tokens = 0
+        model_name: str | None = None
+        async for chunk in model_adapter.stream(ModelRequest(messages=messages, tools=tools, max_tokens=self.budget.max_tokens)):
+            if chunk.content:
+                content_parts.append(chunk.content)
+                if on_model_delta is not None:
+                    await on_model_delta(chunk.content)
+            if chunk.tool_calls:
+                tool_calls = chunk.tool_calls
+            input_tokens = chunk.input_tokens or input_tokens
+            output_tokens = chunk.output_tokens or output_tokens
+            model_name = chunk.model or model_name
+        response = ModelResponse(
+            content="".join(content_parts),
+            tool_calls=tool_calls,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            model=model_name,
+        )
+        session["last_response"] = response
+        return self.decision_engine.from_model_response(response, source="model")
+
+    def _offline_decision(
+        self,
+        state,
+        *,
+        request: AgentRequest,
+        task: Task | None,
+        intent: IntentResult | None,
+        request_frame: RequestFrame | None,
+        session: dict[str, Any],
+    ) -> AgentDecision:
+        """Offline Decision Provider：只复用旧 Planner/Router 生成 AgentDecision。"""
+
+        if session.get("legacy_delegation_result"):
+            return _decision_from_agent_result(AgentResult.model_validate(session["legacy_delegation_result"]), source="offline_compat")
+        if intent is None:
+            intent = self.legacy_intent_adapter.to_intent(request_frame, request, session["datasets"])
+
+        current_plan = session.get("plan")
+        if current_plan is not None:
+            if current_plan.clarification:
+                return AgentDecision(
+                    type=DecisionType.ASK_USER,
+                    reasoning_summary=current_plan.clarification,
+                    final_response=current_plan.clarification,
+                    source="offline",
+                )
+            if current_plan.metadata.get("delegated_roles") and not session["subagent_results"]:
+                return self.router.route(
+                    intent,
+                    current_plan,
+                    session["datasets"],
+                    subtasks=self.decomposer.decompose(request, session["datasets"]),
+                ).model_copy(update={"source": "offline"})
+            if current_plan.metadata.get("delegated_roles") and session["subagent_results"]:
+                completed = sum(1 for item in session["subagent_results"] if item.get("status") == AgentResultStatus.SUCCESS.value)
+                total = len(session["subagent_results"])
+                result = AgentResult(
+                    agent_id="main",
+                    task_id=task.id if task else state.task_id,
+                    status=AgentResultStatus.SUCCESS if completed == total else AgentResultStatus.PARTIAL,
+                    summary=f"已并行完成 {completed}/{total} 个主题分析，并汇总结果。",
+                    findings=list(session["findings"]),
+                    datasets=sorted(session["dataset_ids"]),
+                    artifacts=sorted(session["artifact_ids"]),
+                    trace_id=state.run_id,
+                )
+                return _decision_from_agent_result(result, source="offline")
+            if self.loop.next_executable_step(current_plan, session["completed_steps"]) is None:
+                operation = str(current_plan.metadata.get("operation") or intent.entities.get("operation") or "")
+                result = AgentResult(
+                    agent_id="main",
+                    task_id=task.id if task else state.task_id,
+                    status=AgentResultStatus.SUCCESS,
+                    summary=_plan_result_summary(operation, current_plan, list(session["findings"]), sorted(session["dataset_ids"]), sorted(session["artifact_ids"])),
+                    findings=list(session["findings"]),
+                    datasets=sorted(session["dataset_ids"]),
+                    artifacts=sorted(session["artifact_ids"]),
+                    trace_id=state.run_id,
+                )
+                return _decision_from_agent_result(result, source="offline")
+
+        if intent.intent.value == "RUN_DIAGNOSIS":
+            return _decision_from_agent_result(self._diagnose_runs(request, session["run"]), source="offline")
+        if intent.intent.value == "RESULT_INTERPRETATION":
+            return _decision_from_agent_result(self._interpret_result(request, session["run"]), source="offline")
+        if intent.intent.value == "UNKNOWN":
+            return AgentDecision(type=DecisionType.FINAL, reasoning_summary="当前回合不需要 GIS 执行。", final_response=_conversation_reply(request.user_input), source="offline")
+        findings = self.knowledge.retrieve(request.user_input) if intent.intent.value == "KNOWLEDGE_QUERY" else []
+        result = AgentResult(
+            agent_id="main",
+            task_id=task.id if task else state.task_id,
+            status=AgentResultStatus.SUCCESS,
+            summary="已整理 GIS 知识上下文。" if findings else "已理解请求，但当前计划没有需要执行的 GIS 操作。",
+            findings=findings,
+            trace_id=state.run_id,
+            warnings=[] if findings else ["当前未配置大模型，离线模式只支持有限的 GIS 操作。"],
+        )
+        return _decision_from_agent_result(result, source="offline")
+
+    @staticmethod
+    def _finalize_runtime_outcome(outcome, *, task: Task | None, run: Run) -> AgentResult:
+        """RuntimeOutcome 到 AgentResult 的唯一转换出口。"""
+
         if outcome.error == "AGENT_RUNTIME_BUDGET_EXCEEDED":
             raise BudgetExceeded("Agent turn budget exceeded")
-        if outcome.status is None:
-            return None
+        status = outcome.status or (AgentResultStatus.FAILED if outcome.error else AgentResultStatus.SUCCESS)
         summary = outcome.final_response or outcome.error or "当前运行已结束。"
+        if outcome.error == "EMPTY_MODEL_RESPONSE":
+            summary = "模型未返回可执行的工具调用或文本回答。"
         return AgentResult(
             agent_id="main",
             task_id=task.id if task else run.task_id,
-            status=outcome.status,
+            status=status,
             summary=summary,
             findings=list(outcome.findings),
             datasets=sorted(set(outcome.dataset_ids)),
@@ -675,11 +838,19 @@ class MainAgent:
             response = (decision.final_response or "").strip()
             if not response:
                 return RuntimeTransition(terminal=True, error="EMPTY_MODEL_RESPONSE")
-            session["findings"].append({"model": decision.metadata.get("model"), "content": response})
+            metadata = decision.metadata
+            for finding in metadata.get("findings") or []:
+                if finding not in session["findings"]:
+                    session["findings"].append(finding)
+            session["dataset_ids"].update(str(item) for item in metadata.get("datasets") or [])
+            session["artifact_ids"].update(str(item) for item in metadata.get("artifacts") or [])
+            if decision.source == "model" or metadata.get("model"):
+                session["findings"].append({"model": metadata.get("model"), "content": response})
             return RuntimeTransition(
                 terminal=True,
-                status=AgentResultStatus.SUCCESS,
+                status=_agent_result_status(metadata.get("status"), default=AgentResultStatus.SUCCESS),
                 final_response=response,
+                error=metadata.get("error"),
                 findings=tuple(session["findings"]),
                 dataset_ids=tuple(sorted(session["dataset_ids"])),
                 artifact_ids=tuple(sorted(session["artifact_ids"])),
@@ -710,7 +881,7 @@ class MainAgent:
             session["step_outputs"] = {}
             session["latest_failure"] = None
             await self.trace.emit(run.id, EventType.PLAN_CREATED, f"生成运行时计划：{len(new_plan.steps)} 步", payload={**new_plan.model_dump(mode="json"), "source": "agent_runtime"}, agent_id="main")
-            await self._checkpoint(run.id, "plan_created", self._checkpoint_state(request, intent, new_plan, session["datasets"], request_frame))
+            await self._checkpoint(run.id, "plan_created", self._runtime_checkpoint_state(request, intent, request_frame, session))
             return RuntimeTransition(current_plan=new_plan)
         if decision.type.value == "DELEGATE":
             if task is None:
@@ -746,6 +917,7 @@ class MainAgent:
                 working_memory=session["working_memory"],
                 fingerprint=fingerprint,
             )
+            session["fast_path_enabled"] = False
             session["completed_delegation_fingerprints"].add(delegation.fingerprint)
             session["subagent_results"] = _merge_subagent_views(session["subagent_results"], delegation.subagent_results)
             session["findings"].extend(delegation.findings)
@@ -846,14 +1018,7 @@ class MainAgent:
         await self._checkpoint(
             session["run"].id,
             "model_tool_completed",
-            {
-                **self._checkpoint_state(request, intent, session["plan"], session["datasets"], request_frame),
-                "protocol_messages": bounded_protocol,
-                "latest_observation": latest_observation,
-                "model_findings": session["findings"],
-                "model_dataset_ids": sorted(session["dataset_ids"]),
-                "model_artifact_ids": sorted(session["artifact_ids"]),
-            },
+            self._runtime_checkpoint_state(request, intent, request_frame, session),
         )
         return RuntimeTransition(
             observation=latest_observation,
@@ -924,15 +1089,16 @@ class MainAgent:
             }
         observation = _execution_observation(outcome)
         session["latest_observation"] = observation
-        await self._checkpoint(
+        await self._step_checkpoint(
             session["run"].id,
-            "plan_step_completed" if outcome.accepted else "plan_step_failed",
-            {
-                **self._checkpoint_state(request, intent, session["plan"], session["datasets"], request_frame),
-                "completed_steps": sorted(session["completed_steps"]),
-                "step_outputs": session["step_outputs"],
-                "latest_observation": observation,
-            },
+            request,
+            intent,
+            session["plan"],
+            session["datasets"],
+            set(session["completed_steps"]),
+            request_frame=request_frame,
+            phase="plan_step_completed" if outcome.accepted else "plan_step_failed",
+            runtime_session=session,
         )
         return RuntimeTransition(
             observation=observation,
@@ -1291,6 +1457,47 @@ class MainAgent:
             "dataset_ids": [item.id for item in datasets],
         }
 
+    def _runtime_checkpoint_state(
+        self,
+        request: AgentRequest,
+        intent: IntentResult | None,
+        request_frame: RequestFrame | None,
+        session: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Runtime 的统一恢复视图；Context 和完整 Tool 输出不写入其中。"""
+
+        current_run = self.store.get_run(session["run"].id) or session["run"]
+        plan = session.get("plan")
+        payload = self._checkpoint_state(request, intent, plan, session.get("datasets", []), request_frame)
+        payload.update(
+            {
+                "current_plan": plan.model_dump(mode="json") if plan is not None else None,
+                "original_plan": session["original_plan"].model_dump(mode="json") if session.get("original_plan") is not None else None,
+                "completed_steps": sorted(session.get("completed_steps", set())),
+                "step_outputs": dict(session.get("step_outputs", {})),
+                "protocol_messages": list(session.get("protocol_messages", [])),
+                "latest_observation": session.get("latest_observation"),
+                "latest_failure": session.get("latest_failure"),
+                "findings": list(session.get("findings", [])),
+                "dataset_ids": sorted(session.get("dataset_ids", set())),
+                "artifact_ids": sorted(session.get("artifact_ids", set())),
+                "subagent_results": list(session.get("subagent_results", [])),
+                "completed_delegation_fingerprints": sorted(session.get("completed_delegation_fingerprints", set())),
+                "replan_count": current_run.replan_count,
+                "previous_replan_reasons": list(session.get("previous_replan_reasons", [])),
+                "runtime_mode": session.get("decision_provider"),
+            }
+        )
+        # 旧模型恢复仍读取这些别名；它们与 canonical runtime state 同源。
+        payload.update(
+            {
+                "model_findings": list(session.get("findings", [])),
+                "model_dataset_ids": sorted(session.get("dataset_ids", set())),
+                "model_artifact_ids": sorted(session.get("artifact_ids", set())),
+            }
+        )
+        return payload
+
     async def _checkpoint(self, run_id: str, phase: str, state: dict[str, Any]) -> None:
         if not self.checkpoint_store:
             return
@@ -1298,10 +1505,26 @@ class MainAgent:
         self.checkpoint_store.save(checkpoint)
         await self.trace.emit(run_id, EventType.CHECKPOINT_SAVED, f"保存 Checkpoint：{phase}", payload={"checkpoint_id": checkpoint.id, "phase": phase}, agent_id="main")
 
-    async def _step_checkpoint(self, run_id: str, request: AgentRequest, intent: IntentResult, plan: Plan, datasets, completed_steps: set[str], *, request_frame: RequestFrame | None = None, **state: Any) -> None:
+    async def _step_checkpoint(
+        self,
+        run_id: str,
+        request: AgentRequest,
+        intent: IntentResult,
+        plan: Plan,
+        datasets,
+        completed_steps: set[str],
+        *,
+        request_frame: RequestFrame | None = None,
+        phase: str = "step_completed",
+        runtime_session: dict[str, Any] | None = None,
+        **state: Any,
+    ) -> None:
+        if runtime_session is not None:
+            await self._checkpoint(run_id, phase, self._runtime_checkpoint_state(request, intent, request_frame, runtime_session))
+            return
         await self._checkpoint(
             run_id,
-            "step_completed",
+            phase,
             {
                 **self._checkpoint_state(request, intent, plan, datasets, request_frame),
                 "completed_steps": sorted(completed_steps),
@@ -1699,7 +1922,7 @@ class MainAgent:
                     **self._checkpoint_state(request, intent, plan, datasets, request_frame),
                     "completed_steps": [item.id for item in plan.steps],
                     "subtask_ids": [item.id for item in delegation.tasks],
-                    "delegation_result": result.model_dump(mode="json"),
+                    "legacy_result": result.model_dump(mode="json"),
                     "working_memory_refs": _working_memory_refs(self.store.get_working_memory(task.id)),
                     "runtime_delegation": False,
                 },
@@ -1818,6 +2041,59 @@ def _aggregate_subagent_directive(executions: list[Any]) -> LoopDirective:
     if LoopDirective.ABORT in directives:
         return LoopDirective.ABORT
     return LoopDirective.CONTINUE
+
+
+def _agent_result_status(value: Any, *, default: AgentResultStatus) -> AgentResultStatus:
+    if isinstance(value, AgentResultStatus):
+        return value
+    try:
+        return AgentResultStatus(str(value)) if value else default
+    except ValueError:
+        return default
+
+
+def _decision_from_agent_result(result: AgentResult, *, source: str) -> AgentDecision:
+    if result.status is AgentResultStatus.BLOCKED:
+        return AgentDecision(
+            type=DecisionType.ASK_USER,
+            reasoning_summary=result.summary,
+            final_response=result.summary,
+            source=source,
+            metadata={
+                "status": result.status.value,
+                "error": result.error,
+                "findings": result.findings,
+                "datasets": result.datasets,
+                "artifacts": result.artifacts,
+            },
+        )
+    if result.status in {AgentResultStatus.FAILED, AgentResultStatus.CANCELLED}:
+        return AgentDecision(
+            type=DecisionType.ABORT,
+            reasoning_summary=result.summary,
+            source=source,
+            metadata={
+                "status": result.status.value,
+                "error": result.error,
+                "findings": result.findings,
+                "datasets": result.datasets,
+                "artifacts": result.artifacts,
+            },
+        )
+    return AgentDecision(
+        type=DecisionType.FINAL,
+        reasoning_summary=result.summary,
+        final_response=result.summary,
+        source=source,
+        metadata={
+            "status": result.status.value,
+            "error": result.error,
+            "findings": result.findings,
+            "datasets": result.datasets,
+            "artifacts": result.artifacts,
+            "warnings": result.warnings,
+        },
+    )
 
 
 def _subagent_result_view(subtask: SubTask, execution: SubAgentExecutionResult) -> dict[str, Any]:
