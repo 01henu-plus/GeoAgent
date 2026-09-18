@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 from app.agent.manager import AgentManager
 from app.core.models import (
@@ -21,8 +22,19 @@ from app.core.models import (
     WorkingMemoryItem,
 )
 from app.demo import seed_demo
+from app.models import ModelAdapter, ModelRequest, ModelResponse
 from app.runtime.tool_execution_cycle import ExecutionOutcome
 from app.state import WorkingMemoryUpdater
+
+
+class _DelegationModel(ModelAdapter):
+    def __init__(self, decisions: list[ModelResponse]) -> None:
+        self.decisions = list(decisions)
+        self.requests: list[ModelRequest] = []
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        self.requests.append(request)
+        return self.decisions.pop(0)
 
 
 def test_delegated_subagents_use_parent_task_and_merge_results_into_working_memory(application):
@@ -44,6 +56,149 @@ def test_delegated_subagents_use_parent_task_and_merge_results_into_working_memo
     assert memory is not None
     assert set(result.datasets).issubset(memory.active_dataset_ids)
     assert memory.unresolved_questions == []
+
+
+def test_runtime_delegation_is_observation_then_mainagent_final(application):
+    ids = seed_demo(application)
+    model = _DelegationModel(
+        [
+            ModelResponse(model="fake", tool_calls=[{"id": "delegate", "function": {"name": "agent.delegate", "arguments": "{\"reason\":\"三个主题需要并行处理\"}"}}]),
+            ModelResponse(model="fake", content="已根据子任务结果完成综合判断。"),
+        ]
+    )
+    calls = []
+
+    class FakeManager:
+        async def run(self, request, tasks, datasets, **kwargs):
+            calls.append([item.id for item in tasks])
+            return [
+                SubAgentExecutionResult(
+                    result=AgentResult(agent_id=f"agent-{item.id}", task_id=kwargs["parent_task_id"], status=AgentResultStatus.SUCCESS, summary=f"完成：{item.goal}", trace_id=f"run-{item.id}"),
+                    working_memory_delta=WorkingMemoryDelta(added_dataset_ids=[f"derived-{item.id}"], source_run_id=f"run-{item.id}"),
+                )
+                for item in tasks
+            ]
+
+    original_manager = application.main_agent.agent_manager
+    application.main_agent.model_adapter = model
+    application.main_agent.agent_manager = FakeManager()
+    try:
+        result = asyncio.run(application.ask("综合道路、人口和 DEM，从三个方面评价当前区域", dataset_ids=list(ids.values())))
+    finally:
+        application.main_agent.agent_manager = original_manager
+
+    assert result.status is AgentResultStatus.SUCCESS
+    assert result.summary == "已根据子任务结果完成综合判断。"
+    assert len(calls) == 1
+    assert len(model.requests) == 2
+    second_context = json.loads(model.requests[1].messages[1]["content"].split("\n", 1)[1])
+    assert second_context["current_observation"]["type"] == "delegation"
+    assert second_context["current_observation"]["results"][0]["status"] == "SUCCESS"
+    assert second_context["current_observation"]["results"][0]["subtask_id"]
+    memory = application.store.get_working_memory(result.task_id)
+    assert memory is not None
+    assert all(item.startswith("derived-") for item in memory.active_dataset_ids if item.startswith("derived-"))
+    events = application.store.list_events(result.trace_id)
+    assert any(item.event_type == "DelegationCompleted" for item in events)
+
+
+def test_runtime_delegation_same_fingerprint_does_not_spawn_twice(application):
+    ids = seed_demo(application)
+    model = _DelegationModel(
+        [
+            ModelResponse(model="fake", tool_calls=[{"id": "delegate-a", "function": {"name": "agent.delegate", "arguments": "{}"}}]),
+            ModelResponse(model="fake", tool_calls=[{"id": "delegate-b", "function": {"name": "agent.delegate", "arguments": "{}"}}]),
+            ModelResponse(model="fake", content="已停止重复委派并完成判断。"),
+        ]
+    )
+    spawn_count = 0
+
+    class FakeManager:
+        async def run(self, request, tasks, datasets, **kwargs):
+            nonlocal spawn_count
+            spawn_count += 1
+            return [
+                SubAgentExecutionResult(
+                    result=AgentResult(agent_id=f"agent-{item.id}", task_id=kwargs["parent_task_id"], status=AgentResultStatus.SUCCESS, summary="已完成", trace_id=f"run-{item.id}"),
+                    working_memory_delta=WorkingMemoryDelta(source_run_id=f"run-{item.id}"),
+                )
+                for item in tasks
+            ]
+
+    original_manager = application.main_agent.agent_manager
+    application.main_agent.model_adapter = model
+    application.main_agent.agent_manager = FakeManager()
+    try:
+        result = asyncio.run(application.ask("综合道路、人口和 DEM，从三个方面评价当前区域", dataset_ids=list(ids.values())))
+    finally:
+        application.main_agent.agent_manager = original_manager
+
+    assert result.status is AgentResultStatus.SUCCESS
+    assert spawn_count == 1
+    assert len(model.requests) == 3
+
+
+def test_required_subagent_directives_converge_through_parent_runtime(application):
+    ids = seed_demo(application)
+    for directive, expected_status, expected_error in (
+        (LoopDirective.ASK_USER, AgentResultStatus.BLOCKED, "WAITING_USER"),
+        (LoopDirective.REPLAN, AgentResultStatus.BLOCKED, "REPLAN_REQUIRED"),
+        (LoopDirective.ABORT, AgentResultStatus.FAILED, "上一步执行要求终止当前运行。"),
+    ):
+        model = _DelegationModel(
+            [ModelResponse(model="fake", tool_calls=[{"id": "delegate", "function": {"name": "agent.delegate", "arguments": "{}"}}])]
+        )
+
+        class FakeManager:
+            async def run(self, request, tasks, datasets, **kwargs):
+                return [
+                    SubAgentExecutionResult(
+                        result=AgentResult(agent_id=f"agent-{item.id}", task_id=kwargs["parent_task_id"], status=AgentResultStatus.BLOCKED if directive is not LoopDirective.ABORT else AgentResultStatus.FAILED, summary="子任务未完成", error="需要补充信息" if directive is LoopDirective.ASK_USER else "算法不适用" if directive is LoopDirective.REPLAN else "工具失败", trace_id=f"run-{item.id}"),
+                        directive=directive,
+                        failure_rationale="需要补充信息" if directive is LoopDirective.ASK_USER else "算法不适用" if directive is LoopDirective.REPLAN else "工具失败",
+                    )
+                    for item in tasks
+                ]
+
+        original_manager = application.main_agent.agent_manager
+        application.main_agent.model_adapter = model
+        application.main_agent.agent_manager = FakeManager()
+        try:
+            result = asyncio.run(application.ask("综合道路、人口和 DEM，从三个方面评价当前区域", dataset_ids=list(ids.values())))
+        finally:
+            application.main_agent.agent_manager = original_manager
+
+        assert result.status is expected_status
+        assert result.error == expected_error
+
+
+def test_optional_subagent_abort_remains_partial_observation(application):
+    task = application.task_service.create("可选委派", conversation_id="conv-optional-delegation")
+    run = Run(task_id=task.id, conversation_id=task.conversation_id, agent_id="main")
+    application.store.save_run(run)
+    request = AgentRequest(user_input="可选委派", conversation_id=task.conversation_id)
+    subtask = SubTask(id="optional-subtask", goal="可选检查", description="非必需检查", required=False)
+    original_manager = application.main_agent.agent_manager
+
+    class FakeManager:
+        async def run(self, request, tasks, datasets, **kwargs):
+            return [
+                SubAgentExecutionResult(
+                    result=AgentResult(agent_id="optional-agent", task_id=kwargs["parent_task_id"], status=AgentResultStatus.FAILED, summary="可选任务失败", error="工具失败", trace_id="optional-run"),
+                    directive=LoopDirective.ABORT,
+                    failure_rationale="工具失败",
+                )
+            ]
+
+    application.main_agent.agent_manager = FakeManager()
+    try:
+        delegation = asyncio.run(application.main_agent._execute_delegation(request, run, task, [], [subtask]))
+    finally:
+        application.main_agent.agent_manager = original_manager
+
+    assert delegation.directive is LoopDirective.CONTINUE
+    assert delegation.latest_failure is None
+    assert delegation.observation["results"][0]["directive"] == LoopDirective.ABORT.value
 
 
 def test_subagent_receives_deep_working_memory_snapshot_without_writing_parent_memory(application):
@@ -85,6 +240,34 @@ def test_subagent_receives_deep_working_memory_snapshot_without_writing_parent_m
     assert snapshot.active_dataset_ids == [dataset.id]
     assert snapshot.constraints == ["范围=上海"]
     assert application.store.get_working_memory(task.id).model_dump() == memory.model_dump()
+
+
+def test_deterministic_subagent_counts_tools_without_cognitive_turns(application):
+    dataset = Dataset(id="dataset-subagent-budget", name="roads.geojson", kind=DatasetKind.VECTOR, path="roads.geojson", format="geojson")
+    application.registry.register(dataset)
+    task = application.task_service.create("检查道路", conversation_id="conv-subagent-budget")
+    parent_run = Run(task_id=task.id, conversation_id=task.conversation_id, agent_id="main")
+    application.store.save_run(parent_run)
+
+    async def fake_execute(call, agent_id, services):
+        return ToolResult(call_id=f"call-{call.name}", status=ToolStatus.SUCCESS, output={"ok": True})
+
+    application.sub_agent.executor.execute = fake_execute
+    execution = asyncio.run(
+        application.sub_agent.run(
+            AgentRequest(user_input="检查道路", conversation_id=task.conversation_id),
+            SubTask(goal="道路质量", description="检查道路数据", operation="vector.validate", dataset_ids=[dataset.id]),
+            [dataset],
+            parent_task_id=task.id,
+            parent_run_id=parent_run.id,
+            working_memory_snapshot=None,
+        )
+    )
+
+    child_run = application.store.get_run(execution.result.trace_id)
+    assert child_run is not None
+    assert child_run.turn_count == 0
+    assert child_run.tool_call_count >= 1
 
 
 def test_agent_manager_passes_independent_snapshots_and_returns_deltas(application):

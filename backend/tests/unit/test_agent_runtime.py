@@ -210,6 +210,31 @@ def test_agent_runtime_separates_transition_safety_from_model_turns():
     assert result.state is not None and result.state.turn_count == 0
 
 
+def test_agent_runtime_carries_subagent_results_into_next_decision():
+    decision_count = 0
+
+    async def decide(state):
+        nonlocal decision_count
+        decision_count += 1
+        if state.subagent_results:
+            return AgentDecision(type=DecisionType.FINAL, reasoning_summary="汇总", final_response="汇总完成")
+        return AgentDecision(type=DecisionType.DELEGATE, reasoning_summary="委派")
+
+    async def dispatch(decision, _state):
+        if decision.type is DecisionType.DELEGATE:
+            return RuntimeTransition(
+                observation={"type": "delegation", "completed": 1, "total": 1},
+                subagent_results=({"subtask_id": "sub-1", "status": "SUCCESS", "summary": "已完成"},),
+            )
+        return RuntimeTransition(terminal=True, status=AgentResultStatus.SUCCESS, final_response=decision.final_response)
+
+    result = asyncio.run(AgentRuntime().run(_state(), decide=decide, dispatch=dispatch))
+    assert result.status is AgentResultStatus.SUCCESS
+    assert decision_count == 2
+    assert result.state is not None
+    assert result.state.subagent_results[0]["subtask_id"] == "sub-1"
+
+
 def test_context_exposes_plan_summary_progress_and_latest_failure():
     plan = Plan(
         goal="先检查再分析",
