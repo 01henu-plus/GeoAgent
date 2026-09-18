@@ -13,6 +13,7 @@ from typing import Any
 
 from app.core.models import ToolResult
 from app.runtime.context_assembler import estimate_tokens
+from app.runtime.tool_execution_cycle import ExecutionOutcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,10 +104,25 @@ def compact_protocol_messages(
     return _flatten(compacted)
 
 
-def protocol_tool_result_view(result: ToolResult | dict[str, Any]) -> dict[str, Any]:
+def protocol_tool_result_view(result: ToolResult | ExecutionOutcome | dict[str, Any]) -> dict[str, Any]:
     """构造发送给模型的轻量 ToolResult View，不改变原始结果。"""
 
-    raw = result.model_dump(mode="json") if isinstance(result, ToolResult) else dict(result)
+    if isinstance(result, ExecutionOutcome):
+        raw = result.result.model_dump(mode="json")
+        raw.update(
+            {
+                "accepted": result.accepted,
+                "verified": result.verified,
+                "verification_problems": list(result.verification_problems),
+                "recovery_action": result.recovery_action.value if result.recovery_action else None,
+                "directive": result.directive.value,
+                "attempts": result.attempts,
+            }
+        )
+    elif isinstance(result, ToolResult):
+        raw = result.model_dump(mode="json")
+    else:
+        raw = dict(result)
     view = {
         "call_id": raw.get("call_id"),
         "status": raw.get("status"),
@@ -116,17 +132,26 @@ def protocol_tool_result_view(result: ToolResult | dict[str, Any]) -> dict[str, 
         "artifacts": list(raw.get("artifacts") or [])[:32],
         "retryable": raw.get("retryable", False),
         "output": _compact_value(raw.get("output")),
+        "accepted": raw.get("accepted"),
+        "verified": raw.get("verified"),
+        "verification_problems": _compact_value(raw.get("verification_problems", [])),
+        "recovery_action": raw.get("recovery_action"),
+        "directive": raw.get("directive"),
+        "attempts": raw.get("attempts"),
+        "rationale": _compact_value(raw.get("rationale")),
     }
     return {key: value for key, value in view.items() if value not in (None, "", [], {})}
 
 
-def protocol_tool_message(result: ToolResult) -> dict[str, Any]:
-    """把 ToolResult 变成合法且紧凑的 role=tool 消息。"""
+def protocol_tool_message(result: ToolResult | ExecutionOutcome | dict[str, Any]) -> dict[str, Any]:
+    """把执行结论变成合法且紧凑的 role=tool 消息。"""
+
+    view = protocol_tool_result_view(result)
 
     return {
         "role": "tool",
-        "tool_call_id": result.call_id,
-        "content": json.dumps(protocol_tool_result_view(result), ensure_ascii=False, separators=(",", ":")),
+        "tool_call_id": view.get("call_id"),
+        "content": json.dumps(view, ensure_ascii=False, separators=(",", ":")),
     }
 
 

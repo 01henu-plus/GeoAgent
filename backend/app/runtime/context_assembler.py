@@ -497,6 +497,19 @@ def _observation_view(value: Any) -> Any:
     raw = _dump(value)
     if not raw:
         return _compact_value(value)
+    batch = raw.get("tool_observations")
+    if isinstance(batch, list):
+        return {
+            "tool_observations": [
+                _observation_item_view(item)
+                for item in batch[:8]
+                if isinstance(item, dict)
+            ]
+        }
+    return _observation_item_view(raw)
+
+
+def _observation_item_view(raw: dict[str, Any]) -> dict[str, Any]:
     return {
         key: _compact_value(raw.get(key))
         for key in (
@@ -513,7 +526,9 @@ def _observation_view(value: Any) -> Any:
             "verified",
             "verification_problems",
             "recovery_action",
+            "directive",
             "attempts",
+            "rationale",
         )
         if raw.get(key) not in (None, [], {}, "")
     }

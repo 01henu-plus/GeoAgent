@@ -20,6 +20,7 @@ from app.core.models import (
     IntentResult,
     IntentType,
     InteractionMode,
+    LoopDirective,
     Plan,
     RequestFrame,
     RequestResources,
@@ -334,7 +335,13 @@ class MainAgent:
                 self.memory.write_candidates(candidates)
             if self.conversation_memory is not None:
                 self.conversation_memory.apply_result(request, run, result)
-            await self._checkpoint(run.id, "run_completed", {"status": final_status.value, "result": result.model_dump(mode="json")})
+            completion_state = {"status": final_status.value, "result": result.model_dump(mode="json")}
+            previous_checkpoint = self.checkpoint_store.latest(run.id) if self.checkpoint_store else None
+            if previous_checkpoint is not None:
+                for key in ("protocol_messages", "latest_observation", "model_findings", "model_dataset_ids", "model_artifact_ids"):
+                    if key in previous_checkpoint.state:
+                        completion_state[key] = previous_checkpoint.state[key]
+            await self._checkpoint(run.id, "run_completed", completion_state)
             if task is not None and prepared_request.action in {"create_task", "bind_task", "retry_run"}:
                 self.task_service.update(task, status=_task_status_for_result(result.status), result=result.summary)
             await self.trace.emit(run.id, EventType.RUN_COMPLETED if result.status in {AgentResultStatus.SUCCESS, AgentResultStatus.PARTIAL} else EventType.RUN_FAILED, result.summary, payload={"status": result.status.value, "result": result.model_dump(mode="json")}, agent_id="main")
@@ -440,6 +447,7 @@ class MainAgent:
 
             await self.trace.emit(run.id, EventType.DECISION_MADE, f"模型运行时决定调用 {len(response.tool_calls)} 个工具。", payload={"source": "model_runtime", "action": "tool", "tools": [_model_tool_name(item) for item in response.tool_calls]}, agent_id="main")
             protocol_messages.append({"role": "assistant", "content": response.content or "", "tool_calls": response.tool_calls})
+            batch_observations: list[dict[str, Any]] = []
             for index, raw_call in enumerate(response.tool_calls):
                 call_id = str(raw_call.get("id") or f"model_call_{turn}_{index}")
                 try:
@@ -455,7 +463,7 @@ class MainAgent:
                         ),
                     )
                     name = "model.tool_call"
-                    latest_observation = tool_result.model_dump(mode="json")
+                    observation = _invalid_tool_call_observation(call_id, tool_result, str(exc))
                     execution_outcome = None
                 else:
                     execution_outcome = await self.tool_execution_cycle.execute(
@@ -466,7 +474,8 @@ class MainAgent:
                         call_id=call_id,
                     )
                     tool_result = execution_outcome.result
-                    latest_observation = _execution_observation(execution_outcome)
+                    observation = _execution_observation(execution_outcome)
+                batch_observations.append(observation)
                 findings.append(
                     {
                         "tool": name,
@@ -474,6 +483,9 @@ class MainAgent:
                         "accepted": execution_outcome.accepted if execution_outcome else False,
                         "verification_problems": execution_outcome.verification_problems if execution_outcome else [],
                         "recovery_action": execution_outcome.recovery_action.value if execution_outcome and execution_outcome.recovery_action else None,
+                        "directive": execution_outcome.directive.value if execution_outcome else LoopDirective.ABORT.value,
+                        "verified": execution_outcome.verified if execution_outcome else False,
+                        "attempts": execution_outcome.attempts if execution_outcome else 1,
                         "output": tool_result.output,
                         "error": tool_result.error.model_dump(mode="json") if tool_result.error else None,
                     }
@@ -481,7 +493,8 @@ class MainAgent:
                 if execution_outcome is not None and execution_outcome.accepted:
                     dataset_ids.update(tool_result.datasets)
                     artifact_ids.update(tool_result.artifacts)
-                protocol_messages.append(protocol_tool_message(tool_result))
+                protocol_messages.append(protocol_tool_message(execution_outcome or observation))
+            latest_observation = _batch_observation(batch_observations)
             bounded_protocol = compact_protocol_messages(protocol_messages, max_tokens=self.budget.protocol_history_tokens)
             await self._checkpoint(
                 run.id,
@@ -661,7 +674,9 @@ class MainAgent:
             if isinstance(observation, ToolResult):
                 identifiers.extend(observation.datasets)
             elif isinstance(observation, dict):
-                identifiers.extend(observation.get("datasets") or [])
+                for item in _observation_items(observation):
+                    if item.get("accepted") is True:
+                        identifiers.extend(item.get("datasets") or [])
         registry = self.registry.for_user(request.user_id)
         refreshed: list[Any] = []
         seen: set[str] = set()
@@ -731,8 +746,6 @@ class MainAgent:
         artifacts = list(resume_state.get("artifacts", []))
         errors = list(resume_state.get("errors", []))
         step_outputs = dict(resume_state.get("step_outputs", {})) if isinstance(resume_state.get("step_outputs"), dict) else {}
-        execution_outcomes: dict[str, ExecutionOutcome] = {}
-
         async def execute_step(step, arguments):
             completed_arguments = self._complete_plan_arguments(step.tool_name or "", arguments, user_id=request.user_id)
             outcome = await self.tool_execution_cycle.execute(
@@ -741,12 +754,7 @@ class MainAgent:
                 completed_arguments,
                 user_id=request.user_id,
             )
-            execution_outcomes[step.id] = outcome
-            return outcome.result
-
-        async def verify_step(step, result):
-            outcome = execution_outcomes.get(step.id)
-            return list(outcome.verification_problems) if outcome is not None else []
+            return outcome
 
         async def checkpoint(completed_steps, state):
             await self._step_checkpoint(run.id, request, intent, plan, datasets, completed_steps, request_frame=request_frame, **state)
@@ -760,15 +768,26 @@ class MainAgent:
             errors=errors,
             step_outputs=step_outputs,
             execute_step=execute_step,
-            verify_step=verify_step,
             checkpoint=checkpoint,
         )
         if outcome.failed_step is not None:
-            result = outcome.failed_result
+            failed = outcome.failed_outcome
             message = outcome.errors[-1] if outcome.errors else f"{outcome.failed_step.title}未完成。"
-            blocked = result is not None and result.error is not None and result.error.code in {"MISSING_DATASET", "MISSING_FIELD", "CRS_MISSING", "UNSUPPORTED_FORMAT", "NO_OVERLAP", "APPROVAL_REQUIRED"}
-            summary = f"{outcome.failed_step.title}未完成：{message}" if not outcome.verification_problems else f"{outcome.failed_step.title}结果未通过验证。"
-            return AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.BLOCKED if blocked else AgentResultStatus.FAILED, summary=summary, findings=list(outcome.findings), datasets=list(outcome.output_ids), artifacts=list(outcome.artifacts), warnings=list(outcome.errors[:-1]), error=message, trace_id=run.id)
+            if failed is not None and failed.rationale and not failed.verification_problems and failed.result.error is None:
+                message = failed.rationale
+            if outcome.directive is LoopDirective.ASK_USER:
+                status = AgentResultStatus.BLOCKED
+                error = "WAITING_USER"
+                summary = f"{outcome.failed_step.title}需要补充信息：{message}"
+            elif outcome.directive is LoopDirective.REPLAN:
+                status = AgentResultStatus.BLOCKED
+                error = "REPLAN_REQUIRED"
+                summary = f"{outcome.failed_step.title}当前执行策略不适用，需要重新规划。"
+            else:
+                status = AgentResultStatus.FAILED
+                error = message
+                summary = f"{outcome.failed_step.title}未完成：{message}"
+            return AgentResult(agent_id="main", task_id=task.id, status=status, summary=summary, findings=list(outcome.findings), datasets=list(outcome.output_ids), artifacts=list(outcome.artifacts), warnings=list(outcome.errors[:-1]), error=error, trace_id=run.id)
 
         operation = str(plan.metadata.get("operation") or intent.entities.get("operation") or "")
         status = AgentResultStatus.PARTIAL if outcome.errors else AgentResultStatus.SUCCESS
@@ -966,13 +985,21 @@ def _parse_model_tool_call(raw_call: dict[str, Any]) -> tuple[str, dict[str, Any
     return name, arguments
 
 
-def _observation_from_checkpoint(value: dict[str, Any] | None) -> ToolResult | dict[str, Any] | None:
+def _observation_from_checkpoint(value: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
-    try:
-        return ToolResult.model_validate(value)
-    except (TypeError, ValueError):
-        return dict(value)
+    if isinstance(value.get("tool_observations"), list):
+        return {"tool_observations": [dict(item) for item in value["tool_observations"] if isinstance(item, dict)]}
+    if "call_id" in value or "status" in value:
+        # 兼容早期只保存单个 ToolResult 的 checkpoint。
+        item = dict(value)
+        item.setdefault("accepted", item.get("status") in {ToolStatus.SUCCESS.value, ToolStatus.PARTIAL_SUCCESS.value})
+        item.setdefault("verified", item.get("accepted", False))
+        item.setdefault("verification_problems", [])
+        item.setdefault("directive", LoopDirective.CONTINUE.value if item.get("accepted") else LoopDirective.ABORT.value)
+        item.setdefault("attempts", 1)
+        return _batch_observation([item])
+    return dict(value)
 
 
 def _execution_observation(outcome: ExecutionOutcome) -> dict[str, Any]:
@@ -985,10 +1012,45 @@ def _execution_observation(outcome: ExecutionOutcome) -> dict[str, Any]:
             "verified": outcome.verified,
             "verification_problems": list(outcome.verification_problems),
             "recovery_action": outcome.recovery_action.value if outcome.recovery_action else None,
+            "directive": outcome.directive.value,
             "attempts": outcome.attempts,
+            "rationale": outcome.rationale,
         }
     )
     return {key: value for key, value in observation.items() if value not in (None, [], {})}
+
+
+def _invalid_tool_call_observation(call_id: str, result: ToolResult, detail: str) -> dict[str, Any]:
+    observation = result.model_dump(mode="json")
+    observation.update(
+        {
+            "call_id": call_id,
+            "accepted": False,
+            "verified": False,
+            "verification_problems": [f"模型工具参数无效：{detail}"],
+            "recovery_action": None,
+            "directive": LoopDirective.ABORT.value,
+            "attempts": 1,
+        }
+    )
+    return {key: value for key, value in observation.items() if value not in (None, [], {})}
+
+
+def _batch_observation(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """统一构造本轮 Tool Batch Observation，并保留单 Tool checkpoint 兼容字段。"""
+
+    batch = {"tool_observations": items}
+    if len(items) == 1:
+        # 旧前端和旧 checkpoint 检查仍可能直接读取 call_id；权威内容仍是 batch。
+        batch["call_id"] = items[0].get("call_id")
+    return batch
+
+
+def _observation_items(observation: dict[str, Any]) -> list[dict[str, Any]]:
+    batch = observation.get("tool_observations")
+    if isinstance(batch, list):
+        return [item for item in batch if isinstance(item, dict)]
+    return [observation]
 
 
 def _model_tool_name(raw_call: Any) -> str:
