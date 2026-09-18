@@ -4,10 +4,19 @@ import json
 from app.application import Application
 from app.checkpoint.context import make_checkpoint
 from app.config import Settings
-from app.core.models import AgentRequest, AgentResultStatus, Run, RunStatus, TaskStatus
+from app.core.models import (
+    AgentRequest,
+    AgentResultStatus,
+    Run,
+    RunStatus,
+    TaskStatus,
+    ToolResult,
+    ToolStatus,
+)
 from app.demo import seed_demo
 from app.models import ModelAdapter, ModelRequest, ModelResponse, ModelStreamChunk
 from app.models.config import ModelProfile
+from app.runtime.context_assembler import estimate_tokens
 
 
 class FakeToolModel(ModelAdapter):
@@ -43,6 +52,7 @@ def test_model_loop_passes_tools_and_executes_tool(application):
     assert fake.requests[0].tools
     assert any(item["function"]["name"] == "dataset.inspect" for item in fake.requests[0].tools)
     assert "input_schema" not in fake.requests[0].messages[1]["content"]
+    assert estimate_tokens({"messages": fake.requests[0].messages, "tools": fake.requests[0].tools}) <= application.budget.model_input_tokens
     assert any(message.get("role") == "tool" for message in fake.requests[1].messages)
     assert application.store.get_run(result.trace_id).turn_count == 2
 
@@ -50,6 +60,61 @@ def test_model_loop_passes_tools_and_executes_tool(application):
     second_context = json.loads(fake.requests[1].messages[1]["content"].split("\n", 1)[1])
     assert first_context["run_state"]["turn_count"] == 1
     assert second_context["run_state"]["turn_count"] == 2
+
+
+def test_planner_path_uses_tool_execution_cycle(application):
+    ids = seed_demo(application)
+    calls = []
+    original = application.main_agent.tool_execution_cycle.execute
+
+    async def wrapped(*args, **kwargs):
+        calls.append(args[1])
+        return await original(*args, **kwargs)
+
+    application.main_agent.tool_execution_cycle.execute = wrapped
+    result = asyncio.run(application.ask("检查道路数据", dataset_ids=[ids["roads"]]))
+
+    assert result.status is AgentResultStatus.SUCCESS
+    assert "dataset.inspect" in calls
+
+
+def test_model_path_verification_failure_is_not_accepted_into_working_memory(application):
+    class VerificationModel(ModelAdapter):
+        def __init__(self):
+            self.requests: list[ModelRequest] = []
+
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return ModelResponse(
+                    model="fake",
+                    tool_calls=[
+                        {
+                            "id": "bad-output",
+                            "function": {"name": "raster.slope", "arguments": "{}"},
+                        }
+                    ],
+                )
+            return ModelResponse(model="fake", content="输出未通过验证，需要重新确认数据。")
+
+    model = VerificationModel()
+    application.main_agent.model_adapter = model
+    original_tool = application.main_agent._tool
+
+    async def fake_raw_tool(current_run, name, arguments, *, call_id=None):
+        return ToolResult(call_id=call_id or "bad-output", status=ToolStatus.SUCCESS, datasets=["missing-output"])
+
+    application.main_agent._tool = fake_raw_tool
+    try:
+        result = asyncio.run(application.ask("计算坡度"))
+    finally:
+        application.main_agent._tool = original_tool
+
+    assert result.summary == "输出未通过验证，需要重新确认数据。"
+    second_context = model.requests[1].messages[1]["content"]
+    assert "accepted" in second_context
+    assert "结果引用了未知 Dataset" in second_context
+    assert "missing-output" not in application.store.get_working_memory(result.task_id).active_dataset_ids
 
 
 def test_model_runtime_gets_first_chance_when_offline_rules_would_ask(application):
