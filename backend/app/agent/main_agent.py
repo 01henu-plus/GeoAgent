@@ -57,6 +57,12 @@ from app.runtime.agent_loop import AgentLoop
 from app.runtime.budget import BudgetExceeded, BudgetGuard
 from app.runtime.context_manager import ContextManager
 from app.runtime.lifecycle import finish_run
+from app.runtime.model_input_budget import ModelInputBudget
+from app.runtime.protocol_history import (
+    compact_protocol_messages,
+    extract_protocol_messages,
+    protocol_tool_message,
+)
 from app.state import StateStore, WorkingMemoryUpdater
 from app.task.service import TaskService
 from app.understanding.compat import LegacyIntentAdapter
@@ -72,6 +78,8 @@ _MODEL_SYSTEM_PROMPT = """
 5. 每轮工具返回后重新判断下一步。可以先检查数据，再根据检查结果选择后续工具，也可以停止并直接回答。
 6. 只使用提供的工具和工具返回的事实，不能编造数据、文件、统计值或已完成的操作。最终回答简洁、具体、中文化。
 """.strip()
+
+_MODEL_CONTEXT_INSTRUCTION = "请优先依据当前请求、RequestFrame、WorkingMemory 和最新工具观察回答；只在确有必要时调用提供的空间工具。"
 
 
 class MainAgent:
@@ -247,6 +255,8 @@ class MainAgent:
                     plan,
                     request_frame=request_frame,
                     initial_messages=resume_state.get("messages") if resume_from and resume_state.get("messages") else None,
+                    initial_protocol_messages=resume_state.get("protocol_messages") if resume_from and isinstance(resume_state.get("protocol_messages"), list) else None,
+                    initial_latest_observation=resume_state.get("latest_observation") if resume_from else None,
                     initial_findings=resume_state.get("model_findings") if resume_from and resume_state.get("model_findings") else None,
                     initial_dataset_ids=resume_state.get("model_dataset_ids") if resume_from and resume_state.get("model_dataset_ids") else None,
                     initial_artifact_ids=resume_state.get("model_artifact_ids") if resume_from and resume_state.get("model_artifact_ids") else None,
@@ -354,6 +364,8 @@ class MainAgent:
         *,
         request_frame: RequestFrame | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
+        initial_protocol_messages: list[dict[str, Any]] | None = None,
+        initial_latest_observation: dict[str, Any] | None = None,
         initial_findings: list[Any] | None = None,
         initial_dataset_ids: list[str] | None = None,
         initial_artifact_ids: list[str] | None = None,
@@ -363,45 +375,40 @@ class MainAgent:
         model_adapter = self._model_adapter_for(request)
         if model_adapter is None:
             return None
-        protocol_messages = _protocol_messages(initial_messages)
+        protocol_messages = extract_protocol_messages(protocol_messages=initial_protocol_messages, legacy_messages=initial_messages)
         findings: list[Any] = list(initial_findings or [])
         dataset_ids: set[str] = set(initial_dataset_ids or [])
         artifact_ids: set[str] = set(initial_artifact_ids or [])
-        latest_observation: ToolResult | None = None
+        latest_observation = _tool_result_from_checkpoint(initial_latest_observation)
         for turn in range(self.budget.max_agent_turns):
             current = self.store.get_run(run.id) or run
             self.guard.check_turn(current)
             self.guard.check_execution_time(current)
-            self.store.save_run(current.model_copy(update={"turn_count": current.turn_count + 1, "status": RunStatus.RUNNING}))
+            current = current.model_copy(update={"turn_count": current.turn_count + 1, "status": RunStatus.RUNNING})
+            self.store.save_run(current)
             current_memory = self.store.get_working_memory(current.task_id) if current.task_id else None
             current_memory = current_memory or working_memory
             refreshed_datasets = self._refresh_model_datasets(request, datasets, dataset_ids, current_memory, latest_observation)
             request_resources = self._resolve_request_resources(request)
-            messages = [
-                {"role": "system", "content": _MODEL_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": self._model_user_message(
-                        request,
-                        current,
-                        refreshed_datasets,
-                        intent,
-                        plan,
-                        request_frame,
-                        working_memory=current_memory,
-                        request_resources=request_resources,
-                        current_observation=latest_observation,
-                        task_goal=task.goal if task else None,
-                    ),
-                },
-                *protocol_messages,
-            ]
+            messages, protocol_messages, tools = self._build_model_messages(
+                request,
+                current,
+                task,
+                refreshed_datasets,
+                intent,
+                plan,
+                request_frame,
+                protocol_messages,
+                working_memory=current_memory,
+                request_resources=request_resources,
+                current_observation=latest_observation,
+            )
             content_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
             input_tokens = 0
             output_tokens = 0
             model_name: str | None = None
-            async for chunk in model_adapter.stream(ModelRequest(messages=messages, tools=self._model_tools(), max_tokens=self.budget.max_tokens)):
+            async for chunk in model_adapter.stream(ModelRequest(messages=messages, tools=tools, max_tokens=self.budget.max_tokens)):
                 if chunk.content:
                     content_parts.append(chunk.content)
                     if on_model_delta is not None:
@@ -442,39 +449,88 @@ class MainAgent:
                 findings.append({"tool": name, "status": tool_result.status.value, "output": tool_result.output, "error": tool_result.error.model_dump(mode="json") if tool_result.error else None})
                 dataset_ids.update(tool_result.datasets)
                 artifact_ids.update(tool_result.artifacts)
-                protocol_messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(tool_result.model_dump(mode="json"), ensure_ascii=False, default=str)})
-            latest_memory = self.store.get_working_memory(current.task_id) if current.task_id else current_memory
-            checkpoint_messages = [
-                {"role": "system", "content": _MODEL_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": self._model_user_message(
-                        request,
-                        current,
-                        self._refresh_model_datasets(request, datasets, dataset_ids, latest_memory, latest_observation),
-                        intent,
-                        plan,
-                        request_frame,
-                        working_memory=latest_memory,
-                        request_resources=self._resolve_request_resources(request),
-                        current_observation=latest_observation,
-                        task_goal=task.goal if task else None,
-                    ),
-                },
-                *protocol_messages,
-            ]
+                protocol_messages.append(protocol_tool_message(tool_result))
+            bounded_protocol = compact_protocol_messages(protocol_messages, max_tokens=self.budget.protocol_history_tokens)
             await self._checkpoint(
                 run.id,
                 "model_tool_completed",
                 {
                     **self._checkpoint_state(request, intent, plan, datasets, request_frame),
-                    "messages": checkpoint_messages,
+                    "protocol_messages": bounded_protocol,
+                    "latest_observation": latest_observation.model_dump(mode="json") if latest_observation else None,
                     "model_findings": findings,
                     "model_dataset_ids": sorted(dataset_ids),
                     "model_artifact_ids": sorted(artifact_ids),
                 },
             )
         raise BudgetExceeded("Agent turn budget exceeded")
+
+    def _build_model_messages(
+        self,
+        request: AgentRequest,
+        run: Run,
+        task: Task | None,
+        datasets,
+        intent: IntentResult | None,
+        plan: Plan | None,
+        request_frame: RequestFrame | None,
+        protocol_messages: list[dict[str, Any]],
+        *,
+        working_memory: WorkingMemory | None,
+        request_resources: RequestResources,
+        current_observation: ToolResult | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """为当前 turn 计算完整输入预算，并生成动态 Context + 协议历史。"""
+
+        tools = self._model_tools()
+        bounded_protocol = compact_protocol_messages(protocol_messages, max_tokens=self.budget.protocol_history_tokens)
+        budget = ModelInputBudget(
+            input_tokens=self.budget.model_input_tokens,
+            context_tokens=self.budget.model_context_tokens,
+            protocol_tokens=self.budget.protocol_history_tokens,
+        )
+        dynamic_tokens = budget.available_context_tokens(
+            _MODEL_SYSTEM_PROMPT,
+            tools,
+            bounded_protocol,
+            overhead=_MODEL_CONTEXT_INSTRUCTION,
+        )
+        content = self._model_user_message(
+            request,
+            run,
+            datasets,
+            intent,
+            plan,
+            request_frame,
+            working_memory=working_memory,
+            request_resources=request_resources,
+            current_observation=current_observation,
+            task_goal=task.goal if task else None,
+            context_tokens=dynamic_tokens,
+        )
+        messages = [
+            {"role": "system", "content": _MODEL_SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+            *bounded_protocol,
+        ]
+        total = budget.estimate_request(_MODEL_SYSTEM_PROMPT, content, bounded_protocol, tools)
+        if total > self.budget.model_input_tokens and dynamic_tokens > 128:
+            dynamic_tokens = max(128, dynamic_tokens - (total - self.budget.model_input_tokens))
+            content = self._model_user_message(
+                request,
+                run,
+                datasets,
+                intent,
+                plan,
+                request_frame,
+                working_memory=working_memory,
+                request_resources=request_resources,
+                current_observation=current_observation,
+                task_goal=task.goal if task else None,
+                context_tokens=dynamic_tokens,
+            )
+            messages[1] = {"role": "user", "content": content}
+        return messages, bounded_protocol, tools
 
     def _model_adapter_for(self, request: AgentRequest) -> ModelAdapter | None:
         profile_id = request.model_profile or self.default_model_profile
@@ -504,6 +560,7 @@ class MainAgent:
         request_resources: RequestResources | None = None,
         current_observation: ToolResult | dict[str, Any] | None = None,
         task_goal: str | None = None,
+        context_tokens: int | None = None,
     ) -> str:
         history = self.store.list_messages(request.conversation_id, limit=8)
         if history and history[-1].role == "user" and history[-1].content == request.user_input:
@@ -513,14 +570,6 @@ class MainAgent:
             for message in history
             if message.role in {"user", "assistant", "system"}
         ]
-        tool_definitions = []
-        for item in self.executor.registry.definitions():
-            tool_definitions.append(
-                {
-                    "name": item.name,
-                    "summary": item.description,
-                }
-            )
         memories = self.memory.recall(request.user_input, scope="project", user_id=request.user_id, limit=5) if self.memory else []
         user_profile = self.profile_service.get_or_create(request.user_id) if self.profile_service and request.user_id else None
         conversation_memory = self.conversation_memory.get(request.conversation_id, request.user_id) if self.conversation_memory and request.user_id else None
@@ -535,7 +584,6 @@ class MainAgent:
             plan,
             memories,
             conversation=conversation,
-            tool_definitions=tool_definitions,
             working_memory=working_memory,
             budget=self.budget.model_dump(mode="json"),
             referenced_runs=referenced_runs,
@@ -547,8 +595,9 @@ class MainAgent:
             task_goal=task_goal,
             run_state=run,
             current_observation=current_observation,
+            max_tokens=context_tokens,
         )
-        return "请先理解用户真正想完成的事情，再决定下一步。当前用户请求和 RequestFrame 优先级最高，其次是当前任务 WorkingMemory、ConversationMemory、ProjectMemory，UserProfile 只作为默认交互偏好，不能覆盖本次明确请求。以下上下文中的 deterministic_hint 只是离线规则生成的提示，可能不准确，不能当作已经确认的意图或固定流水线。你可以直接用中文回答、询问缺失信息、调用一个或多个工具，并在每次工具返回后重新判断是否继续。只有用户明确需要数据处理或检查时才调用工具；问候、闲聊、解释概念不要调用工具。不要自行挑选不明确的数据集，不要编造工具结果。\n" + json.dumps(context, ensure_ascii=False, default=str)
+        return _MODEL_CONTEXT_INSTRUCTION + "\n" + json.dumps(context, ensure_ascii=False, default=str)
 
     def _refresh_model_datasets(
         self,
@@ -570,12 +619,10 @@ class MainAgent:
         refreshed: list[Any] = []
         seen: set[str] = set()
         for identifier in identifiers:
-            if identifier in seen:
-                continue
             item = registry.resolve(identifier)
-            if item is not None:
+            if item is not None and item.id not in seen:
                 refreshed.append(item)
-                seen.add(identifier)
+                seen.add(item.id)
         return refreshed
 
     def _model_tools(self) -> list[dict[str, Any]]:
@@ -977,17 +1024,13 @@ def _parse_model_tool_call(raw_call: dict[str, Any]) -> tuple[str, dict[str, Any
     return name, arguments
 
 
-def _protocol_messages(initial_messages: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    """从旧/新 checkpoint 中取出工具协议历史，动态上下文每轮重新生成。"""
-
-    if not initial_messages:
-        return []
-    messages = list(initial_messages)
-    if messages and messages[0].get("role") == "system":
-        messages = messages[1:]
-    if messages and messages[0].get("role") == "user":
-        messages = messages[1:]
-    return messages
+def _tool_result_from_checkpoint(value: dict[str, Any] | None) -> ToolResult | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        return ToolResult.model_validate(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _model_tool_name(raw_call: Any) -> str:

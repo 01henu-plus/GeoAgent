@@ -368,7 +368,10 @@ def create_app(application: Application | None = None) -> FastAPI:
             saved_request = {"user_input": goal, "conversation_id": previous.conversation_id or new_id("conv")}
         request = AgentRequest.model_validate(saved_request).model_copy(update={"user_id": current_user.id})
         has_saved_plan = bool(checkpoint.state.get("intent") and checkpoint.state.get("plan"))
-        has_model_context = isinstance(checkpoint.state.get("messages"), list) and bool(checkpoint.state["messages"])
+        has_model_context = any(
+            isinstance(checkpoint.state.get(key), list) and bool(checkpoint.state[key])
+            for key in ("protocol_messages", "messages")
+        )
         if not has_saved_plan and not has_model_context:
             raise HTTPException(status_code=409, detail="checkpoint 还没有可恢复的上下文")
         run = await geoagent.run_manager.submit(request, resume_from=checkpoint, metadata={"resumed_from": run_id})

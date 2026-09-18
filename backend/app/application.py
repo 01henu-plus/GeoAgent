@@ -69,7 +69,7 @@ class Application:
         self.profile = UserProfileService(self.store)
         self.profile_extractor = ProfilePreferenceExtractor()
         self.conversation_memory = ConversationMemoryService(self.store)
-        self.context_manager = ContextManager()
+        self.context_manager = ContextManager(max_tokens=self.settings.model_context_tokens)
         self.knowledge = KnowledgeRetriever()
         self.models = ModelRegistry()
         self.model_profiles: dict[str, ModelProfile] = {}
@@ -105,10 +105,14 @@ class Application:
             max_subagents=self.settings.max_subagents,
             max_parallel_agents=self.settings.max_parallel_agents,
             max_tokens=self.settings.max_tokens,
+            model_input_tokens=self.settings.model_input_tokens,
+            model_context_tokens=self.settings.model_context_tokens,
+            protocol_history_tokens=self.settings.protocol_history_tokens,
+            subagent_context_tokens=self.settings.subagent_context_tokens,
             max_execution_seconds=self.settings.max_execution_seconds,
         )
         self.task_service = TaskService(TaskRepository(self.store))
-        self.sub_agent = SubAgent(self.tool_executor, self.store, self.trace, context_manager=ContextManager(max_tokens=3000), budget=self.budget, services_factory=self.execution_services)
+        self.sub_agent = SubAgent(self.tool_executor, self.store, self.trace, context_manager=ContextManager(max_tokens=self.budget.subagent_context_tokens), budget=self.budget, services_factory=self.execution_services)
         self.agent_manager = AgentManager(self.sub_agent, max_parallel=self.settings.max_parallel_agents, max_subagents=self.settings.max_subagents, timeout_seconds=self.settings.max_execution_seconds)
         self.main_agent = MainAgent(store=self.store, trace=self.trace, executor=self.tool_executor, registry=self.registry, task_service=self.task_service, agent_manager=self.agent_manager, settings=self.settings, checkpoint_store=self.checkpoints, memory=self.memory, knowledge=self.knowledge, model_adapter=self.model_adapter, model_adapters=self.model_adapters, default_model_profile=self.default_model_profile, context_manager=self.context_manager, budget=self.budget, services_factory=self.execution_services, profile_service=self.profile, profile_extractor=self.profile_extractor, conversation_memory=self.conversation_memory)
         self.run_manager = RunManager(self.main_agent, self.store, self.metrics)

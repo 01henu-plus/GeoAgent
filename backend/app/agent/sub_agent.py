@@ -41,8 +41,8 @@ class SubAgent:
         self.executor = executor
         self.store = store
         self.trace = trace
-        self.context_manager = context_manager or ContextManager(max_chars=10000)
         self.budget = budget or RunBudget(max_agent_turns=10)
+        self.context_manager = context_manager or ContextManager(max_tokens=self.budget.subagent_context_tokens)
         self.guard = BudgetGuard(self.budget)
         self.services_factory = services_factory
 
