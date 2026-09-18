@@ -19,7 +19,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.application import Application
 from app.core.models import AgentRequest, AgentResult, User, UserView, new_id
@@ -72,6 +72,15 @@ class LoginBody(BaseModel):
 class UserUpdateBody(BaseModel):
     display_name: str | None = None
     email: str | None = None
+
+
+class UserProfileUpdateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    language: str | None = None
+    response_style: str | None = None
+    measurement_system: str | None = None
+    preferred_output_format: str | None = None
 
 
 def get_current_user(request: Request) -> User:
@@ -147,6 +156,18 @@ def create_app(application: Application | None = None) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return UserView.from_user(updated).model_dump(mode="json")
+
+    @api.get("/api/v1/users/me/profile")
+    async def current_profile(current_user: User = Depends(get_current_user)) -> dict[str, Any]:
+        return geoagent.profile.get_or_create(current_user.id).model_dump(mode="json")
+
+    @api.patch("/api/v1/users/me/profile")
+    async def update_current_profile(body: UserProfileUpdateBody, current_user: User = Depends(get_current_user)) -> dict[str, Any]:
+        try:
+            profile = geoagent.profile.update(current_user.id, body.model_dump(exclude_unset=True))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return profile.model_dump(mode="json")
 
     @api.get("/api/v1/models")
     async def model_status(_: User = Depends(get_current_user)) -> dict[str, object]:
