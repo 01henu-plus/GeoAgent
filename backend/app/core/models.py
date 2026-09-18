@@ -122,6 +122,14 @@ class ToolStatus(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class DatasetOutputPolicy(StrEnum):
+    """Tool 对 Dataset 输出的契约强度。"""
+
+    NONE = "NONE"
+    OPTIONAL = "OPTIONAL"
+    REQUIRED = "REQUIRED"
+
+
 class ErrorCategory(StrEnum):
     INPUT = "INPUT"
     CRS = "CRS"
@@ -328,8 +336,19 @@ class ToolMetadata(StrictModel):
     risk_level: RiskLevel = RiskLevel.READ
     supports_retry: bool = False
     produces_dataset: bool = False
+    dataset_output_policy: DatasetOutputPolicy | None = None
     produces_artifact: bool = False
     tags: list[str] = Field(default_factory=list)
+
+    def model_post_init(self, __context: Any) -> None:
+        """兼容旧注册代码，同时让输出策略成为验证时的权威字段。"""
+
+        if self.dataset_output_policy is None:
+            object.__setattr__(
+                self,
+                "dataset_output_policy",
+                DatasetOutputPolicy.REQUIRED if self.produces_dataset else DatasetOutputPolicy.NONE,
+            )
 
 
 class ToolCall(StrictModel):
@@ -395,6 +414,7 @@ class Run(StrictModel):
     error: str | None = None
     turn_count: int = 0
     tool_call_count: int = 0
+    replan_count: int = 0
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -627,6 +647,7 @@ class RunBudget(StrictModel):
     max_agent_turns: int = Field(default=20, ge=1)
     max_tool_calls: int = Field(default=40, ge=1)
     max_retry_per_action: int = Field(default=2, ge=0)
+    max_replans: int = Field(default=2, ge=0)
     max_subagents: int = Field(default=5, ge=0)
     max_parallel_agents: int = Field(default=3, ge=1)
     max_tokens: int = Field(default=1200, ge=1)
@@ -664,6 +685,30 @@ class Plan(StrictModel):
     revision: int = 1
     clarification: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReplanContext(StrictModel):
+    """一次确定性 Replan 所需的最小失败上下文。"""
+
+    goal: str
+    original_plan: Plan
+    current_plan: Plan
+    current_revision: int
+    completed_steps: list[str] = Field(default_factory=list)
+    step_outputs: dict[str, Any] = Field(default_factory=dict)
+    failed_step: PlanStep | None = None
+    failed_tool_name: str | None = None
+    failed_arguments: dict[str, Any] = Field(default_factory=dict)
+    error_code: str | None = None
+    error_message: str | None = None
+    verification_problems: list[str] = Field(default_factory=list)
+    recovery_action: FailureAction | None = None
+    directive: LoopDirective = LoopDirective.REPLAN
+    attempts: int = 1
+    current_dataset_ids: list[str] = Field(default_factory=list)
+    current_artifact_ids: list[str] = Field(default_factory=list)
+    replan_count: int = 0
+    previous_replan_reasons: list[str] = Field(default_factory=list)
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]

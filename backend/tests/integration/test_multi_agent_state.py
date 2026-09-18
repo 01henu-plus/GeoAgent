@@ -304,7 +304,7 @@ def test_subagent_repair_accepts_final_dataset_without_internal_repair_dataset(a
     assert execution.result.status is AgentResultStatus.SUCCESS
     assert execution.working_memory_delta.added_dataset_ids == ["slope-final"]
     assert "projected-dem" not in execution.working_memory_delta.added_dataset_ids
-    assert execution.result.datasets == [dataset.id, "slope-final"]
+    assert execution.result.datasets == ["slope-final"]
 
 
 def test_subagent_directives_stop_local_execution_without_planner(application):

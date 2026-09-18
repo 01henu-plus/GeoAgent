@@ -109,8 +109,11 @@ def protocol_tool_result_view(result: ToolResult | ExecutionOutcome | dict[str, 
 
     if isinstance(result, ExecutionOutcome):
         raw = result.result.model_dump(mode="json")
+        protocol_call_id = result.protocol_call_id or result.result.call_id
         raw.update(
             {
+                "protocol_call_id": protocol_call_id,
+                "execution_call_id": result.result.call_id,
                 "accepted": result.accepted,
                 "verified": result.verified,
                 "verification_problems": list(result.verification_problems),
@@ -124,7 +127,10 @@ def protocol_tool_result_view(result: ToolResult | ExecutionOutcome | dict[str, 
     else:
         raw = dict(result)
     view = {
-        "call_id": raw.get("call_id"),
+        # call_id 是给旧 checkpoint/前端看的兼容字段；协议字段单独保留。
+        "call_id": raw.get("protocol_call_id") or raw.get("call_id"),
+        "protocol_call_id": raw.get("protocol_call_id") or raw.get("call_id"),
+        "execution_call_id": raw.get("execution_call_id") or raw.get("call_id"),
         "status": raw.get("status"),
         "error": _compact_value(raw.get("error")),
         "warnings": _compact_value(raw.get("warnings", [])),
@@ -150,7 +156,7 @@ def protocol_tool_message(result: ToolResult | ExecutionOutcome | dict[str, Any]
 
     return {
         "role": "tool",
-        "tool_call_id": view.get("call_id"),
+        "tool_call_id": view.get("protocol_call_id") or view.get("call_id"),
         "content": json.dumps(view, ensure_ascii=False, separators=(",", ":")),
     }
 

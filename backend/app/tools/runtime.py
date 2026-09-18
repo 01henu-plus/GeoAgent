@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.core.models import ErrorCategory, ToolMetadata
+from app.core.models import DatasetOutputPolicy, ErrorCategory, ToolMetadata
 from app.execution.tools import ToolContext, ToolRegistry
 from app.gis.errors import GISFailure
 
@@ -25,7 +25,8 @@ def register_runtime_tools(registry: ToolRegistry) -> None:
             },
             risk_level="WRITE",
             supports_retry=False,
-            produces_dataset=True,
+            produces_dataset=False,
+            dataset_output_policy=DatasetOutputPolicy.OPTIONAL,
             tags=["runtime", "python", "gis"],
         ),
         python_execute,
@@ -45,7 +46,8 @@ def register_runtime_tools(registry: ToolRegistry) -> None:
             },
             risk_level="WRITE",
             supports_retry=True,
-            produces_dataset=True,
+            produces_dataset=False,
+            dataset_output_policy=DatasetOutputPolicy.OPTIONAL,
             tags=["runtime", "shell", "gis"],
         ),
         shell_execute,

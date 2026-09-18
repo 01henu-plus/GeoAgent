@@ -6,7 +6,15 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from app.core.models import FailureAction, LoopDirective, Run, RunBudget, ToolResult, ToolStatus
+from app.core.models import (
+    DatasetOutputPolicy,
+    FailureAction,
+    LoopDirective,
+    Run,
+    RunBudget,
+    ToolResult,
+    ToolStatus,
+)
 from app.decision.failure_analyzer import FailureAnalyzer
 from app.decision.verifier import ResultVerifier
 from app.events import EventType
@@ -25,6 +33,7 @@ class ExecutionOutcome:
     recovery_action: FailureAction | None
     attempts: int
     accepted: bool
+    protocol_call_id: str | None = None
     directive: LoopDirective = LoopDirective.CONTINUE
     original_result: ToolResult | None = None
     rationale: str | None = None
@@ -63,7 +72,8 @@ class ToolExecutionCycle:
         user_id: str | None = None,
         call_id: str | None = None,
     ) -> ExecutionOutcome:
-        original = await self.raw_executor(run, tool_name, arguments, call_id=call_id)
+        protocol_call_id = call_id
+        original = await self._invoke_raw(run, tool_name, arguments, call_id=call_id, attempt=1)
         current = original
         attempts = 1
         recovery_action: FailureAction | None = None
@@ -85,8 +95,8 @@ class ToolExecutionCycle:
                     payload={"tool": tool_name, "attempt": attempts + 1},
                     agent_id=run.agent_id,
                 )
-                current = await self.raw_executor(run, tool_name, arguments)
                 attempts += 1
+                current = await self._invoke_raw(run, tool_name, arguments, attempt=attempts)
                 continue
 
             if action is FailureAction.REPAIR and not repair_used:
@@ -107,8 +117,8 @@ class ToolExecutionCycle:
                     payload={"tool": tool_name, "arguments": repaired_arguments},
                     agent_id=run.agent_id,
                 )
-                current = await self.raw_executor(run, tool_name, repaired_arguments)
                 attempts += 1
+                current = await self._invoke_raw(run, tool_name, repaired_arguments, attempt=attempts)
                 arguments = repaired_arguments
                 continue
 
@@ -123,6 +133,7 @@ class ToolExecutionCycle:
                 recovery_action=recovery_action,
                 attempts=attempts,
                 accepted=False,
+                protocol_call_id=protocol_call_id,
                 directive=directive,
                 original_result=original,
                 rationale=rationale,
@@ -130,7 +141,20 @@ class ToolExecutionCycle:
 
         verified = True
         verification_problems: list[str] = []
-        if self._produces_dataset(tool_name) and current.datasets:
+        output_policy = self._dataset_output_policy(tool_name)
+        if output_policy is DatasetOutputPolicy.REQUIRED and not current.datasets:
+            verification_problems = ["Tool 声明必须产生 Dataset，但执行结果没有返回 Dataset。"]
+            verified = False
+            recovery_action = FailureAction.ABORT
+            rationale = verification_problems[0]
+            await self.trace.emit(
+                run.id,
+                EventType.VERIFICATION_FAILED,
+                rationale,
+                payload={"tool": tool_name, "problems": verification_problems, "output_policy": output_policy.value},
+                agent_id=run.agent_id,
+            )
+        elif current.datasets and output_policy is not DatasetOutputPolicy.NONE:
             await self.trace.emit(
                 run.id,
                 EventType.VERIFICATION_STARTED,
@@ -160,6 +184,7 @@ class ToolExecutionCycle:
             recovery_action=recovery_action,
             attempts=attempts,
             accepted=accepted,
+            protocol_call_id=protocol_call_id,
             directive=LoopDirective.CONTINUE if accepted else LoopDirective.ABORT,
             original_result=original,
             rationale=rationale,
@@ -180,11 +205,38 @@ class ToolExecutionCycle:
             agent_id=run.agent_id,
         )
 
-    def _produces_dataset(self, tool_name: str) -> bool:
+    def _dataset_output_policy(self, tool_name: str) -> DatasetOutputPolicy:
         try:
-            return bool(self.tool_registry.get(tool_name).metadata.produces_dataset)
+            metadata = self.tool_registry.get(tool_name).metadata
+            policy = getattr(metadata, "dataset_output_policy", None)
+            if policy is not None:
+                return policy
+            return DatasetOutputPolicy.REQUIRED if metadata.produces_dataset else DatasetOutputPolicy.NONE
         except KeyError:
-            return False
+            return DatasetOutputPolicy.NONE
+
+    async def _invoke_raw(
+        self,
+        run: Run,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        call_id: str | None = None,
+        attempt: int,
+    ) -> ToolResult:
+        """把 logical action 的 attempt 传给新 executor，同时兼容旧测试 hook。"""
+
+        kwargs: dict[str, Any] = {"attempt": attempt}
+        if call_id is not None:
+            kwargs["call_id"] = call_id
+        try:
+            return await self.raw_executor(run, tool_name, arguments, **kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument 'attempt'" not in str(exc):
+                raise
+            if call_id is not None:
+                return await self.raw_executor(run, tool_name, arguments, call_id=call_id)
+            return await self.raw_executor(run, tool_name, arguments)
 
     async def _repair_arguments(
         self,
@@ -202,7 +254,7 @@ class ToolExecutionCycle:
                 return None
             target_crs = CRSService(default_crs=self.default_crs).choose_projected_crs(dataset)
             reprojection_tool = "raster.reproject" if dataset.kind.value == "RASTER" else "crs.reproject"
-            repaired = await self.raw_executor(run, reprojection_tool, {"dataset_id": dataset.id, "target_crs": target_crs})
+            repaired = await self._invoke_raw(run, reprojection_tool, {"dataset_id": dataset.id, "target_crs": target_crs}, attempt=1)
             if repaired.status is not ToolStatus.SUCCESS or not repaired.datasets:
                 return None
             updated = dict(arguments)
@@ -221,7 +273,7 @@ class ToolExecutionCycle:
                 if dataset is None:
                     continue
                 reprojection_tool = "raster.reproject" if dataset.kind.value == "RASTER" else "crs.reproject"
-                repaired = await self.raw_executor(run, reprojection_tool, {"dataset_id": dataset.id, "target_crs": target_crs})
+                repaired = await self._invoke_raw(run, reprojection_tool, {"dataset_id": dataset.id, "target_crs": target_crs}, attempt=1)
                 if repaired.status is not ToolStatus.SUCCESS or not repaired.datasets:
                     return None
                 updated[key] = repaired.datasets[-1]
@@ -237,7 +289,7 @@ class ToolExecutionCycle:
                 return None
             updated = dict(arguments)
             reprojection_tool = "raster.reproject" if right.kind.value == "RASTER" else "crs.reproject"
-            repaired = await self.raw_executor(run, reprojection_tool, {"dataset_id": right.id, "target_crs": left.crs.authority})
+            repaired = await self._invoke_raw(run, reprojection_tool, {"dataset_id": right.id, "target_crs": left.crs.authority}, attempt=1)
             if repaired.status is not ToolStatus.SUCCESS or not repaired.datasets:
                 return None
             updated[right_key] = repaired.datasets[-1]
@@ -251,7 +303,7 @@ class ToolExecutionCycle:
                 dataset = registry.resolve(str(updated[key]))
                 if dataset is None or dataset.kind.value != "VECTOR":
                     continue
-                repaired = await self.raw_executor(run, "vector.repair", {"dataset_id": dataset.id})
+                repaired = await self._invoke_raw(run, "vector.repair", {"dataset_id": dataset.id}, attempt=1)
                 if repaired.status is ToolStatus.SUCCESS and repaired.datasets:
                     updated[key] = repaired.datasets[-1]
                     changed = True

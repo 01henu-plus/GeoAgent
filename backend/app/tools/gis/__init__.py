@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.core.models import RiskLevel, ToolMetadata
+from app.core.models import DatasetOutputPolicy, RiskLevel, ToolMetadata
 from app.execution.tools import ToolRegistry
 
 
@@ -23,14 +23,19 @@ def metadata(
     artifact: bool = False,
     tags: list[str] | None = None,
     input_schema: dict[str, Any] | None = None,
+    dataset_output_policy: DatasetOutputPolicy | None = None,
 ) -> ToolMetadata:
+    output_policy = dataset_output_policy
+    if output_policy is None:
+        output_policy = DatasetOutputPolicy.NONE if artifact or name.endswith(".validate") else DatasetOutputPolicy.REQUIRED if write else DatasetOutputPolicy.NONE
     return ToolMetadata(
         name=name,
         description=description,
         input_schema=input_schema or _SCHEMAS.get(name, _schema({})),
         risk_level=RiskLevel.WRITE if write else RiskLevel.READ,
         supports_retry=name.startswith(("dataset.inspect", "raster.inspect")),
-        produces_dataset=write and not artifact and not name.endswith(".validate"),
+        produces_dataset=output_policy is DatasetOutputPolicy.REQUIRED,
+        dataset_output_policy=output_policy,
         produces_artifact=artifact,
         tags=tags or ["gis"],
     )

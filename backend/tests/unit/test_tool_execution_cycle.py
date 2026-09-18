@@ -7,6 +7,7 @@ from app.core.models import (
     CRSInfo,
     Dataset,
     DatasetKind,
+    DatasetOutputPolicy,
     FailureAction,
     LoopDirective,
     Run,
@@ -53,11 +54,12 @@ class FakeRegistry:
 
 
 class FakeToolRegistry:
-    def __init__(self, produces_dataset=False):
+    def __init__(self, produces_dataset=False, dataset_output_policy=None):
         self.produces_dataset = produces_dataset
+        self.dataset_output_policy = dataset_output_policy
 
     def get(self, name):
-        return SimpleNamespace(metadata=SimpleNamespace(produces_dataset=self.produces_dataset))
+        return SimpleNamespace(metadata=SimpleNamespace(produces_dataset=self.produces_dataset, dataset_output_policy=self.dataset_output_policy))
 
 
 class SequenceExecutor:
@@ -150,6 +152,53 @@ def test_retry_stops_at_budget():
     assert outcome.accepted is False
     assert outcome.attempts == 2
     assert len(executor.calls) == 2
+
+
+def test_retry_attempt_is_recorded_on_each_execution_call():
+    calls = []
+
+    async def executor(run, name, arguments, *, call_id=None, attempt=1):
+        calls.append((call_id, attempt))
+        if attempt == 1:
+            return ToolResult(call_id=call_id or "first", status=ToolStatus.FAILED, retryable=True, error=ToolError(code="EXECUTION_TIMEOUT", message="超时"))
+        return ToolResult(call_id="execution-second", status=ToolStatus.SUCCESS)
+
+    cycle = _cycle(executor)
+    outcome = asyncio.run(cycle.execute(_run(), "dataset.inspect", {}, call_id="protocol-call"))
+
+    assert outcome.accepted is True
+    assert outcome.protocol_call_id == "protocol-call"
+    assert calls == [("protocol-call", 1), (None, 2)]
+    assert outcome.result.call_id == "execution-second"
+
+
+def test_required_dataset_output_without_dataset_is_rejected():
+    executor = SequenceExecutor([ToolResult(call_id="call", status=ToolStatus.SUCCESS)])
+    cycle = _cycle(executor, produces_dataset=True)
+
+    outcome = asyncio.run(cycle.execute(_run(), "raster.slope", {}, user_id="user-a"))
+
+    assert outcome.accepted is False
+    assert outcome.verified is False
+    assert "必须产生 Dataset" in outcome.verification_problems[0]
+
+
+def test_optional_dataset_output_without_dataset_is_accepted():
+    executor = SequenceExecutor([ToolResult(call_id="call", status=ToolStatus.SUCCESS)])
+    cycle = ToolExecutionCycle(
+        raw_executor=executor,
+        tool_registry=FakeToolRegistry(dataset_output_policy=DatasetOutputPolicy.OPTIONAL),
+        registry=FakeRegistry(),
+        trace=FakeTrace(),
+        failure_analyzer=FailureAnalyzer(),
+        verifier=ResultVerifier(),
+        budget=RunBudget(max_retry_per_action=1),
+    )
+
+    outcome = asyncio.run(cycle.execute(_run(), "python.execute", {}, user_id="user-a"))
+
+    assert outcome.accepted is True
+    assert outcome.verified is True
 
 
 @pytest.mark.parametrize("action", [FailureAction.ASK_USER, FailureAction.REPLAN, FailureAction.ABORT])

@@ -185,18 +185,20 @@ def test_protocol_tool_message_exposes_execution_acceptance_and_verification():
         recovery_action=None,
         attempts=1,
         accepted=False,
+        protocol_call_id="call-original",
         directive=LoopDirective.ABORT,
     )
 
     message = protocol_tool_message(outcome)
     payload = json.loads(message["content"])
 
-    assert message["tool_call_id"] == "call-bad"
+    assert message["tool_call_id"] == "call-original"
     assert payload["status"] == ToolStatus.SUCCESS.value
     assert payload["accepted"] is False
     assert payload["verified"] is False
     assert payload["verification_problems"] == ["结果不可读"]
     assert payload["directive"] == LoopDirective.ABORT.value
+    assert payload["execution_call_id"] == "call-bad"
 
 
 def test_main_agent_rejects_fixed_cost_input_overflow(application):

@@ -142,7 +142,6 @@ class SubAgent:
             inspect = await execute_action("dataset.inspect", {"dataset_id": selected.id})
             _require_accepted(inspect, "数据检查")
             findings.append({"dataset": selected.name, "inspection": inspect.result.output})
-            result_datasets.append(selected.id)
 
             if subtask.operation == "vector.validate" or "road" in subtask.goal.casefold() or "道路" in subtask.goal:
                 validation = await execute_action("vector.validate", {"dataset_id": selected.id})
@@ -224,26 +223,31 @@ class SubAgent:
         await self.trace.emit(parent_run_id, EventType.SUBAGENT_COMPLETED, summary, payload={"agent_id": agent_id, "status": status.value, "directive": directive.value, "result": final.model_dump(mode="json")}, agent_id=agent_id)
         return SubAgentExecutionResult(result=final, working_memory_delta=delta, directive=directive, failure_rationale=failure_rationale)
 
-    async def _execute_tool_raw(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None) -> ToolResult:
+    async def _execute_tool_raw(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None, attempt: int = 1) -> ToolResult:
         current = self.store.get_run(run.id) or run
         self.guard.check_turn(current)
         self.guard.check_tool(current)
         self.guard.check_execution_time(current)
         current = current.model_copy(update={"turn_count": current.turn_count + 1, "tool_call_count": current.tool_call_count + 1, "status": RunStatus.WAITING_TOOL})
         self.store.save_run(current)
-        call = ToolCall(id=call_id or new_id("call"), name=name, arguments=arguments, run_id=current.id, agent_id=current.agent_id)
+        call = ToolCall(id=call_id or new_id("call"), name=name, arguments=arguments, run_id=current.id, agent_id=current.agent_id, attempt=attempt)
         user_id = self.store.user_id_for_run(current.id)
         services = self.services_factory(user_id) if self.services_factory else self.executor.services if hasattr(self.executor, "services") else {}
         return await self.executor.execute(call, agent_id=current.agent_id, services=services)
 
-    async def _call(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None) -> ToolResult:
+    async def _call(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None, attempt: int = 1) -> ToolResult:
         """Raw Tool hook，保留给测试和旧调用方；业务执行统一经过 Cycle。"""
 
-        return await self._execute_tool_raw(run, name, arguments, call_id=call_id)
+        return await self._execute_tool_raw(run, name, arguments, call_id=call_id, attempt=attempt)
 
-    async def _raw_tool_for_cycle(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None) -> ToolResult:
-        # 不把 call_id 强加给旧的测试 hook；SubAgent 的每次实际执行仍会生成独立 ToolCall。
-        return await self._call(run, name, arguments)
+    async def _raw_tool_for_cycle(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None, attempt: int = 1) -> ToolResult:
+        try:
+            return await self._call(run, name, arguments, call_id=call_id, attempt=attempt)
+        except TypeError as exc:
+            # 保留现有测试和外部 hook 的三参数兼容形式；正式 executor 仍会记录 attempt。
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            return await self._call(run, name, arguments)
 
 
 def _require_accepted(outcome: ExecutionOutcome, label: str) -> ToolResult:
