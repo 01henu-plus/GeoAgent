@@ -86,14 +86,6 @@ class AgentLoop:
                 "error": result.error.model_dump(mode="json") if result.error else None,
             }
             collected_findings.append(finding)
-            _extend_unique(collected_outputs, result.datasets)
-            _extend_unique(collected_artifacts, result.artifacts)
-            outputs[step.id] = {
-                "dataset_id": result.datasets[-1] if result.datasets else None,
-                "dataset_ids": list(result.datasets),
-                "artifact_ids": list(result.artifacts),
-                "output": result.output,
-            }
 
             if result.status not in {ToolStatus.SUCCESS, ToolStatus.PARTIAL_SUCCESS}:
                 step.status = TaskStatus.FAILED
@@ -113,6 +105,14 @@ class AgentLoop:
                     return PlanLoopOutcome(frozenset(completed), tuple(collected_findings), tuple(collected_outputs), tuple(collected_artifacts), tuple(collected_errors), outputs, failed_step=step, failed_result=result, verification_problems=tuple(problems))
                 continue
 
+            _extend_unique(collected_outputs, result.datasets)
+            _extend_unique(collected_artifacts, result.artifacts)
+            outputs[step.id] = {
+                "dataset_id": result.datasets[-1] if result.datasets else None,
+                "dataset_ids": list(result.datasets),
+                "artifact_ids": list(result.artifacts),
+                "output": result.output,
+            }
             step.status = TaskStatus.SUCCEEDED
             completed.add(step.id)
             await checkpoint(completed, _state(collected_findings, collected_outputs, collected_artifacts, collected_errors, outputs))

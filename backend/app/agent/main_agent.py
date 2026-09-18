@@ -63,6 +63,7 @@ from app.runtime.protocol_history import (
     extract_protocol_messages,
     protocol_tool_message,
 )
+from app.runtime.tool_execution_cycle import ExecutionOutcome, ToolExecutionCycle
 from app.state import StateStore, WorkingMemoryUpdater
 from app.task.service import TaskService
 from app.understanding.compat import LegacyIntentAdapter
@@ -113,6 +114,17 @@ class MainAgent:
         self.profile_extractor = profile_extractor or ProfilePreferenceExtractor()
         self.conversation_memory = conversation_memory
         self.working_memory_updater = WorkingMemoryUpdater(store)
+        self.tool_execution_cycle = ToolExecutionCycle(
+            raw_executor=self._raw_tool_for_cycle,
+            tool_registry=self.executor.registry,
+            registry=self.registry,
+            trace=self.trace,
+            failure_analyzer=self.failure_analyzer,
+            verifier=self.verifier,
+            budget=self.budget,
+            working_memory_updater=self.working_memory_updater,
+            default_crs=self.settings.default_crs,
+        )
         self.knowledge = knowledge or KnowledgeRetriever()
         self.model_adapter = model_adapter
         self.model_adapters = model_adapters if model_adapters is not None else {}
@@ -379,7 +391,7 @@ class MainAgent:
         findings: list[Any] = list(initial_findings or [])
         dataset_ids: set[str] = set(initial_dataset_ids or [])
         artifact_ids: set[str] = set(initial_artifact_ids or [])
-        latest_observation = _tool_result_from_checkpoint(initial_latest_observation)
+        latest_observation = _observation_from_checkpoint(initial_latest_observation)
         for turn in range(self.budget.max_agent_turns):
             current = self.store.get_run(run.id) or run
             self.guard.check_turn(current)
@@ -443,12 +455,32 @@ class MainAgent:
                         ),
                     )
                     name = "model.tool_call"
+                    latest_observation = tool_result.model_dump(mode="json")
+                    execution_outcome = None
                 else:
-                    tool_result = await self._tool(run, name, arguments, call_id=call_id)
-                latest_observation = tool_result
-                findings.append({"tool": name, "status": tool_result.status.value, "output": tool_result.output, "error": tool_result.error.model_dump(mode="json") if tool_result.error else None})
-                dataset_ids.update(tool_result.datasets)
-                artifact_ids.update(tool_result.artifacts)
+                    execution_outcome = await self.tool_execution_cycle.execute(
+                        run,
+                        name,
+                        arguments,
+                        user_id=self.store.user_id_for_run(run.id),
+                        call_id=call_id,
+                    )
+                    tool_result = execution_outcome.result
+                    latest_observation = _execution_observation(execution_outcome)
+                findings.append(
+                    {
+                        "tool": name,
+                        "status": tool_result.status.value,
+                        "accepted": execution_outcome.accepted if execution_outcome else False,
+                        "verification_problems": execution_outcome.verification_problems if execution_outcome else [],
+                        "recovery_action": execution_outcome.recovery_action.value if execution_outcome and execution_outcome.recovery_action else None,
+                        "output": tool_result.output,
+                        "error": tool_result.error.model_dump(mode="json") if tool_result.error else None,
+                    }
+                )
+                if execution_outcome is not None and execution_outcome.accepted:
+                    dataset_ids.update(tool_result.datasets)
+                    artifact_ids.update(tool_result.artifacts)
                 protocol_messages.append(protocol_tool_message(tool_result))
             bounded_protocol = compact_protocol_messages(protocol_messages, max_tokens=self.budget.protocol_history_tokens)
             await self._checkpoint(
@@ -457,7 +489,7 @@ class MainAgent:
                 {
                     **self._checkpoint_state(request, intent, plan, datasets, request_frame),
                     "protocol_messages": bounded_protocol,
-                    "latest_observation": latest_observation.model_dump(mode="json") if latest_observation else None,
+                    "latest_observation": latest_observation,
                     "model_findings": findings,
                     "model_dataset_ids": sorted(dataset_ids),
                     "model_artifact_ids": sorted(artifact_ids),
@@ -478,7 +510,7 @@ class MainAgent:
         *,
         working_memory: WorkingMemory | None,
         request_resources: RequestResources,
-        current_observation: ToolResult | None,
+        current_observation: ToolResult | dict[str, Any] | None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         """为当前 turn 计算完整输入预算，并生成动态 Context + 协议历史。"""
 
@@ -489,12 +521,18 @@ class MainAgent:
             context_tokens=self.budget.model_context_tokens,
             protocol_tokens=self.budget.protocol_history_tokens,
         )
-        dynamic_tokens = budget.available_context_tokens(
+        allocation = budget.allocate(
             _MODEL_SYSTEM_PROMPT,
             tools,
             bounded_protocol,
             overhead=_MODEL_CONTEXT_INSTRUCTION,
         )
+        if allocation.over_budget:
+            raise BudgetExceeded(
+                "MODEL_INPUT_BUDGET_EXCEEDED: "
+                f"固定输入成本 {allocation.fixed_tokens} 超过模型输入预算 {allocation.input_tokens}。"
+            )
+        dynamic_tokens = allocation.available_context_tokens
         content = self._model_user_message(
             request,
             run,
@@ -514,8 +552,8 @@ class MainAgent:
             *bounded_protocol,
         ]
         total = budget.estimate_request(_MODEL_SYSTEM_PROMPT, content, bounded_protocol, tools)
-        if total > self.budget.model_input_tokens and dynamic_tokens > 128:
-            dynamic_tokens = max(128, dynamic_tokens - (total - self.budget.model_input_tokens))
+        if total > self.budget.model_input_tokens:
+            dynamic_tokens = max(0, dynamic_tokens - (total - self.budget.model_input_tokens))
             content = self._model_user_message(
                 request,
                 run,
@@ -530,6 +568,12 @@ class MainAgent:
                 context_tokens=dynamic_tokens,
             )
             messages[1] = {"role": "user", "content": content}
+            total = budget.estimate_request(_MODEL_SYSTEM_PROMPT, content, bounded_protocol, tools)
+        if total > self.budget.model_input_tokens:
+            raise BudgetExceeded(
+                "MODEL_INPUT_BUDGET_EXCEEDED: "
+                f"模型请求估算 {total} token，超过输入预算 {self.budget.model_input_tokens}。"
+            )
         return messages, bounded_protocol, tools
 
     def _model_adapter_for(self, request: AgentRequest) -> ModelAdapter | None:
@@ -605,7 +649,7 @@ class MainAgent:
         datasets,
         dataset_ids: set[str],
         working_memory: WorkingMemory | None,
-        observation: ToolResult | None,
+        observation: ToolResult | dict[str, Any] | None,
     ) -> list[Any]:
         """每个模型 turn 重新按用户作用域读取当前可见数据集。"""
 
@@ -614,7 +658,10 @@ class MainAgent:
             identifiers.extend(working_memory.active_dataset_ids)
         identifiers.extend(dataset_ids)
         if observation is not None:
-            identifiers.extend(observation.datasets)
+            if isinstance(observation, ToolResult):
+                identifiers.extend(observation.datasets)
+            elif isinstance(observation, dict):
+                identifiers.extend(observation.get("datasets") or [])
         registry = self.registry.for_user(request.user_id)
         refreshed: list[Any] = []
         seen: set[str] = set()
@@ -684,19 +731,22 @@ class MainAgent:
         artifacts = list(resume_state.get("artifacts", []))
         errors = list(resume_state.get("errors", []))
         step_outputs = dict(resume_state.get("step_outputs", {})) if isinstance(resume_state.get("step_outputs"), dict) else {}
+        execution_outcomes: dict[str, ExecutionOutcome] = {}
 
         async def execute_step(step, arguments):
             completed_arguments = self._complete_plan_arguments(step.tool_name or "", arguments, user_id=request.user_id)
-            result = await self._tool(run, step.tool_name or "", completed_arguments)
-            return await self._recover_plan_failure(run, step.tool_name or "", completed_arguments, result, user_id=request.user_id)
+            outcome = await self.tool_execution_cycle.execute(
+                run,
+                step.tool_name or "",
+                completed_arguments,
+                user_id=request.user_id,
+            )
+            execution_outcomes[step.id] = outcome
+            return outcome.result
 
         async def verify_step(step, result):
-            if result.status in {ToolStatus.SUCCESS, ToolStatus.PARTIAL_SUCCESS} and result.datasets and self._tool_produces_dataset(step.tool_name or ""):
-                await self.trace.emit(run.id, EventType.VERIFICATION_STARTED, f"开始验证 {step.title} 的输出", payload={"tool": step.tool_name, "dataset_ids": result.datasets}, agent_id="main")
-            problems = self._verification_problems(step.tool_name or "", result, user_id=request.user_id)
-            if problems:
-                await self.trace.emit(run.id, EventType.VERIFICATION_FAILED, "；".join(problems), payload={"tool": step.tool_name, "problems": problems}, agent_id="main")
-            return problems
+            outcome = execution_outcomes.get(step.id)
+            return list(outcome.verification_problems) if outcome is not None else []
 
         async def checkpoint(completed_steps, state):
             await self._step_checkpoint(run.id, request, intent, plan, datasets, completed_steps, request_frame=request_frame, **state)
@@ -724,22 +774,6 @@ class MainAgent:
         status = AgentResultStatus.PARTIAL if outcome.errors else AgentResultStatus.SUCCESS
         return AgentResult(agent_id="main", task_id=task.id, status=status, summary=_plan_result_summary(operation, plan, list(outcome.findings), list(outcome.output_ids), list(outcome.artifacts)), findings=list(outcome.findings), datasets=list(outcome.output_ids), artifacts=list(outcome.artifacts), warnings=list(outcome.errors), error=outcome.errors[0] if outcome.errors and not outcome.findings else None, trace_id=run.id)
 
-    def _verification_problems(self, tool_name: str, result: ToolResult, *, user_id: str | None = None) -> list[str]:
-        if result.status not in {ToolStatus.SUCCESS, ToolStatus.PARTIAL_SUCCESS} or not result.datasets:
-            return []
-        if not self._tool_produces_dataset(tool_name):
-            return []
-        verified, problems = self.verifier.verify(result, {item.id: item for item in self.registry.for_user(user_id).list()})
-        if verified:
-            return []
-        return problems
-
-    def _tool_produces_dataset(self, tool_name: str) -> bool:
-        try:
-            return bool(self.executor.registry.get(tool_name).metadata.produces_dataset)
-        except KeyError:
-            return False
-
     def _complete_plan_arguments(self, tool_name: str, arguments: dict[str, Any], *, user_id: str | None = None) -> dict[str, Any]:
         """补齐只有运行时才能确定的参数，例如自动选择投影 CRS。"""
 
@@ -749,106 +783,6 @@ class MainAgent:
             if dataset is not None:
                 completed["target_crs"] = CRSService(default_crs=self.settings.default_crs).choose_projected_crs(dataset)
         return completed
-
-    async def _recover_plan_failure(self, run: Run, tool_name: str, arguments: dict[str, Any], result: ToolResult, *, user_id: str | None = None) -> ToolResult:
-        """只对已知且可证明安全的 GIS 条件做一次修复后重试。"""
-
-        if result.status is not ToolStatus.FAILED or result.error is None:
-            return result
-        action, rationale = self.failure_analyzer.analyze(result)
-        event_type = {
-            "REPAIR": EventType.REPAIR_SELECTED,
-            "REPLAN": EventType.REPLAN_STARTED,
-            "ASK_USER": EventType.DECISION_MADE,
-            "ABORT": EventType.DECISION_MADE,
-        }.get(action.value, EventType.DECISION_MADE)
-        await self.trace.emit(
-            run.id,
-            event_type,
-            rationale,
-            payload={"action": action.value, "tool": tool_name, "error": result.error.model_dump(mode="json")},
-            agent_id="main",
-        )
-        if action.value == "RETRY" and result.retryable:
-            for _ in range(self.budget.max_retry_per_action):
-                await self.trace.emit(run.id, EventType.RETRY_STARTED, f"重试 {tool_name}", payload={"tool": tool_name}, agent_id="main")
-                retry = await self._tool(run, tool_name, arguments)
-                if retry.status in {ToolStatus.SUCCESS, ToolStatus.PARTIAL_SUCCESS}:
-                    return retry
-                result = retry
-            return result
-        if action.value != "REPAIR":
-            return result
-
-        repaired_arguments = await self._repair_arguments(run, tool_name, arguments, result.error.code, user_id=user_id)
-        if repaired_arguments is None:
-            return result
-        await self.trace.emit(run.id, EventType.RETRY_STARTED, f"修复输入后重试 {tool_name}", payload={"tool": tool_name, "arguments": repaired_arguments}, agent_id="main")
-        return await self._tool(run, tool_name, repaired_arguments)
-
-    async def _repair_arguments(self, run: Run, tool_name: str, arguments: dict[str, Any], error_code: str, *, user_id: str | None = None) -> dict[str, Any] | None:
-        registry = self.registry.for_user(user_id)
-        if error_code in {"CRS_UNIT_MISMATCH", "CRS_MISSING"} and "dataset_id" in arguments:
-            dataset = registry.resolve(str(arguments["dataset_id"]))
-            if dataset is None or dataset.crs is None:
-                return None
-            target_crs = CRSService(default_crs=self.settings.default_crs).choose_projected_crs(dataset)
-            reprojection_tool = "raster.reproject" if dataset.kind.value == "RASTER" else "crs.reproject"
-            repaired = await self._tool(run, reprojection_tool, {"dataset_id": dataset.id, "target_crs": target_crs})
-            if repaired.status is not ToolStatus.SUCCESS or not repaired.datasets:
-                return None
-            updated = dict(arguments)
-            updated["dataset_id"] = repaired.datasets[-1]
-            return updated
-        if error_code == "CRS_UNIT_MISMATCH" and "source_dataset_id" in arguments:
-            source = registry.resolve(str(arguments["source_dataset_id"]))
-            if source is None or source.crs is None:
-                return None
-            target_crs = CRSService(default_crs=self.settings.default_crs).choose_projected_crs(source)
-            updated = dict(arguments)
-            for key in ("source_dataset_id", "target_dataset_id"):
-                identifier = updated.get(key)
-                dataset = registry.resolve(str(identifier)) if identifier else None
-                if dataset is None:
-                    continue
-                reprojection_tool = "raster.reproject" if dataset.kind.value == "RASTER" else "crs.reproject"
-                repaired = await self._tool(run, reprojection_tool, {"dataset_id": dataset.id, "target_crs": target_crs})
-                if repaired.status is not ToolStatus.SUCCESS or not repaired.datasets:
-                    return None
-                updated[key] = repaired.datasets[-1]
-            return updated
-        if error_code == "CRS_MISMATCH":
-            left_id = arguments.get("left_dataset_id") or arguments.get("source_dataset_id")
-            right_key = "right_dataset_id" if arguments.get("right_dataset_id") else "mask_dataset_id" if arguments.get("mask_dataset_id") else "target_dataset_id"
-            right_id = arguments.get(right_key)
-            left = registry.resolve(str(left_id)) if left_id else None
-            right = registry.resolve(str(right_id)) if right_id else None
-            if left is None or right is None or left.crs is None:
-                return None
-            target_crs = left.crs.authority
-            if not target_crs:
-                return None
-            reprojection_tool = "raster.reproject" if right.kind.value == "RASTER" else "crs.reproject"
-            repaired = await self._tool(run, reprojection_tool, {"dataset_id": right.id, "target_crs": target_crs})
-            if repaired.status is not ToolStatus.SUCCESS or not repaired.datasets:
-                return None
-            updated = dict(arguments)
-            updated[right_key] = repaired.datasets[-1]
-            return updated
-        if error_code == "INVALID_GEOMETRY":
-            updated = dict(arguments)
-            input_keys = [key for key in ("dataset_id", "left_dataset_id", "right_dataset_id", "mask_dataset_id") if key in updated]
-            changed = False
-            for key in input_keys:
-                dataset = registry.resolve(str(updated[key]))
-                if dataset is None or dataset.kind.value != "VECTOR":
-                    continue
-                repaired = await self._tool(run, "vector.repair", {"dataset_id": dataset.id})
-                if repaired.status is ToolStatus.SUCCESS and repaired.datasets:
-                    updated[key] = repaired.datasets[-1]
-                    changed = True
-            return updated if changed else None
-        return None
 
     def _interpret_result(self, request: AgentRequest, run: Run) -> AgentResult:
         identifiers = list(request.referenced_run_ids)
@@ -970,7 +904,7 @@ class MainAgent:
             )
         return result
 
-    async def _tool(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None) -> ToolResult:
+    async def _execute_tool_raw(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None) -> ToolResult:
         current = self.store.get_run(run.id) or run
         self.guard.check_turn(current)
         self.guard.check_execution_time(current)
@@ -980,9 +914,17 @@ class MainAgent:
         call = ToolCall(id=call_id or new_id("call"), name=name, arguments=arguments, run_id=run.id, agent_id="main")
         user_id = self.store.user_id_for_run(current.id)
         services = self.services_factory(user_id) if self.services_factory else self.executor.services
-        result = await self.executor.execute(call, agent_id="main", services=services)
-        self.working_memory_updater.update_from_tool_result(current.task_id, result, run_id=current.id)
-        return result
+        return await self.executor.execute(call, agent_id="main", services=services)
+
+    async def _tool(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None) -> ToolResult:
+        """保留给旧测试/调用方的 Raw Tool hook；新路径由 Cycle 负责包裹。"""
+
+        return await self._execute_tool_raw(run, name, arguments, call_id=call_id)
+
+    async def _raw_tool_for_cycle(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None) -> ToolResult:
+        """通过兼容 hook 执行 Raw Tool，便于测试替换而不绕过 Cycle。"""
+
+        return await self._tool(run, name, arguments, call_id=call_id)
 
 
 def _set_plan_step_status(plan: Plan, step_id: str, status: TaskStatus) -> None:
@@ -1024,13 +966,29 @@ def _parse_model_tool_call(raw_call: dict[str, Any]) -> tuple[str, dict[str, Any
     return name, arguments
 
 
-def _tool_result_from_checkpoint(value: dict[str, Any] | None) -> ToolResult | None:
+def _observation_from_checkpoint(value: dict[str, Any] | None) -> ToolResult | dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     try:
         return ToolResult.model_validate(value)
     except (TypeError, ValueError):
-        return None
+        return dict(value)
+
+
+def _execution_observation(outcome: ExecutionOutcome) -> dict[str, Any]:
+    """给下一轮模型的轻量执行观察，不把 ExecutionOutcome 全量暴露出去。"""
+
+    observation = outcome.result.model_dump(mode="json")
+    observation.update(
+        {
+            "accepted": outcome.accepted,
+            "verified": outcome.verified,
+            "verification_problems": list(outcome.verification_problems),
+            "recovery_action": outcome.recovery_action.value if outcome.recovery_action else None,
+            "attempts": outcome.attempts,
+        }
+    )
+    return {key: value for key, value in observation.items() if value not in (None, [], {})}
 
 
 def _model_tool_name(raw_call: Any) -> str:
