@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { api, Artifact, Conversation, Dataset, Event, fetchRunView, ModelStatus, Result, Run, User } from "./api";
+import { api, Artifact, Conversation, Dataset, Event, fetchRunView, MeasurementSystem, ModelStatus, ResponseStyle, Result, Run, User, UserProfile } from "./api";
 import { childRunsOf, eventRuns, groupRunsByTask, interactionModeLabel, isActiveRun, isMainRun, lineageSource, RESUMABLE_RUN_STATUSES, runTitle, runsForConversation } from "./domain";
 
 type View = "chat" | "datasets" | "agents" | "runs" | "results" | "settings";
@@ -209,6 +209,7 @@ function formatDuration(durationMs: number): string {
 
 export function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [view, setView] = useState<View>("chat");
   const [accountOpen, setAccountOpen] = useState(false);
@@ -337,11 +338,13 @@ export function App() {
 
   useEffect(() => {
     if (!currentUser) return;
+    void api.profile().then(setUserProfile).catch((err) => setError(errorMessage(err)));
     void refresh();
     void initializeConversations();
   }, [currentUser?.id]);
 
   const clearSessionState = () => {
+    setUserProfile(null);
     setConversationId("");
     setConversations([]);
     setMessages([]);
@@ -621,7 +624,7 @@ export function App() {
       {view === "agents" && <AgentPanel runs={conversationRuns} />}
       {view === "runs" && <RunPanel runs={conversationRuns} selectedRunId={selectedRunId} events={events} onSelect={loadRun} onCancel={cancelRun} onResume={resumeRun} onDelete={deleteRun} onDeleteMany={deleteRunRecords} busy={busy} />}
       {view === "results" && <ResultPanel result={result} datasets={datasets} events={events} artifacts={artifacts} />}
-      {view === "settings" && <SettingsPanel currentUser={currentUser} onSaved={setCurrentUser} modelStatus={modelStatus} />}
+      {view === "settings" && <SettingsPanel currentUser={currentUser} onSaved={setCurrentUser} profile={userProfile} onProfileSaved={setUserProfile} modelStatus={modelStatus} />}
     </main>
   </div>;
 }
@@ -718,12 +721,24 @@ function ResultPanel({ result, datasets, events, artifacts }: { result: Result |
   return <section className="panel result-panel">{!result ? <Empty text="完成一次分析后，结果、证据和运行追踪会显示在这里。" /> : <><div className="result-head"><div><span className={`pill ${result.status.toLowerCase()}`}>{statusLabel(result.status)}</span><h2>{result.summary}</h2></div><code>{result.trace_id}</code></div>{result.error && <div className="result-error"><b>错误</b><span>{result.error}</span></div>}<div className="result-columns"><div><h3>分析发现</h3>{result.findings.length === 0 ? <Empty text="没有结构化发现。" /> : result.findings.map((finding, index) => <pre key={index}>{findingText(finding)}</pre>)}<h3>关联数据集</h3>{result.datasets.length === 0 ? <p className="muted-text">本次运行没有关联数据集。</p> : <div className="dataset-result-list">{result.datasets.map((datasetId) => { const dataset = datasets.find((item) => item.id === datasetId); return <div className="dataset-result-item" key={datasetId}><b>{dataset?.name ?? datasetId}</b><small>{dataset?.kind ? kindLabel(dataset.kind) : "数据集"} · {datasetId}</small></div>; })}</div>}<h3>结果文件</h3>{result.artifacts.length === 0 ? <p className="muted-text">本次运行没有产物。</p> : <div className="artifact-list">{result.artifacts.map((artifactId) => { const artifact = artifacts.find((item) => item.id === artifactId); return <a className="artifact-link" href={api.artifactUrl(artifactId)} target="_blank" rel="noreferrer" key={artifactId}>{artifact?.name ?? artifactId} <span>↗</span></a>; })}</div>}{result.evidence.length > 0 && <><h3>证据</h3>{result.evidence.map((evidence, index) => <pre key={index}>{findingText(evidence)}</pre>)}</>}</div><div><h3>执行情况</h3><div className="metric"><b>{events.length}</b><span>追踪事件</span></div><div className="metric"><b>{result.datasets.length}</b><span>涉及数据集</span></div><div className="metric"><b>{result.artifacts.length}</b><span>结果文件</span></div>{result.warnings.length > 0 && <><h3>警告</h3>{result.warnings.map((warning) => <p className="warning" key={warning}>{warning}</p>)}</>}</div></div></> }</section>;
 }
 
-function SettingsPanel({ currentUser, onSaved, modelStatus }: { currentUser: User; onSaved: (user: User) => void; modelStatus: ModelStatus | null }) {
+function SettingsPanel({ currentUser, onSaved, profile, onProfileSaved, modelStatus }: { currentUser: User; onSaved: (user: User) => void; profile: UserProfile | null; onProfileSaved: (profile: UserProfile) => void; modelStatus: ModelStatus | null }) {
   const [displayName, setDisplayName] = useState(currentUser.display_name);
   const [email, setEmail] = useState(currentUser.email ?? "");
+  const [language, setLanguage] = useState(profile?.language ?? "zh-CN");
+  const [responseStyle, setResponseStyle] = useState<ResponseStyle>(profile?.response_style ?? "balanced");
+  const [measurementSystem, setMeasurementSystem] = useState<MeasurementSystem>(profile?.measurement_system ?? "metric");
+  const [preferredOutputFormat, setPreferredOutputFormat] = useState(profile?.preferred_output_format ?? "");
   const [saving, setSaving] = useState(false);
+  const [savingProfile, setSavingProfile] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [profileSaved, setProfileSaved] = useState(false);
   const [error, setError] = useState("");
+  useEffect(() => {
+    setLanguage(profile?.language ?? "zh-CN");
+    setResponseStyle(profile?.response_style ?? "balanced");
+    setMeasurementSystem(profile?.measurement_system ?? "metric");
+    setPreferredOutputFormat(profile?.preferred_output_format ?? "");
+  }, [profile]);
   const save = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setSaving(true);
@@ -739,7 +754,22 @@ function SettingsPanel({ currentUser, onSaved, modelStatus }: { currentUser: Use
       setSaving(false);
     }
   };
-  return <section className="panel settings-panel"><div className="panel-head"><div><span className="eyebrow">账号与运行配置</span><h2>设置</h2></div></div><form className="account-settings-form" onSubmit={(event) => void save(event)}><label>显示名称<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label><label>用户名<input value={currentUser.username} readOnly /></label><label>邮箱<input value={email} onChange={(event) => setEmail(event.target.value)} type="email" /></label><button className="primary" disabled={saving || !displayName.trim()}>{saving ? "正在保存…" : "保存账号信息"}</button>{saved && <span className="settings-success">已保存</span>}{error && <span className="settings-inline-error">{error}</span>}</form><div className="settings-grid"><div className="setting-item"><span>登录状态</span><b>已登录</b></div><div className="setting-item"><span>默认模型</span><b>{modelStatus?.profiles.find((profile) => profile.id === modelStatus.default_profile)?.label ?? "未配置"}</b></div><div className="setting-item"><span>可用模型</span><b>{modelStatus?.profiles.length ?? 0} 个</b></div></div><p className="settings-note">模型接口从后端环境配置中读取，发送消息时可在对话框右下角切换。</p></section>;
+  const saveProfile = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSavingProfile(true);
+    setProfileSaved(false);
+    setError("");
+    try {
+      const updated = await api.updateProfile({ language, response_style: responseStyle, measurement_system: measurementSystem, preferred_output_format: preferredOutputFormat || null });
+      onProfileSaved(updated);
+      setProfileSaved(true);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSavingProfile(false);
+    }
+  };
+  return <section className="panel settings-panel"><div className="panel-head"><div><span className="eyebrow">账号与运行配置</span><h2>设置</h2></div></div><form className="account-settings-form" onSubmit={(event) => void save(event)}><h3>账号信息</h3><label>显示名称<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label><label>用户名<input value={currentUser.username} readOnly /></label><label>邮箱<input value={email} onChange={(event) => setEmail(event.target.value)} type="email" /></label><button className="primary" disabled={saving || !displayName.trim()}>{saving ? "正在保存…" : "保存账号信息"}</button>{saved && <span className="settings-success">已保存</span>}</form><form className="account-settings-form" onSubmit={(event) => void saveProfile(event)}><h3>用户偏好</h3><label>语言<select value={language} onChange={(event) => setLanguage(event.target.value)}><option value="zh-CN">中文</option><option value="en-US">English</option></select></label><label>回答风格<select value={responseStyle} onChange={(event) => setResponseStyle(event.target.value as ResponseStyle)}><option value="concise">简洁</option><option value="balanced">平衡</option><option value="detailed">详细</option></select></label><label>单位制<select value={measurementSystem} onChange={(event) => setMeasurementSystem(event.target.value as MeasurementSystem)}><option value="metric">公制</option><option value="imperial">英制</option></select></label><label>默认输出格式<select value={preferredOutputFormat} onChange={(event) => setPreferredOutputFormat(event.target.value)}><option value="">自动</option><option value="GeoPackage">GeoPackage</option><option value="GeoJSON">GeoJSON</option><option value="GeoTIFF">GeoTIFF</option><option value="CSV">CSV</option></select></label><button className="primary" disabled={savingProfile}>{savingProfile ? "正在保存…" : "保存用户偏好"}</button>{profileSaved && <span className="settings-success">偏好已保存</span>}{error && <span className="settings-inline-error">{error}</span>}<p className="settings-note">这些偏好只作为默认交互方式；当前请求的明确要求优先，格式偏好仅在任务能力允许时使用。</p></form><div className="settings-grid"><div className="setting-item"><span>登录状态</span><b>已登录</b></div><div className="setting-item"><span>默认模型</span><b>{modelStatus?.profiles.find((profile) => profile.id === modelStatus.default_profile)?.label ?? "未配置"}</b></div><div className="setting-item"><span>可用模型</span><b>{modelStatus?.profiles.length ?? 0} 个</b></div></div><p className="settings-note">模型接口从后端环境配置中读取，发送消息时可在对话框右下角切换。</p></section>;
 }
 
 function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => void }) {

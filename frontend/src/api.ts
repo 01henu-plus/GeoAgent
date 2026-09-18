@@ -11,6 +11,9 @@ export type Artifact = { id: string; name: string; kind: string; path?: string |
 export type ResumeResponse = { resumed_from: string; run_id: string; checkpoint: string; result: Result };
 export type Conversation = { id: string; title: string; created_at: string; updated_at: string };
 export type User = { id: string; username: string; email?: string | null; display_name: string; is_active: boolean; created_at: string; updated_at: string };
+export type ResponseStyle = "concise" | "balanced" | "detailed";
+export type MeasurementSystem = "metric" | "imperial";
+export type UserProfile = { user_id: string; language: string; response_style: ResponseStyle; measurement_system: MeasurementSystem; preferred_output_format?: string | null; updated_at: string };
 export type ConversationMessage = { id: string; conversation_id: string; role: string; content: string; run_id?: string | null; created_at?: string };
 export type ModelProfile = { id: string; label: string; provider: string; base_url?: string | null; model: string; timeout_seconds: number; temperature: number; has_api_key: boolean; default: boolean };
 export type ModelStatus = { configured: boolean; source: string; default_profile?: string | null; profiles: ModelProfile[] };
@@ -94,6 +97,8 @@ export const api = {
   login: (identifier: string, password: string) => request<User>("/api/v1/auth/login", { method: "POST", body: JSON.stringify({ identifier, password }) }),
   logout: () => request<{ logged_out: boolean }>("/api/v1/auth/logout", { method: "POST" }),
   updateMe: (displayName: string, email?: string) => request<User>("/api/v1/users/me", { method: "PATCH", body: JSON.stringify({ display_name: displayName, email: email || null }) }),
+  profile: () => request<UserProfile>("/api/v1/users/me/profile"),
+  updateProfile: (changes: Partial<Omit<UserProfile, "user_id" | "updated_at">>) => request<UserProfile>("/api/v1/users/me/profile", { method: "PATCH", body: JSON.stringify(changes) }),
   datasets: () => request<Dataset[]>("/api/v1/datasets"),
   uploadAttachment,
   conversations: (limit = 50) => request<Conversation[]>(`/api/v1/conversations?limit=${limit}`),
