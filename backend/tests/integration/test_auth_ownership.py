@@ -1,9 +1,13 @@
+import asyncio
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from app.api import create_app
-from app.core.models import Artifact, ArtifactKind, Run, RunStatus
+from app.auth.password import hash_session_token
+from app.core.models import Artifact, ArtifactKind, Run, RunStatus, Task
 
 
 def _register(client: TestClient, username: str):
@@ -70,3 +74,78 @@ def test_websocket_requires_session(application):
             with client.websocket_connect("/ws"):
                 pass
         assert error.value.code == 1008
+
+
+def test_run_derived_dataset_and_artifact_keep_user_owner(application):
+    with TestClient(create_app(application)) as client_a, TestClient(create_app(application)) as client_b:
+        user_a = _register(client_a, "owner-a")
+        user_b = _register(client_b, "owner-b")
+        conversation = application.conversations.create("归属测试", user_id=user_a["id"])
+        task = Task(goal="归属测试", conversation_id=conversation.id)
+        application.store.save_task(task)
+        main_run = Run(conversation_id=conversation.id, task_id=task.id, agent_id="main", status=RunStatus.RUNNING)
+        application.store.save_run(main_run)
+        services = application.execution_services(user_a["id"])
+        dataset_path = services["workspace"].input_dir / "owned.csv"
+        dataset_path.write_text("x,y\n1,2\n", encoding="utf-8")
+        dataset = services["registry"].register_path(dataset_path, run_id=main_run.id)
+        artifact_path = services["workspace"].output_dir / "owned.txt"
+        artifact_path.write_text("owned", encoding="utf-8")
+        artifact = services["artifacts"].publish(artifact_path, run_id=main_run.id)
+        sub_run = Run(conversation_id=conversation.id, task_id=task.id, parent_run_id=main_run.id, agent_id="sub", status=RunStatus.RUNNING)
+        application.store.save_run(sub_run)
+        sub_path = services["workspace"].intermediate_dir / "sub.csv"
+        sub_path.write_text("x,y\n3,4\n", encoding="utf-8")
+        sub_dataset = services["registry"].register_path(sub_path, run_id=sub_run.id)
+        assert dataset.owner_user_id == user_a["id"]
+        assert artifact.owner_user_id == user_a["id"]
+        assert sub_dataset.owner_user_id == user_a["id"]
+        assert application.store.get_dataset_for_user(dataset.id, user_a["id"]) is not None
+        assert application.store.get_dataset_for_user(dataset.id, user_b["id"]) is None
+        assert application.store.get_artifact_for_user(artifact.id, user_b["id"]) is None
+        assert client_b.get("/api/v1/datasets").json() == []
+
+
+def test_authenticated_websocket_resources_are_owned_by_user(application):
+    with TestClient(create_app(application)) as client_a:
+        user_a = _register(client_a, "socket-owner")
+        run_id = None
+        with client_a.websocket_connect("/ws") as websocket:
+            websocket.send_json({"type": "ask", "message": "你好", "conversation_id": "socket-conversation"})
+            while True:
+                payload = websocket.receive_json()
+                if payload["type"] == "run":
+                    run_id = payload["data"]["id"]
+                if payload["type"] == "result":
+                    break
+        assert run_id is not None
+        assert application.store.run_belongs_to_user(run_id, user_a["id"])
+    with TestClient(create_app(application)) as client_b:
+        _register(client_b, "socket-other")
+        assert client_b.get(f"/api/v1/runs/{run_id}").status_code == 404
+        assert client_b.get("/api/v1/conversations").json() == []
+
+
+def test_expired_and_inactive_sessions_are_rejected(application):
+    with TestClient(create_app(application)) as client:
+        created = _register(client, "session-owner")
+        token = client.cookies.get(application.settings.auth_cookie_name)
+        assert token is not None
+        session = application.store.get_session(hash_session_token(token))
+        assert session is not None
+        application.store.save_session(session.model_copy(update={"expires_at": datetime.now(UTC) - timedelta(minutes=1)}))
+        assert client.get("/api/v1/users/me").status_code == 401
+        client.post("/api/v1/auth/login", json={"identifier": "session-owner", "password": "password123"})
+        user = application.store.get_user(created["id"])
+        assert user is not None
+        application.store.save_user(user.model_copy(update={"is_active": False}))
+        assert client.get("/api/v1/users/me").status_code == 401
+
+
+def test_python_tool_is_disabled_without_explicit_configuration(application):
+    from app.core.models import ToolCall
+
+    result = asyncio.run(application.tool_executor.execute(ToolCall(name="python.execute", arguments={"code": "print(1)"}), agent_id="main", services=application.execution_services()))
+    assert result.status.value == "FAILED"
+    assert result.error is not None
+    assert result.error.code == "UNSAFE_PYTHON_DISABLED"
