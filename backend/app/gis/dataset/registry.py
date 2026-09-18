@@ -10,13 +10,19 @@ from app.state import StateStore
 
 
 class DatasetRegistry:
-    def __init__(self, store: StateStore, inspector: DatasetInspector | None = None, *, owner_user_id: str | None = None) -> None:
+    def __init__(self, store: StateStore, inspector: DatasetInspector | None = None, *, owner_user_id: str | None = None, system_owned: bool = False) -> None:
         self.store = store
         self.inspector = inspector or DatasetInspector()
         self.owner_user_id = owner_user_id
+        self.system_owned = system_owned
 
-    def for_user(self, user_id: str | None) -> DatasetRegistry:
-        return DatasetRegistry(self.store, self.inspector, owner_user_id=user_id)
+    def for_user(self, user_id: str | None, *, system_owned: bool | None = None) -> DatasetRegistry:
+        return DatasetRegistry(
+            self.store,
+            self.inspector,
+            owner_user_id=user_id,
+            system_owned=self.system_owned if system_owned is None and user_id is None else bool(system_owned),
+        )
 
     def register(self, dataset: Dataset) -> Dataset:
         self.store.save_dataset(dataset)
@@ -33,11 +39,15 @@ class DatasetRegistry:
         parameters: dict | None = None,
         tool_call_id: str | None = None,
         owner_user_id: str | None = None,
+        system_owned: bool = False,
     ) -> Dataset:
         target = Path(path).expanduser().resolve()
         owner = owner_user_id or self.owner_user_id
         if owner is None and run_id:
             owner = self.store.user_id_for_run(run_id)
+        system_owned = system_owned or self.system_owned
+        if owner is None and not system_owned:
+            raise PermissionError("创建数据集必须绑定用户；系统数据请明确指定 system_owned=True")
         if run_id is None and operation is None:
             existing = next(
                 (item for item in self.store.list_datasets_for_user(owner) if Path(item.path).expanduser().resolve() == target)

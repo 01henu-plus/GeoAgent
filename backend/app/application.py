@@ -15,6 +15,7 @@ from app.artifact import ArtifactService
 from app.auth import AuthService
 from app.checkpoint.store import CheckpointStore
 from app.config import Settings
+from app.conversation_memory import ConversationMemoryService
 from app.core.models import AgentRequest, RunBudget
 from app.entry import AttachmentService, ConversationService, normalize_request
 from app.events import EventBus
@@ -34,6 +35,7 @@ from app.models.config import ModelProfile
 from app.models.providers import OpenAICompatibleAdapter
 from app.observability import Metrics, TraceRecorder
 from app.permission import PermissionPolicy
+from app.profile import ProfilePreferenceExtractor, UserProfileService
 from app.run import RunManager
 from app.runtime.context_manager import ContextManager
 from app.state import StateStore
@@ -54,16 +56,19 @@ class Application:
         self.workspace = WorkspaceManager(self.settings.workspace_path)
         self.attachments = AttachmentService(self.workspace)
         self.inspector = DatasetInspector()
-        self.registry = DatasetRegistry(self.store, self.inspector)
+        self.registry = DatasetRegistry(self.store, self.inspector, system_owned=True)
         self.vectors = VectorService()
         self.rasters = RasterService()
         self.crs = CRSService(self.vectors, default_crs=self.settings.default_crs)
         self.renderer = MapRenderer()
         self.python_executor = PythonExecutor(self.workspace, timeout_seconds=self.settings.tool_timeout_seconds)
         self.shell_executor = ShellExecutor(self.workspace, timeout_seconds=self.settings.tool_timeout_seconds)
-        self.artifacts = ArtifactService(self.store, self.workspace)
+        self.artifacts = ArtifactService(self.store, self.workspace, system_owned=True)
         self.checkpoints = CheckpointStore(self.store)
         self.memory = MemoryManager(self.store)
+        self.profile = UserProfileService(self.store)
+        self.profile_extractor = ProfilePreferenceExtractor()
+        self.conversation_memory = ConversationMemoryService(self.store)
         self.context_manager = ContextManager()
         self.knowledge = KnowledgeRetriever()
         self.models = ModelRegistry()
@@ -90,6 +95,8 @@ class Application:
             "python": self.python_executor,
             "shell": self.shell_executor,
             "artifacts": self.artifacts,
+            "allow_unsafe_python": self.settings.enable_unsafe_python,
+            "system_owned": True,
         }
         self.budget = RunBudget(
             max_agent_turns=self.settings.max_agent_turns,
@@ -103,7 +110,7 @@ class Application:
         self.task_service = TaskService(TaskRepository(self.store))
         self.sub_agent = SubAgent(self.tool_executor, self.store, self.trace, context_manager=ContextManager(max_chars=10000), budget=self.budget, services_factory=self.execution_services)
         self.agent_manager = AgentManager(self.sub_agent, max_parallel=self.settings.max_parallel_agents, max_subagents=self.settings.max_subagents, timeout_seconds=self.settings.max_execution_seconds)
-        self.main_agent = MainAgent(store=self.store, trace=self.trace, executor=self.tool_executor, registry=self.registry, task_service=self.task_service, agent_manager=self.agent_manager, settings=self.settings, checkpoint_store=self.checkpoints, memory=self.memory, knowledge=self.knowledge, model_adapter=self.model_adapter, model_adapters=self.model_adapters, default_model_profile=self.default_model_profile, context_manager=self.context_manager, budget=self.budget, services_factory=self.execution_services)
+        self.main_agent = MainAgent(store=self.store, trace=self.trace, executor=self.tool_executor, registry=self.registry, task_service=self.task_service, agent_manager=self.agent_manager, settings=self.settings, checkpoint_store=self.checkpoints, memory=self.memory, knowledge=self.knowledge, model_adapter=self.model_adapter, model_adapters=self.model_adapters, default_model_profile=self.default_model_profile, context_manager=self.context_manager, budget=self.budget, services_factory=self.execution_services, profile_service=self.profile, profile_extractor=self.profile_extractor, conversation_memory=self.conversation_memory)
         self.run_manager = RunManager(self.main_agent, self.store, self.metrics)
         self.conversations = ConversationService(self.store, self.run_manager)
 
@@ -122,11 +129,13 @@ class Application:
         services.update(
             {
                 "workspace": workspace,
-                "registry": self.registry.for_user(user_id),
+                "registry": self.registry.for_user(user_id, system_owned=user_id is None),
                 "python": PythonExecutor(workspace, timeout_seconds=self.settings.tool_timeout_seconds),
                 "shell": ShellExecutor(workspace, timeout_seconds=self.settings.tool_timeout_seconds),
-                "artifacts": ArtifactService(self.store, workspace),
+                "artifacts": ArtifactService(self.store, workspace, system_owned=user_id is None),
                 "user_id": user_id,
+                "allow_unsafe_python": self.settings.enable_unsafe_python,
+                "system_owned": user_id is None,
             }
         )
         return services
@@ -195,4 +204,4 @@ class Application:
     def register_dataset(self, path: str | Path, *, name: str | None = None, user_id: str | None = None):
         workspace = self.workspace.for_user(user_id)
         target = workspace.resolve(path, allow_missing=False)
-        return self.registry.for_user(user_id).register_path(target, name=name)
+        return self.registry.for_user(user_id, system_owned=user_id is None).register_path(target, name=name, system_owned=user_id is None)

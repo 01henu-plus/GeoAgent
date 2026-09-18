@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     max_tokens: int = Field(default=1200, ge=1)
     max_execution_seconds: int = Field(default=300, ge=1)
     tool_timeout_seconds: int = Field(default=120, ge=1)
+    enable_unsafe_python: bool = False
     model_profiles: str | None = None
     auth_cookie_name: str = "geoagent_session"
     auth_cookie_secure: bool = False

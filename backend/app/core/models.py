@@ -93,6 +93,17 @@ class InteractionMode(StrEnum):
     CANCEL_TASK = "cancel_task"
 
 
+class ResponseStyle(StrEnum):
+    CONCISE = "concise"
+    BALANCED = "balanced"
+    DETAILED = "detailed"
+
+
+class MeasurementSystem(StrEnum):
+    METRIC = "metric"
+    IMPERIAL = "imperial"
+
+
 class DecisionType(StrEnum):
     TOOL = "TOOL"
     DELEGATE = "DELEGATE"
@@ -462,6 +473,32 @@ class Message(StrictModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class ConversationMemoryEntry(StrictModel):
+    """会话级派生事实，始终保留其来源引用。"""
+
+    id: str = Field(default_factory=lambda: new_id("cmem"))
+    content: str
+    source_message_id: str | None = None
+    source_task_id: str | None = None
+    source_run_id: str | None = None
+    reference_type: str | None = None
+    reference_id: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ConversationMemory(StrictModel):
+    """Conversation 作用域的结构化派生状态，不替代原始 Messages。"""
+
+    conversation_id: str
+    user_id: str
+    summary: str = ""
+    key_facts: list[ConversationMemoryEntry] = Field(default_factory=list)
+    decisions: list[ConversationMemoryEntry] = Field(default_factory=list)
+    important_references: list[ConversationMemoryEntry] = Field(default_factory=list)
+    unresolved_topics: list[ConversationMemoryEntry] = Field(default_factory=list)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class MemoryItem(StrictModel):
     id: str = Field(default_factory=lambda: new_id("mem"))
     owner_user_id: str | None = None
@@ -482,6 +519,17 @@ class User(StrictModel):
     display_name: str
     is_active: bool = True
     created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class UserProfile(StrictModel):
+    """跨会话的明确工作交互偏好，不保存用户画像或敏感信息。"""
+
+    user_id: str
+    language: str = "zh-CN"
+    response_style: ResponseStyle = ResponseStyle.BALANCED
+    measurement_system: MeasurementSystem = MeasurementSystem.METRIC
+    preferred_output_format: str | None = None
     updated_at: datetime = Field(default_factory=utc_now)
 
 

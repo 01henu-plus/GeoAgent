@@ -10,6 +10,7 @@ from typing import Any
 from app.agent.manager import AgentManager
 from app.checkpoint.context import make_checkpoint
 from app.checkpoint.store import CheckpointStore
+from app.conversation_memory import ConversationMemoryService
 from app.core.models import (
     AgentRequest,
     AgentResult,
@@ -50,6 +51,7 @@ from app.memory import MemoryManager
 from app.memory.extractor import MemoryExtractor
 from app.models import ModelAdapter, ModelRequest, ModelResponse
 from app.observability import TraceRecorder
+from app.profile import ProfilePreferenceExtractor, UserProfileService
 from app.run.lifecycle import PreparedRequest, RequestLifecycleBinder
 from app.runtime.agent_loop import AgentLoop
 from app.runtime.budget import BudgetExceeded, BudgetGuard
@@ -75,7 +77,7 @@ _MODEL_SYSTEM_PROMPT = """
 class MainAgent:
     """负责用户目标、策略循环和结果汇总；确定性 GIS 计算委托给 Tools。"""
 
-    def __init__(self, *, store: StateStore, trace: TraceRecorder, executor: ToolExecutor, registry, task_service: TaskService, agent_manager: AgentManager, settings, budget: RunBudget | None = None, checkpoint_store: CheckpointStore | None = None, memory: MemoryManager | None = None, knowledge: KnowledgeRetriever | None = None, model_adapter: ModelAdapter | None = None, model_adapters: dict[str, ModelAdapter] | None = None, default_model_profile: str | None = None, context_manager: ContextManager | None = None, services_factory=None) -> None:
+    def __init__(self, *, store: StateStore, trace: TraceRecorder, executor: ToolExecutor, registry, task_service: TaskService, agent_manager: AgentManager, settings, budget: RunBudget | None = None, checkpoint_store: CheckpointStore | None = None, memory: MemoryManager | None = None, knowledge: KnowledgeRetriever | None = None, model_adapter: ModelAdapter | None = None, model_adapters: dict[str, ModelAdapter] | None = None, default_model_profile: str | None = None, context_manager: ContextManager | None = None, services_factory=None, profile_service: UserProfileService | None = None, profile_extractor: ProfilePreferenceExtractor | None = None, conversation_memory: ConversationMemoryService | None = None) -> None:
         self.store = store
         self.trace = trace
         self.executor = executor
@@ -99,6 +101,9 @@ class MainAgent:
         self.checkpoint_store = checkpoint_store
         self.memory = memory
         self.memory_extractor = MemoryExtractor()
+        self.profile_service = profile_service
+        self.profile_extractor = profile_extractor or ProfilePreferenceExtractor()
+        self.conversation_memory = conversation_memory
         self.working_memory_updater = WorkingMemoryUpdater(store)
         self.knowledge = knowledge or KnowledgeRetriever()
         self.model_adapter = model_adapter
@@ -173,6 +178,9 @@ class MainAgent:
         intent: IntentResult | None = None
         plan: Plan | None = None
         request_frame: RequestFrame | None = prepared_request.frame
+        if self.conversation_memory is not None:
+            self.conversation_memory.apply_request(request, request_frame, task, run)
+        self._apply_profile_preference(request)
         datasets = []
         phase = "created"
         await self.trace.emit(
@@ -216,6 +224,8 @@ class MainAgent:
                     self.working_memory_updater.add_unresolved_questions(task.id, request_frame.blocking_issues, run_id=run.id)
                 run = finish_run(run, RunStatus.WAITING_USER, error=result.error)
                 self.store.save_run(run.model_copy(update={"metadata": {**run.metadata, "result": result.model_dump(mode="json")}}))
+                if self.conversation_memory is not None:
+                    self.conversation_memory.apply_result(request, run, result)
                 await self._checkpoint(run.id, "run_completed", {"status": run.status.value, "result": result.model_dump(mode="json")})
                 await self.trace.emit(run.id, EventType.RUN_FAILED, result.summary, payload={"status": run.status.value, "result": result.model_dump(mode="json")}, agent_id="main")
                 return result
@@ -300,6 +310,8 @@ class MainAgent:
             if self.memory:
                 candidates = self.memory_extractor.extract(request, request_frame, run, result, user_id=request.user_id)
                 self.memory.write_candidates(candidates)
+            if self.conversation_memory is not None:
+                self.conversation_memory.apply_result(request, run, result)
             await self._checkpoint(run.id, "run_completed", {"status": final_status.value, "result": result.model_dump(mode="json")})
             if task is not None and prepared_request.action in {"create_task", "bind_task", "retry_run"}:
                 self.task_service.update(task, status=_task_status_for_result(result.status), result=result.summary)
@@ -430,6 +442,13 @@ class MainAgent:
                 return adapter
         return self.model_adapter
 
+    def _apply_profile_preference(self, request: AgentRequest) -> None:
+        if self.profile_service is None or not request.user_id:
+            return
+        changes = self.profile_extractor.extract(request.user_input)
+        if changes:
+            self.profile_service.update(request.user_id, changes)
+
     def _model_user_message(self, request: AgentRequest, run: Run, datasets, intent: IntentResult | None, plan: Plan | None, request_frame: RequestFrame | None = None, *, working_memory: WorkingMemory | None = None) -> str:
         history = self.store.list_messages(request.conversation_id, limit=20)
         if history and history[-1].role == "user" and history[-1].content == request.user_input:
@@ -450,6 +469,8 @@ class MainAgent:
                 }
             )
         memories = self.memory.recall(request.user_input, scope="project", user_id=request.user_id, limit=5) if self.memory else []
+        user_profile = self.profile_service.get_or_create(request.user_id) if self.profile_service and request.user_id else None
+        conversation_memory = self.conversation_memory.get(request.conversation_id, request.user_id) if self.conversation_memory and request.user_id else None
         referenced_runs = [
             item.model_dump(mode="json")
             for item in self.request_understanding.reference_resolver.resolve_runs(request.referenced_run_ids, conversation_id=request.conversation_id, exclude_run_id=run.id)
@@ -467,8 +488,10 @@ class MainAgent:
             referenced_runs=referenced_runs,
             intent_hint=intent,
             request_frame=request_frame,
+            user_profile=user_profile,
+            conversation_memory=conversation_memory,
         )
-        return "请先理解用户真正想完成的事情，再决定下一步。以下上下文中的 deterministic_hint 只是离线规则生成的提示，可能不准确，不能当作已经确认的意图或固定流水线。你可以直接用中文回答、询问缺失信息、调用一个或多个工具，并在每次工具返回后重新判断是否继续。只有用户明确需要数据处理或检查时才调用工具；问候、闲聊、解释概念不要调用工具。不要自行挑选不明确的数据集，不要编造工具结果。\n" + json.dumps(context, ensure_ascii=False, default=str)
+        return "请先理解用户真正想完成的事情，再决定下一步。当前用户请求和 RequestFrame 优先级最高，其次是当前任务 WorkingMemory、ConversationMemory、ProjectMemory，UserProfile 只作为默认交互偏好，不能覆盖本次明确请求。以下上下文中的 deterministic_hint 只是离线规则生成的提示，可能不准确，不能当作已经确认的意图或固定流水线。你可以直接用中文回答、询问缺失信息、调用一个或多个工具，并在每次工具返回后重新判断是否继续。只有用户明确需要数据处理或检查时才调用工具；问候、闲聊、解释概念不要调用工具。不要自行挑选不明确的数据集，不要编造工具结果。\n" + json.dumps(context, ensure_ascii=False, default=str)
 
     def _model_tools(self) -> list[dict[str, Any]]:
         common_schema = {

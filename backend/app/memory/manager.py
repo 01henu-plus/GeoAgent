@@ -89,6 +89,7 @@ class MemoryManager:
 def _terms(value: str) -> set[str]:
     normalized = value.casefold()
     tokens = set(re.findall(r"[a-z0-9_:.+-]+", normalized))
+    tokens.update(part for token in tuple(tokens) for part in token.split("_") if part)
     for sequence in re.findall(r"[\u3400-\u9fff]+", normalized):
         tokens.update(sequence[index : index + 2] for index in range(len(sequence) - 1))
         tokens.update(sequence)

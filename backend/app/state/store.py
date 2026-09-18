@@ -19,6 +19,7 @@ from app.core.models import (
     Artifact,
     Checkpoint,
     Conversation,
+    ConversationMemory,
     Dataset,
     MemoryItem,
     Message,
@@ -29,6 +30,7 @@ from app.core.models import (
     ToolResult,
     TraceEvent,
     User,
+    UserProfile,
     UserSession,
     WorkingMemory,
     utc_now,
@@ -43,6 +45,12 @@ CREATE TABLE IF NOT EXISTS conversations (
     title TEXT NOT NULL,
     user_id TEXT,
     created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conversation_memories (
+    conversation_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS messages (
@@ -136,6 +144,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
     last_seen_at TEXT
+);
+CREATE TABLE IF NOT EXISTS user_profiles (
+    user_id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS trace_events (
     id TEXT PRIMARY KEY,
@@ -280,6 +293,27 @@ class StateStore:
             db.commit()
         return cursor.rowcount > 0
 
+    def save_user_profile(self, profile: UserProfile) -> None:
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO user_profiles(user_id,payload_json,updated_at) VALUES(?,?,?)
+                ON CONFLICT(user_id) DO UPDATE SET payload_json=excluded.payload_json,
+                updated_at=excluded.updated_at""",
+                (profile.user_id, profile.model_dump_json(), profile.updated_at.isoformat()),
+            )
+            db.commit()
+
+    def get_user_profile(self, user_id: str) -> UserProfile | None:
+        with self._connect() as db:
+            row = db.execute("SELECT payload_json FROM user_profiles WHERE user_id=?", (user_id,)).fetchone()
+        return self._model(UserProfile, row[0]) if row else None
+
+    def delete_user_profile(self, user_id: str) -> bool:
+        with self._connect() as db:
+            cursor = db.execute("DELETE FROM user_profiles WHERE user_id=?", (user_id,))
+            db.commit()
+        return cursor.rowcount > 0
+
     def upsert_conversation(self, conversation_id: str, title: str, timestamp: str, user_id: str | None = None) -> None:
         with self._connect() as db:
             db.execute(
@@ -324,7 +358,34 @@ class StateStore:
             else:
                 cursor = db.execute("DELETE FROM conversations WHERE id=? AND user_id=?", (conversation_id, user_id))
             if cursor.rowcount:
+                db.execute("DELETE FROM conversation_memories WHERE conversation_id=?", (conversation_id,))
                 db.execute("DELETE FROM working_memories WHERE conversation_id=?", (conversation_id,))
+            db.commit()
+        return cursor.rowcount > 0
+
+    def save_conversation_memory(self, memory: ConversationMemory) -> None:
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO conversation_memories(conversation_id,user_id,payload_json,updated_at) VALUES(?,?,?,?)
+                ON CONFLICT(conversation_id) DO UPDATE SET user_id=excluded.user_id,
+                payload_json=excluded.payload_json, updated_at=excluded.updated_at""",
+                (memory.conversation_id, memory.user_id, memory.model_dump_json(), memory.updated_at.isoformat()),
+            )
+            db.commit()
+
+    def get_conversation_memory(self, conversation_id: str) -> ConversationMemory | None:
+        with self._connect() as db:
+            row = db.execute("SELECT payload_json FROM conversation_memories WHERE conversation_id=?", (conversation_id,)).fetchone()
+        return self._model(ConversationMemory, row[0]) if row else None
+
+    def get_conversation_memory_for_user(self, conversation_id: str, user_id: str) -> ConversationMemory | None:
+        with self._connect() as db:
+            row = db.execute("SELECT payload_json FROM conversation_memories WHERE conversation_id=? AND user_id=?", (conversation_id, user_id)).fetchone()
+        return self._model(ConversationMemory, row[0]) if row else None
+
+    def delete_conversation_memory(self, conversation_id: str) -> bool:
+        with self._connect() as db:
+            cursor = db.execute("DELETE FROM conversation_memories WHERE conversation_id=?", (conversation_id,))
             db.commit()
         return cursor.rowcount > 0
 

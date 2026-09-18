@@ -31,7 +31,7 @@ def inspect_dataset(arguments: dict[str, Any], context: ToolContext) -> dict:
     dataset = registry.resolve(identifier) if identifier else None
     if dataset is None and arguments.get("path"):
         path = context.services["workspace"].resolve(arguments["path"], allow_missing=False)
-        dataset = registry.register_path(path, name=arguments.get("name"))
+        dataset = registry.register_path(path, name=arguments.get("name"), run_id=context.run_id)
     dataset = dataset or dataset_from_context(context, identifier)
     return {"output": dataset.model_dump(mode="json"), "datasets": [dataset.id]}
 
@@ -40,4 +40,3 @@ def register_dataset(arguments: dict[str, Any], context: ToolContext) -> dict:
     path = context.services["workspace"].resolve(arguments.get("path", ""), allow_missing=False)
     dataset = context.services["registry"].register_path(path, name=arguments.get("name"), run_id=context.run_id)
     return {"output": dataset.model_dump(mode="json"), "datasets": [dataset.id]}
-

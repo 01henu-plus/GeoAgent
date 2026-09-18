@@ -1,4 +1,8 @@
-"""在 GeoAgent workspace 中运行 Python 脚本。"""
+"""在 GeoAgent workspace 中运行受信任的本地 Python 脚本。
+
+WorkspaceManager 只提供路径边界，不构成通用 Python 的 OS 级安全沙箱。
+是否允许 Agent 调用该能力由 GEOAGENT_ENABLE_UNSAFE_PYTHON 控制。
+"""
 
 from __future__ import annotations
 
@@ -21,8 +25,8 @@ class PythonExecutor:
     def execute(self, code: str, *, cancel_event: Event | None = None) -> PythonExecutionResult:
         if not code.strip():
             raise ValueError("Python code 不能为空。")
-        if re.search(r"(?:\.\.[\\/]|[A-Za-z]:[\\/]|\\\\)", code):
-            raise PermissionError("Python 代码中的路径必须位于当前用户 workspace 内。")
+        if re.search(r"(?:\.\.[\\/]|[A-Za-z]:[\\/]|\\\\)", code) or re.search(r"(?<![\w])/(?:etc|tmp|home|root|var|usr|bin|opt)(?:[\\/\s'\")]|$)", code):
+            raise PermissionError("Python 代码包含明显的 workspace 外部绝对路径或路径穿越。")
         before = self.workspace.snapshot()
         script = self.workspace.temp_dir / f"run_{uuid.uuid4().hex[:10]}.py"
         script.write_text(code, encoding="utf-8")

@@ -7,11 +7,13 @@ from typing import Any
 
 from app.core.models import (
     AgentRequest,
+    ConversationMemory,
     Dataset,
     IntentResult,
     MemoryItem,
     Plan,
     RequestFrame,
+    UserProfile,
     WorkingMemory,
 )
 
@@ -36,6 +38,8 @@ class ContextManager:
         errors: list[str] | None = None,
         intent_hint: IntentResult | None = None,
         request_frame: RequestFrame | None = None,
+        user_profile: UserProfile | dict[str, Any] | None = None,
+        conversation_memory: ConversationMemory | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         context = {
             "user_request": request.user_input,
@@ -51,7 +55,9 @@ class ContextManager:
             "conversation": conversation or [],
             "tool_definitions": tool_definitions or [],
             "working_memory": _dump_working_memory(working_memory),
+            "conversation_memory": _dump_model(conversation_memory),
             "project_memory": [memory.model_dump(mode="json") for memory in memories],
+            "user_profile": _dump_model(user_profile),
             "referenced_runs": referenced_runs or [],
             "findings": findings or [],
             "errors": errors or [],
@@ -130,5 +136,13 @@ def _dump_working_memory(value: WorkingMemory | dict[str, Any] | None) -> dict[s
     if value is None:
         return {}
     if isinstance(value, WorkingMemory):
+        return value.model_dump(mode="json")
+    return dict(value)
+
+
+def _dump_model(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     return dict(value)

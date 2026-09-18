@@ -13,7 +13,7 @@ def register_runtime_tools(registry: ToolRegistry) -> None:
     registry.register(
         ToolMetadata(
             name="python.execute",
-            description="在 workspace 沙箱中执行 Python GIS 代码",
+            description="在受信任的本地运行时执行 Python GIS 代码（默认关闭）",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -53,6 +53,12 @@ def register_runtime_tools(registry: ToolRegistry) -> None:
 
 
 def python_execute(arguments: dict[str, Any], context: ToolContext) -> dict:
+    if not context.services.get("allow_unsafe_python", False):
+        raise GISFailure(
+            "UNSAFE_PYTHON_DISABLED",
+            "通用 Python 执行默认关闭；仅在受信任的本地运行时显式开启 GEOAGENT_ENABLE_UNSAFE_PYTHON 后使用。",
+            category=ErrorCategory.PERMISSION,
+        )
     result = context.services["python"].execute(arguments.get("code", ""), cancel_event=context.cancel_event)
     if result.returncode != 0:
         raise GISFailure("PYTHON_EXECUTION_FAILED", result.stderr or "Python 执行失败。", category=ErrorCategory.EXECUTION, details={"returncode": result.returncode}, retryable=False)
