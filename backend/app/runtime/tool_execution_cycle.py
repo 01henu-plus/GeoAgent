@@ -11,7 +11,6 @@ from app.decision.failure_analyzer import FailureAnalyzer
 from app.decision.verifier import ResultVerifier
 from app.events import EventType
 from app.gis.crs.service import CRSService
-from app.state.working_memory import WorkingMemoryUpdater
 
 RawToolExecutor = Callable[..., Awaitable[ToolResult]]
 
@@ -44,7 +43,6 @@ class ToolExecutionCycle:
         failure_analyzer: FailureAnalyzer,
         verifier: ResultVerifier,
         budget: RunBudget,
-        working_memory_updater: WorkingMemoryUpdater,
         default_crs: str = "EPSG:3857",
     ) -> None:
         self.raw_executor = raw_executor
@@ -54,7 +52,6 @@ class ToolExecutionCycle:
         self.failure_analyzer = failure_analyzer
         self.verifier = verifier
         self.budget = budget
-        self.working_memory_updater = working_memory_updater
         self.default_crs = default_crs
 
     async def execute(
@@ -155,8 +152,6 @@ class ToolExecutionCycle:
                 )
 
         accepted = verified
-        if accepted:
-            self.working_memory_updater.update_from_tool_result(run.task_id, current, run_id=run.id)
 
         return ExecutionOutcome(
             result=current,

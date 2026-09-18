@@ -123,7 +123,6 @@ class MainAgent:
             failure_analyzer=self.failure_analyzer,
             verifier=self.verifier,
             budget=self.budget,
-            working_memory_updater=self.working_memory_updater,
             default_crs=self.settings.default_crs,
         )
         self.knowledge = knowledge or KnowledgeRetriever()
@@ -491,6 +490,7 @@ class MainAgent:
                     }
                 )
                 if execution_outcome is not None and execution_outcome.accepted:
+                    self._accept_main_tool_result(run, tool_result)
                     dataset_ids.update(tool_result.datasets)
                     artifact_ids.update(tool_result.artifacts)
                 protocol_messages.append(protocol_tool_message(execution_outcome or observation))
@@ -754,6 +754,8 @@ class MainAgent:
                 completed_arguments,
                 user_id=request.user_id,
             )
+            if outcome.accepted:
+                self._accept_main_tool_result(run, outcome.result)
             return outcome
 
         async def checkpoint(completed_steps, state):
@@ -792,6 +794,11 @@ class MainAgent:
         operation = str(plan.metadata.get("operation") or intent.entities.get("operation") or "")
         status = AgentResultStatus.PARTIAL if outcome.errors else AgentResultStatus.SUCCESS
         return AgentResult(agent_id="main", task_id=task.id, status=status, summary=_plan_result_summary(operation, plan, list(outcome.findings), list(outcome.output_ids), list(outcome.artifacts)), findings=list(outcome.findings), datasets=list(outcome.output_ids), artifacts=list(outcome.artifacts), warnings=list(outcome.errors), error=outcome.errors[0] if outcome.errors and not outcome.findings else None, trace_id=run.id)
+
+    def _accept_main_tool_result(self, run: Run, result: ToolResult) -> None:
+        """MainAgent 作为 Task 状态所有者，显式接收已验证的 Tool 结果。"""
+
+        self.working_memory_updater.update_from_tool_result(run.task_id, result, run_id=run.id)
 
     def _complete_plan_arguments(self, tool_name: str, arguments: dict[str, Any], *, user_id: str | None = None) -> dict[str, Any]:
         """补齐只有运行时才能确定的参数，例如自动选择投影 CRS。"""
@@ -899,14 +906,40 @@ class MainAgent:
         if parent_memory is not None:
             parent_memory = self.working_memory_updater.merge_deltas(parent_memory, deltas)
             self.store.save_working_memory(parent_memory)
-        findings = [{"agent_id": item.agent_id, "summary": item.summary, "status": item.status.value, "findings": item.findings} for item in results]
+        findings = [
+            {
+                "agent_id": item.agent_id,
+                "summary": item.summary,
+                "status": item.status.value,
+                "directive": execution.directive.value,
+                "failure_rationale": execution.failure_rationale,
+                "findings": item.findings,
+            }
+            for execution, item in zip(executions, results, strict=True)
+        ]
         output_ids = sorted({dataset_id for item in results for dataset_id in item.datasets})
         artifacts = sorted({artifact_id for item in results for artifact_id in item.artifacts})
         failed_required = [item for item, subtask in zip(results, tasks, strict=True) if subtask.required and item.status in {AgentResultStatus.FAILED, AgentResultStatus.BLOCKED}]
         failed_any = [item for item in results if item.status is not AgentResultStatus.SUCCESS]
         status = AgentResultStatus.FAILED if failed_required and len(failed_any) == len(tasks) else AgentResultStatus.PARTIAL if failed_any else AgentResultStatus.SUCCESS
         summary = f"已并行完成 {len(results) - len(failed_any)}/{len(results)} 个主题分析，并汇总结果。"
-        result = AgentResult(agent_id="main", task_id=run.task_id, status=status, summary=summary, findings=findings, datasets=output_ids, artifacts=artifacts, warnings=[item.error for item in failed_any if item.error], trace_id=run.id)
+        required_executions = [execution for execution, subtask in zip(executions, tasks, strict=True) if subtask.required]
+        directive = _aggregate_subagent_directive(required_executions)
+        if directive is LoopDirective.ASK_USER:
+            status = AgentResultStatus.BLOCKED
+            summary = "部分子任务需要补充用户信息后才能继续。"
+            error = "WAITING_USER"
+        elif directive is LoopDirective.REPLAN:
+            status = AgentResultStatus.BLOCKED
+            summary = "部分子任务当前执行策略不适用，需要重新规划。"
+            error = "REPLAN_REQUIRED"
+        elif directive is LoopDirective.ABORT and required_executions and all(item.directive is LoopDirective.ABORT for item in required_executions):
+            status = AgentResultStatus.FAILED
+            summary = "所有必需子任务均执行失败。"
+            error = next((item.result.error for item in required_executions if item.result.error), "SubAgent 执行失败")
+        else:
+            error = next((item.error for item in failed_any if item.error), None)
+        result = AgentResult(agent_id="main", task_id=run.task_id, status=status, summary=summary, findings=findings, datasets=output_ids, artifacts=artifacts, warnings=[item.error for item in failed_any if item.error], error=error, trace_id=run.id)
         if plan is not None and intent is not None:
             _set_plan_step_status(plan, "parallel", TaskStatus.SUCCEEDED)
             _set_plan_step_status(plan, "synthesize", TaskStatus.SUCCEEDED)
@@ -950,6 +983,19 @@ def _set_plan_step_status(plan: Plan, step_id: str, status: TaskStatus) -> None:
     step = next((item for item in plan.steps if item.id == step_id), None)
     if step is not None:
         step.status = status
+
+
+def _aggregate_subagent_directive(executions: list[Any]) -> LoopDirective:
+    """按必需子任务聚合控制信号：用户信息优先于重新规划，再优先于终止。"""
+
+    directives = {item.directive for item in executions}
+    if LoopDirective.ASK_USER in directives:
+        return LoopDirective.ASK_USER
+    if LoopDirective.REPLAN in directives:
+        return LoopDirective.REPLAN
+    if LoopDirective.ABORT in directives:
+        return LoopDirective.ABORT
+    return LoopDirective.CONTINUE
 
 
 def _plan_result_summary(operation: str, plan: Plan, findings: list[Any], datasets: list[str], artifacts: list[str]) -> str:
