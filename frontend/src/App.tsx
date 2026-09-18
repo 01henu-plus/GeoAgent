@@ -1,18 +1,16 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { api, Artifact, Conversation, Dataset, Event, ModelStatus, Result, Run } from "./api";
+import { api, Artifact, Conversation, Dataset, Event, fetchRunView, ModelStatus, Result, Run } from "./api";
+import { childRunsOf, eventRuns, groupRunsByTask, interactionModeLabel, isActiveRun, isMainRun, lineageSource, RESUMABLE_RUN_STATUSES, runTitle, runsForConversation } from "./domain";
 
 type View = "chat" | "datasets" | "agents" | "runs" | "results" | "settings";
-type ChatMessage = { id: string; role: "user" | "assistant"; content: string; result?: Result; events?: Event[]; durationMs?: number };
-
-const ACTIVE_RUN_STATUSES = new Set(["CREATED", "PLANNING", "RUNNING", "WAITING_TOOL", "WAITING_SUBAGENT", "RETRYING", "REPLANNING", "VALIDATING"]);
-const RESUMABLE_RUN_STATUSES = new Set(["CANCELLED", "INTERRUPTED"]);
+type ChatMessage = { id: string; role: "user" | "assistant"; content: string; result?: Result; events?: Event[]; artifacts?: Artifact[]; durationMs?: number };
 
 const STATUS_LABELS: Record<string, string> = {
   CREATED: "已创建",
   PLANNING: "规划中",
   RUNNING: "运行中",
   WAITING_TOOL: "等待工具",
-  WAITING_SUBAGENT: "等待临时智能体",
+  WAITING_SUBAGENT: "等待子智能体",
   WAITING_USER: "等待补充信息",
   WAITING_APPROVAL: "等待确认",
   RETRYING: "重试中",
@@ -23,7 +21,7 @@ const STATUS_LABELS: Record<string, string> = {
   SUCCESS: "成功",
   PARTIAL: "部分完成",
   FAILED: "失败",
-  BLOCKED: "已阻止",
+  BLOCKED: "已阻塞",
   CANCELLED: "已取消",
   INTERRUPTED: "已中断",
   BUDGET_EXCEEDED: "超出预算",
@@ -56,7 +54,7 @@ const EVENT_LABELS: Record<string, string> = {
   PlanCreated: "已生成执行计划",
   DecisionMade: "已确定下一步动作",
   SubTaskCreated: "已创建子任务",
-  SubAgentSpawned: "已启动临时智能体",
+  SubAgentSpawned: "已启动子智能体",
   ToolStarted: "工具开始执行",
   ToolCompleted: "工具执行完成",
   ToolFailed: "工具执行失败",
@@ -67,7 +65,7 @@ const EVENT_LABELS: Record<string, string> = {
   ArtifactCreated: "已生成结果文件",
   VerificationStarted: "开始验证结果",
   VerificationFailed: "结果验证失败",
-  SubAgentCompleted: "临时智能体已完成",
+  SubAgentCompleted: "子智能体已完成",
   CheckpointSaved: "已保存检查点",
   ResumeStarted: "开始恢复运行",
   RunCompleted: "运行完成",
@@ -154,11 +152,11 @@ function formatLabel(value: string): string {
 }
 
 function eventLabel(value: string): string {
-  return EVENT_LABELS[value] ?? "运行事件";
+  return EVENT_LABELS[value] ?? value;
 }
 
 function agentLabel(value: string): string {
-  return value === "main" ? "主智能体" : "临时智能体";
+  return value === "main" ? "主智能体" : "子智能体";
 }
 
 function replaceText(value: string, search: string, replacement: string): string {
@@ -168,7 +166,7 @@ function replaceText(value: string, search: string, replacement: string): string
 function displayEventMessage(message: string): string {
   let displayed = message;
   for (const [name, label] of Object.entries(TOOL_LABELS)) displayed = replaceText(displayed, name, label);
-  for (const [name, label] of [["Main Agent", "主智能体"], ["SubAgent", "临时智能体"], ["Dataset", "数据集"], ["Artifact", "结果文件"], ["Checkpoint", "检查点"], ["Tool", "工具"], ["CRS", "坐标系"], ["road", "道路"], ["population", "人口"], ["terrain", "地形"], ["SUCCESS", "成功"], ["PARTIAL_SUCCESS", "部分成功"], ["FAILED", "失败"], ["CANCELLED", "已取消"]]) {
+  for (const [name, label] of [["Main Agent", "主智能体"], ["SubAgent", "子智能体"], ["Dataset", "数据集"], ["Artifact", "结果文件"], ["Checkpoint", "检查点"], ["Tool", "工具"], ["CRS", "坐标系"], ["road", "道路"], ["population", "人口"], ["terrain", "地形"], ["SUCCESS", "成功"], ["PARTIAL_SUCCESS", "部分完成"], ["FAILED", "失败"], ["CANCELLED", "已取消"]]) {
     displayed = replaceText(displayed, name, label);
   }
   return displayed;
@@ -217,6 +215,7 @@ export function App() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [datasets, setDatasets] = useState<Dataset[]>([]);
+  const [selectedDatasetIds, setSelectedDatasetIds] = useState<string[]>([]);
   const [uploadedFiles, setUploadedFiles] = useState<Dataset[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
@@ -234,11 +233,15 @@ export function App() {
   const [elapsedMs, setElapsedMs] = useState(0);
   const [streamingReply, setStreamingReply] = useState("");
 
-  // 未显式选择的数据集交给后端 Entry 层按名称、主题和历史结果解析；
-  // 只有本轮通过加号上传的文件作为明确附件传入。
-  const requestDatasetIds: string[] = [];
+  const requestDatasetIds = selectedDatasetIds;
   const requestAttachmentIds = useMemo(() => uploadedFiles.map((item) => item.id), [uploadedFiles]);
-  const agentCount = useMemo(() => new Set(runs.map((item) => item.agent_id)).size, [runs]);
+  const conversationRuns = useMemo(() => runsForConversation(conversationId, runs), [conversationId, runs]);
+  const agentCount = useMemo(() => {
+    const active = conversationRuns.filter(isActiveRun).length;
+    if (active > 0) return active;
+    const latestMain = conversationRuns.find(isMainRun);
+    return latestMain ? 1 + childRunsOf(latestMain.id, conversationRuns).length : 0;
+  }, [conversationRuns]);
 
   useEffect(() => {
     if (!busy || runStartedAt === null) return;
@@ -267,10 +270,29 @@ export function App() {
   const loadConversation = async (id: string) => {
     try {
       const history = await api.messages(id);
-      setMessages(history.map((item) => ({ id: item.id, role: item.role === "user" ? "user" : "assistant", content: item.content })));
-      setResult(null);
-      setEvents([]);
-      setArtifacts([]);
+      setSelectedDatasetIds([]);
+      setUploadedFiles([]);
+      setSelectedRunId(null);
+      setActiveRunId(null);
+      setStreamingReply("");
+      const restored = await Promise.all(history.map(async (item) => {
+        const base: ChatMessage = { id: item.id, role: item.role === "user" ? "user" : "assistant", content: item.content };
+        if (base.role !== "assistant" || !item.run_id) return base;
+        try {
+          const details = await fetchRunView(item.run_id, runs);
+          const started = details.run.started_at ? Date.parse(details.run.started_at) : NaN;
+          const finished = details.run.finished_at ? Date.parse(details.run.finished_at) : NaN;
+          const durationMs = Number.isFinite(started) && Number.isFinite(finished) ? Math.max(0, finished - started) : undefined;
+          return { ...base, content: details.result?.summary ?? base.content, result: details.result ?? undefined, events: details.events, artifacts: details.artifacts, durationMs };
+        } catch {
+          return base;
+        }
+      }));
+      setMessages(restored);
+      const latest = [...restored].reverse().find((item) => item.result);
+      setResult(latest?.result ?? null);
+      setEvents(latest?.events ?? []);
+      setArtifacts(latest?.artifacts ?? []);
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -323,7 +345,10 @@ export function App() {
       setEvents([]);
       setArtifacts([]);
       setResult(null);
+      setSelectedDatasetIds([]);
       setUploadedFiles([]);
+      setSelectedRunId(null);
+      setActiveRunId(null);
       setView("chat");
       setError("");
       setPendingDeleteId(null);
@@ -351,6 +376,10 @@ export function App() {
         setResult(null);
         setEvents([]);
         setArtifacts([]);
+        setSelectedDatasetIds([]);
+        setUploadedFiles([]);
+        setSelectedRunId(null);
+        setActiveRunId(null);
         setPendingDeleteId(null);
         return;
       }
@@ -371,11 +400,10 @@ export function App() {
     setArtifacts([]);
     setError("");
     try {
-      setEvents(await api.events(runId));
-      const run = await api.run(runId);
-      const saved = run.metadata.result;
-      if (saved && typeof saved === "object") setResult(saved as Result);
-      setArtifacts(await api.artifacts(runId));
+      const details = await fetchRunView(runId, runs);
+      setEvents(details.events);
+      setResult(details.result);
+      setArtifacts(details.artifacts);
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -394,25 +422,28 @@ export function App() {
     setStreamingReply("");
     setMessage("");
     setMessages((current) => [...current, { id: `local-user-${Date.now()}`, role: "user", content: prompt }]);
-    let streamedEvents: Event[] = [];
     try {
       const next = await api.streamAsk(
         prompt,
         requestDatasetIds,
         requestAttachmentIds,
         (run) => { setActiveRunId(run.id); setSelectedRunId(run.id); },
-        (event) => { streamedEvents = [...streamedEvents, event]; setEvents((current) => [...current, event]); },
+        (event) => { setEvents((current) => [...current, event]); },
         (content) => setStreamingReply((current) => current + content),
         conversationId,
         selectedModelProfile,
       );
       const durationMs = Math.round(performance.now() - startedAt);
-      setResult(next);
-      setMessages((current) => [...current, { id: `local-assistant-${next.trace_id}`, role: "assistant", content: next.summary, result: next, events: streamedEvents, durationMs }]);
+      const details = await fetchRunView(next.trace_id);
+      const finalResult = details.result ?? next;
+      setResult(finalResult);
+      setEvents(details.events);
+      setArtifacts(details.artifacts);
+      setMessages((current) => [...current, { id: `local-assistant-${finalResult.trace_id}`, role: "assistant", content: finalResult.summary, result: finalResult, events: details.events, durationMs }]);
+      setSelectedDatasetIds([]);
+      setUploadedFiles([]);
       await refresh();
       await loadConversations();
-      setEvents(await api.events(next.trace_id));
-      setArtifacts(await api.artifacts(next.trace_id));
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -428,7 +459,12 @@ export function App() {
     try {
       await api.cancelRun(runId);
       await refresh();
-      if (selectedRunId === runId) setEvents(await api.events(runId));
+      if (selectedRunId === runId) {
+        const details = await fetchRunView(runId);
+        setEvents(details.events);
+        setResult(details.result);
+        setArtifacts(details.artifacts);
+      }
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -475,12 +511,13 @@ export function App() {
     setError("");
     try {
       const resumed = await api.resumeRun(runId);
-      setResult(resumed.result);
       setSelectedRunId(resumed.run_id);
       setView("results");
       await refresh();
-      setEvents(await api.events(resumed.run_id));
-      setArtifacts(await api.artifacts(resumed.run_id));
+      const details = await fetchRunView(resumed.run_id);
+      setResult(details.result ?? resumed.result);
+      setEvents(details.events);
+      setArtifacts(details.artifacts);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -519,18 +556,18 @@ export function App() {
   return <div className="shell">
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark">G</span><div><b>GeoAgent</b><small>空间智能</small></div></div>
-      <section className="sidebar-block workspace-block"><div className="sidebar-block-title">工作区</div><Nav label="数据集" icon="◇" count={datasets.length} active={view === "datasets"} onClick={() => setView("datasets")} /><Nav label="智能体" icon="◎" count={agentCount} active={view === "agents"} onClick={() => setView("agents")} /><Nav label="运行与追踪" icon="⌁" count={runs.length} active={view === "runs"} onClick={() => setView("runs")} /><Nav label="结果" icon="▣" active={view === "results"} onClick={() => setView("results")} /></section>
+      <section className="sidebar-block workspace-block"><div className="sidebar-block-title">工作区</div><Nav label="数据集" icon="◇" count={datasets.length} active={view === "datasets"} onClick={() => setView("datasets")} /><Nav label="智能体" icon="◎" count={agentCount} active={view === "agents"} onClick={() => setView("agents")} /><Nav label="运行与追踪" icon="⌁" count={conversationRuns.length} active={view === "runs"} onClick={() => setView("runs")} /><Nav label="结果" icon="▣" active={view === "results"} onClick={() => setView("results")} /></section>
       <section className="sidebar-block conversation-block"><div className="sidebar-block-head"><span>对话</span><button type="button" className="new-conversation" aria-label="新建对话" title="新建对话" disabled={busy} onClick={() => void createNewConversation()}>＋</button></div><div className="conversation-list">{conversations.length === 0 ? <span className="conversation-empty">正在加载对话…</span> : conversations.map((item) => <div className="conversation-row" key={item.id}><button type="button" className={`conversation-select ${item.id === conversationId ? "active" : ""}`} disabled={busy} onClick={() => void selectConversation(item.id)}><span className="conversation-dot" /><span className="conversation-title">{item.title || "新对话"}</span></button><button type="button" className="conversation-delete" aria-label={`删除对话 ${item.title}`} title="删除对话" disabled={busy} onClick={() => setPendingDeleteId((current) => current === item.id ? null : item.id)}>×</button>{pendingDeleteId === item.id && <div className="conversation-confirm" role="dialog" aria-label={`确认删除对话 ${item.title}`}><span>删除这个对话？</span><div><button type="button" className="conversation-confirm-delete" onClick={() => void deleteConversation(item)}>删除</button><button type="button" className="conversation-confirm-cancel" onClick={() => setPendingDeleteId(null)}>取消</button></div></div>}</div>)}</div></section>
       <div className="account-area">{accountOpen && <div className="account-menu"><button type="button" onClick={() => { setView("settings"); setAccountOpen(false); }}>设置</button><div className="account-menu-note">当前为本地用户模式</div></div>}<button type="button" className="account-button" aria-expanded={accountOpen} onClick={() => setAccountOpen((current) => !current)}><span className="account-avatar">本</span><span className="account-copy"><b>本地用户</b><small>已登录</small></span><span className={`account-chevron ${accountOpen ? "open" : ""}`}>⌃</span></button></div>
     </aside>
     <main className="main">
       {view !== "chat" && <header className="topbar"><div><h1>{view === "datasets" ? "数据集登记" : view === "agents" ? "智能体活动" : view === "runs" ? "运行追踪" : view === "settings" ? "设置" : "结果中心"}</h1></div><div className="topbar-actions"><button className="ghost" onClick={() => setView("chat")}>返回对话</button><button className="close-view" type="button" aria-label="关闭当前页面" title="关闭" onClick={() => setView("chat")}>×</button><button className="ghost" onClick={() => void refresh()}>↻ 刷新</button></div></header>}
       {error && <div className="error">{error}</div>}
-      {view === "chat" && <Chat message={message} setMessage={setMessage} busy={busy} conversationReady={Boolean(conversationId)} streamingReply={streamingReply} elapsedMs={elapsedMs} send={send} cancel={() => activeRunId ? cancelRun(activeRunId) : Promise.resolve()} activeRunId={activeRunId} events={events} messages={messages} onShowResult={(next) => { setResult(next); setView("results"); }} uploadedFiles={uploadedFiles} uploading={uploading} onUpload={uploadFiles} onRemoveFile={(id) => setUploadedFiles((current) => current.filter((item) => item.id !== id))} modelStatus={modelStatus} selectedModelProfile={selectedModelProfile} onModelChange={setSelectedModelProfile} />}
-      {view === "datasets" && <DatasetPanel datasets={datasets} onRegister={registerDataset} busy={busy} />}
-      {view === "agents" && <AgentPanel runs={runs} />}
-      {view === "runs" && <RunPanel runs={runs} events={events} onSelect={loadRun} onCancel={cancelRun} onResume={resumeRun} onDelete={deleteRun} onDeleteMany={deleteRunRecords} busy={busy} />}
-      {view === "results" && <ResultPanel result={result} events={events} artifacts={artifacts} />}
+      {view === "chat" && <Chat message={message} setMessage={setMessage} busy={busy} conversationReady={Boolean(conversationId)} streamingReply={streamingReply} elapsedMs={elapsedMs} send={send} cancel={() => activeRunId ? cancelRun(activeRunId) : Promise.resolve()} activeRunId={activeRunId} events={events} messages={messages} onShowResult={(next) => { setResult(next); setView("results"); }} datasets={datasets} selectedDatasetIds={selectedDatasetIds} onRemoveDataset={(id) => setSelectedDatasetIds((current) => current.filter((item) => item !== id))} uploadedFiles={uploadedFiles} uploading={uploading} onUpload={uploadFiles} onRemoveFile={(id) => setUploadedFiles((current) => current.filter((item) => item.id !== id))} modelStatus={modelStatus} selectedModelProfile={selectedModelProfile} onModelChange={setSelectedModelProfile} />}
+      {view === "datasets" && <DatasetPanel datasets={datasets} selectedDatasetIds={selectedDatasetIds} onToggleRequestDataset={(id) => setSelectedDatasetIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])} onRegister={registerDataset} busy={busy} />}
+      {view === "agents" && <AgentPanel runs={conversationRuns} />}
+      {view === "runs" && <RunPanel runs={conversationRuns} selectedRunId={selectedRunId} events={events} onSelect={loadRun} onCancel={cancelRun} onResume={resumeRun} onDelete={deleteRun} onDeleteMany={deleteRunRecords} busy={busy} />}
+      {view === "results" && <ResultPanel result={result} datasets={datasets} events={events} artifacts={artifacts} />}
       {view === "settings" && <SettingsPanel modelStatus={modelStatus} />}
     </main>
   </div>;
@@ -538,22 +575,23 @@ export function App() {
 
 function Nav({ label, icon, count, active, onClick }: { label: string; icon: string; count?: number; active: boolean; onClick: () => void }) { return <button className={`nav ${active ? "active" : ""}`} onClick={onClick}><span>{icon}</span>{label}{count !== undefined && <em>{count}</em>}</button>; }
 
-function Chat({ message, setMessage, busy, conversationReady, streamingReply, elapsedMs, send, cancel, activeRunId, events, messages, onShowResult, uploadedFiles, uploading, onUpload, onRemoveFile, modelStatus, selectedModelProfile, onModelChange }: { message: string; setMessage: (value: string) => void; busy: boolean; conversationReady: boolean; streamingReply: string; elapsedMs: number; send: () => Promise<void>; cancel: () => Promise<void>; activeRunId: string | null; events: Event[]; messages: ChatMessage[]; onShowResult: (result: Result) => void; uploadedFiles: Dataset[]; uploading: boolean; onUpload: (files: FileList | null) => Promise<void>; onRemoveFile: (id: string) => void; modelStatus: ModelStatus | null; selectedModelProfile: string; onModelChange: (value: string) => void }) {
-  return <section className="chat-layout">{(messages.length > 0 || busy) && <div className="chat-history" aria-live="polite">{messages.map((item) => <ChatBubble item={item} onShowResult={onShowResult} key={item.id} />)}{busy && <><RunProgress events={events} durationMs={elapsedMs} live />{streamingReply && <div className="chat-message assistant streaming-message"><div className="chat-bubble">{assistantText(streamingReply)}<span className="typing-cursor" aria-hidden="true" /></div></div>}</>}</div>}<div className="composer"><textarea className="composer-input" value={message} onChange={(e) => setMessage(e.target.value)} rows={2} aria-label="输入空间问题" /><div className="composer-foot"><div className="composer-left"><label className="file-button" title="添加文件" aria-label="添加文件"><span aria-hidden="true">＋</span><input type="file" multiple accept=".geojson,.json,.gpkg,.shp,.zip,.kml,.gml,.tif,.tiff,.img,.vrt,.asc,.csv,.tsv,.parquet,.jsonl" disabled={busy || uploading} onChange={(event) => { void onUpload(event.currentTarget.files); event.currentTarget.value = ""; }} /></label>{uploadedFiles.length > 0 && <div className="file-chips">{uploadedFiles.map((file) => <span className="file-chip" key={file.id}><span className="file-chip-name">📎 {file.name}</span><button type="button" className="file-remove" title={`移除 ${file.name}`} aria-label={`移除 ${file.name}`} onClick={() => onRemoveFile(file.id)}>×</button></span>)}</div>}</div><div className="composer-right">{uploading && <span className="uploading">正在上传…</span>}{modelStatus && (modelStatus.profiles.length > 0 ? <div className="model-picker"><span>模型</span><select value={selectedModelProfile} onChange={(event) => onModelChange(event.target.value)} disabled={busy} aria-label="选择模型">{modelStatus.profiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.label}</option>)}</select></div> : <span className="model-picker-offline">未配置模型</span>)}{busy ? <button className="cancel" onClick={() => void cancel()}>取消运行</button> : <button className="primary send-button" aria-label="发送" title="发送" disabled={!message.trim() || uploading || !conversationReady} onClick={() => void send()}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 10.5 18-7.5-8.5 18-2-8.5L3 10.5Z" /><path d="m10.5 12.5 10.5-9.5" /></svg></button>}</div></div></div></section>;
+function Chat({ message, setMessage, busy, conversationReady, streamingReply, elapsedMs, send, cancel, activeRunId, events, messages, onShowResult, datasets, selectedDatasetIds, onRemoveDataset, uploadedFiles, uploading, onUpload, onRemoveFile, modelStatus, selectedModelProfile, onModelChange }: { message: string; setMessage: (value: string) => void; busy: boolean; conversationReady: boolean; streamingReply: string; elapsedMs: number; send: () => Promise<void>; cancel: () => Promise<void>; activeRunId: string | null; events: Event[]; messages: ChatMessage[]; onShowResult: (result: Result) => void; datasets: Dataset[]; selectedDatasetIds: string[]; onRemoveDataset: (id: string) => void; uploadedFiles: Dataset[]; uploading: boolean; onUpload: (files: FileList | null) => Promise<void>; onRemoveFile: (id: string) => void; modelStatus: ModelStatus | null; selectedModelProfile: string; onModelChange: (value: string) => void }) {
+  return <section className="chat-layout">{(messages.length > 0 || busy) && <div className="chat-history" aria-live="polite">{messages.map((item) => <ChatBubble item={item} onShowResult={onShowResult} key={item.id} />)}{busy && <><RunProgress events={events} durationMs={elapsedMs} live />{streamingReply && <div className="chat-message assistant streaming-message"><div className="chat-bubble">{assistantText(streamingReply)}<span className="typing-cursor" aria-hidden="true" /></div></div>}</>}</div>}<div className="composer"><textarea className="composer-input" value={message} onChange={(e) => setMessage(e.target.value)} rows={2} aria-label="输入空间问题" /><div className="composer-foot"><div className="composer-left"><label className="file-button" title="添加文件" aria-label="添加文件"><span aria-hidden="true">＋</span><input type="file" multiple accept=".geojson,.json,.gpkg,.shp,.zip,.kml,.gml,.tif,.tiff,.img,.vrt,.asc,.csv,.tsv,.parquet,.jsonl" disabled={busy || uploading} onChange={(event) => { void onUpload(event.currentTarget.files); event.currentTarget.value = ""; }} /></label>{selectedDatasetIds.length > 0 && <div className="file-chips request-dataset-chips"><span className="resource-chip-label">数据：</span>{selectedDatasetIds.map((id) => { const dataset = datasets.find((item) => item.id === id); return <span className="file-chip" key={id}><span className="file-chip-name">◇ {dataset?.name ?? id}</span><button type="button" className="file-remove" title={`移除数据集 ${dataset?.name ?? id}`} aria-label={`移除数据集 ${dataset?.name ?? id}`} onClick={() => onRemoveDataset(id)}>×</button></span>; })}</div>}{uploadedFiles.length > 0 && <div className="file-chips request-attachment-chips"><span className="resource-chip-label">附件：</span>{uploadedFiles.map((file) => <span className="file-chip" key={file.id}><span className="file-chip-name">📎 {file.name}</span><button type="button" className="file-remove" title={`移除 ${file.name}`} aria-label={`移除 ${file.name}`} onClick={() => onRemoveFile(file.id)}>×</button></span>)}</div>}</div><div className="composer-right">{uploading && <span className="uploading">正在上传…</span>}{modelStatus && (modelStatus.profiles.length > 0 ? <div className="model-picker"><span>模型</span><select value={selectedModelProfile} onChange={(event) => onModelChange(event.target.value)} disabled={busy} aria-label="选择模型">{modelStatus.profiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.label}</option>)}</select></div> : <span className="model-picker-offline">未配置模型</span>)}{busy ? <button className="cancel" onClick={() => void cancel()}>取消运行</button> : <button className="primary send-button" aria-label="发送" title="发送" disabled={!message.trim() || uploading || !conversationReady} onClick={() => void send()}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 10.5 18-7.5-8.5 18-2-8.5L3 10.5Z" /><path d="m10.5 12.5 10.5-9.5" /></svg></button>}</div></div></div></section>;
 }
 
 function ChatBubble({ item, onShowResult }: { item: ChatMessage; onShowResult: (result: Result) => void }) {
   const result = item.result;
-  const hasDetails = Boolean(result && (result.findings.length > 0 || result.datasets.length > 0 || result.artifacts.length > 0 || result.status !== "SUCCESS"));
-  return <div className={`chat-message ${item.role}`}>{item.durationMs !== undefined && <RunProgress events={item.events ?? []} durationMs={item.durationMs} /> }<div className="chat-bubble">{item.role === "assistant" ? assistantText(item.content) : item.content}</div>{result && hasDetails && <button className="chat-result-link" onClick={() => onShowResult(result)}>查看详细结果</button>}</div>;
+  const hasDetails = Boolean(result && (result.findings.length > 0 || result.datasets.length > 0 || result.artifacts.length > 0 || result.evidence.length > 0 || result.warnings.length > 0 || result.error || result.status !== "SUCCESS"));
+  return <div className={`chat-message ${item.role}`}>{item.durationMs !== undefined && <RunProgress events={item.events ?? []} durationMs={item.durationMs} status={result?.status} /> }<div className="chat-bubble">{item.role === "assistant" ? assistantText(item.content) : item.content}</div>{result && hasDetails && <button className="chat-result-link" onClick={() => onShowResult(result)}>查看详细结果</button>}</div>;
 }
 
-function RunProgress({ events, durationMs, live = false }: { events: Event[]; durationMs: number; live?: boolean }) {
+function RunProgress({ events, durationMs, status, live = false }: { events: Event[]; durationMs: number; status?: string; live?: boolean }) {
   const currentEvent = events[events.length - 1];
-  return <div className="run-progress"><div className="run-progress-head"><span className="run-progress-time">{formatDuration(durationMs)}</span><span className={`run-progress-status ${live ? "running" : "completed"}`}>{live ? "处理中" : "已完成"}</span></div><div className="run-progress-current">{currentEvent ? <><span className="run-progress-marker">✓</span><span>{eventLabel(currentEvent.event_type)}：{displayEventMessage(currentEvent.message)}</span></> : <><span className="run-progress-spinner" />等待智能体事件…</>}</div></div>;
+  const displayStatus = live ? "处理中" : statusLabel(status ?? "COMPLETED");
+  return <div className="run-progress"><div className="run-progress-head"><span className="run-progress-time">{formatDuration(durationMs)}</span><span className={`run-progress-status ${live ? "running" : (status ?? "COMPLETED").toLowerCase()}`}>{displayStatus}</span></div><div className="run-progress-current">{currentEvent ? <><span className="run-progress-marker">✓</span><span>{eventLabel(currentEvent.event_type)}：{displayEventMessage(currentEvent.message)}</span></> : <><span className="run-progress-spinner" />等待智能体事件…</>}</div></div>;
 }
 
-function DatasetPanel({ datasets, onRegister, busy }: { datasets: Dataset[]; onRegister: (path: string, name: string) => Promise<void>; busy: boolean }) {
+function DatasetPanel({ datasets, selectedDatasetIds, onToggleRequestDataset, onRegister, busy }: { datasets: Dataset[]; selectedDatasetIds: string[]; onToggleRequestDataset: (id: string) => void; onRegister: (path: string, name: string) => Promise<void>; busy: boolean }) {
   const [path, setPath] = useState("");
   const [name, setName] = useState("");
   const [registering, setRegistering] = useState(false);
@@ -572,26 +610,23 @@ function DatasetPanel({ datasets, onRegister, busy }: { datasets: Dataset[]; onR
       setRegistering(false);
     }
   };
-  return <section className="panel"><div className="panel-head"><div><span className="eyebrow">已登记数据源</span><h2>数据集登记</h2></div><span className="count-badge">{datasets.length} 个数据集</span></div><form className="dataset-register" onSubmit={(event) => void submit(event)}><input value={path} onChange={(event) => setPath(event.target.value)} placeholder="请输入工作区内的数据文件路径" aria-label="数据文件路径" /><input value={name} onChange={(event) => setName(event.target.value)} placeholder="显示名称（可选）" aria-label="显示名称" /><button className="primary" disabled={busy || registering || !path.trim()}>{registering ? "正在登记…" : "登记数据集"}</button></form>{datasets.length === 0 ? <Empty text="还没有数据集。请输入工作区内的文件路径进行登记。" /> : <div className="dataset-grid">{datasets.map((item) => <div className="dataset-card" key={item.id}><b className="dataset-name">{item.name}</b><button type="button" className="small-action" onClick={() => setPropertyDataset(item)}>属性</button></div>)}</div>}{propertyDataset && <div className="dataset-modal" role="dialog" aria-modal="true" aria-label="数据集属性" onClick={() => setPropertyDataset(null)}><div className="dataset-modal-card" onClick={(event) => event.stopPropagation()}><div className="dataset-modal-head"><div><span className="eyebrow">数据集属性</span><h2>{propertyDataset.name}</h2></div><button type="button" className="modal-close" onClick={() => setPropertyDataset(null)}>关闭</button></div><div className="property-grid"><Property label="数据集编号" value={propertyDataset.id} /><Property label="数据类型" value={kindLabel(propertyDataset.kind)} /><Property label="文件格式" value={formatLabel(propertyDataset.format)} /><Property label="坐标系" value={propertyDataset.crs?.authority ?? "未提供"} /><Property label="坐标系名称" value={propertyDataset.crs?.name ?? "未提供"} /><Property label="要素数量" value={propertyDataset.schema?.feature_count !== undefined ? String(propertyDataset.schema.feature_count) : "不适用"} /><Property label="几何类型" value={propertyDataset.schema?.geometry_type ?? "未提供"} /><Property label="栅格尺寸" value={propertyDataset.schema?.width !== undefined ? `${propertyDataset.schema.width} × ${propertyDataset.schema.height ?? "?"}，${propertyDataset.schema.bands ?? "?"} 个波段` : "不适用"} /><Property label="空间范围" value={propertyDataset.extent ? `${propertyDataset.extent.min_x}, ${propertyDataset.extent.min_y} 至 ${propertyDataset.extent.max_x}, ${propertyDataset.extent.max_y}` : "未提供"} /><Property label="文件路径" value={propertyDataset.path} /><Property label="创建时间" value={propertyDataset.created_at ?? "未提供"} /><Property label="创建运行" value={propertyDataset.created_by_run_id ?? "手动登记或上传"} /></div><h3>字段</h3><pre>{propertyDataset.schema?.fields && Object.keys(propertyDataset.schema.fields).length > 0 ? JSON.stringify(propertyDataset.schema.fields, null, 2) : "未提供字段信息"}</pre><h3>附加信息</h3><pre>{JSON.stringify(propertyDataset.metadata ?? {}, null, 2)}</pre><h3>完整属性</h3><pre>{JSON.stringify(propertyDataset, null, 2)}</pre></div></div>}</section>;
+  return <section className="panel"><div className="panel-head"><div><span className="eyebrow">已登记数据源</span><h2>数据集登记</h2></div><span className="count-badge">{datasets.length} 个数据集</span></div><form className="dataset-register" onSubmit={(event) => void submit(event)}><input value={path} onChange={(event) => setPath(event.target.value)} placeholder="请输入工作区内的数据文件路径" aria-label="数据文件路径" /><input value={name} onChange={(event) => setName(event.target.value)} placeholder="显示名称（可选）" aria-label="显示名称" /><button className="primary" disabled={busy || registering || !path.trim()}>{registering ? "正在登记…" : "登记数据集"}</button></form>{datasets.length === 0 ? <Empty text="还没有数据集。请输入工作区内的文件路径进行登记。" /> : <div className="dataset-grid">{datasets.map((item) => { const selected = selectedDatasetIds.includes(item.id); return <div className={`dataset-card ${selected ? "request-selected" : ""}`} key={item.id}><b className="dataset-name">{item.name}</b><div className="dataset-card-actions"><button type="button" className={`small-action ${selected ? "selected-action" : ""}`} onClick={() => onToggleRequestDataset(item.id)}>{selected ? "移出本轮" : "用于下一条消息"}</button><button type="button" className="small-action" onClick={() => setPropertyDataset(item)}>属性</button></div></div>; })}</div>}{propertyDataset && <div className="dataset-modal" role="dialog" aria-modal="true" aria-label="数据集属性" onClick={() => setPropertyDataset(null)}><div className="dataset-modal-card" onClick={(event) => event.stopPropagation()}><div className="dataset-modal-head"><div><span className="eyebrow">数据集属性</span><h2>{propertyDataset.name}</h2></div><button type="button" className="modal-close" onClick={() => setPropertyDataset(null)}>关闭</button></div><div className="property-grid"><Property label="数据集编号" value={propertyDataset.id} /><Property label="数据类型" value={kindLabel(propertyDataset.kind)} /><Property label="文件格式" value={formatLabel(propertyDataset.format)} /><Property label="坐标系" value={propertyDataset.crs?.authority ?? "未提供"} /><Property label="坐标系名称" value={propertyDataset.crs?.name ?? "未提供"} /><Property label="要素数量" value={propertyDataset.schema?.feature_count !== undefined ? String(propertyDataset.schema.feature_count) : "不适用"} /><Property label="几何类型" value={propertyDataset.schema?.geometry_type ?? "未提供"} /><Property label="栅格尺寸" value={propertyDataset.schema?.width !== undefined ? `${propertyDataset.schema.width} × ${propertyDataset.schema.height ?? "?"}，${propertyDataset.schema.bands ?? "?"} 个波段` : "不适用"} /><Property label="空间范围" value={propertyDataset.extent ? `${propertyDataset.extent.min_x}, ${propertyDataset.extent.min_y} 至 ${propertyDataset.extent.max_x}, ${propertyDataset.extent.max_y}` : "未提供"} /><Property label="文件路径" value={propertyDataset.path} /><Property label="创建时间" value={propertyDataset.created_at ?? "未提供"} /><Property label="创建运行" value={propertyDataset.created_by_run_id ?? "手动登记或上传"} /></div><h3>字段</h3><pre>{propertyDataset.schema?.fields && Object.keys(propertyDataset.schema.fields).length > 0 ? JSON.stringify(propertyDataset.schema.fields, null, 2) : "未提供字段信息"}</pre><h3>附加信息</h3><pre>{JSON.stringify(propertyDataset.metadata ?? {}, null, 2)}</pre><h3>完整属性</h3><pre>{JSON.stringify(propertyDataset, null, 2)}</pre></div></div>}</section>;
 }
 
 function Property({ label, value }: { label: string; value: string }) { return <div className="property-item"><span>{label}</span><b>{value}</b></div>; }
 
 function AgentPanel({ runs }: { runs: Run[] }) {
-  const agents = useMemo(() => {
-    const grouped = new Map<string, Run[]>();
-    for (const run of runs) grouped.set(run.agent_id, [...(grouped.get(run.agent_id) ?? []), run]);
-    return [...grouped.entries()].sort(([left], [right]) => left === "main" ? -1 : right === "main" ? 1 : left.localeCompare(right));
-  }, [runs]);
-  return <section className="panel"><div className="panel-head"><div><span className="eyebrow">主智能体 + 临时智能体</span><h2>智能体活动</h2></div><span className="count-badge">{agents.length} 个智能体</span></div>{agents.length === 0 ? <Empty text="运行任务后，这里会显示主智能体和临时智能体。" /> : <div className="agent-grid">{agents.map(([agent, agentRuns]) => { const latest = agentRuns[0]; return <div className="agent-card" key={agent}><div className="agent-icon">{agent === "main" ? "主" : "临"}</div><div><b>{agentLabel(agent)}</b><small>{agentRuns.length} 次运行 · 最近状态：{statusLabel(latest.status)}</small><span>{latest.metadata.goal ? String(latest.metadata.goal) : "主题分析"}</span></div></div>; })}</div>}</section>;
+  const mainRuns = runs.filter(isMainRun);
+  return <section className="panel"><div className="panel-head"><div><span className="eyebrow">执行树</span><h2>智能体活动</h2></div><span className="count-badge">{runs.length} 个执行节点</span></div>{mainRuns.length === 0 ? <Empty text="运行任务后，这里会显示主运行和子智能体执行树。" /> : <div className="agent-grid">{mainRuns.map((main) => { const children = childRunsOf(main.id, runs); return <div className="agent-card execution-tree-card" key={main.id}><div className="agent-icon">主</div><div className="execution-tree-copy"><b>{runTitle(main)}</b><small>主运行 · {statusLabel(main.status)} · {main.id}</small><span>{children.length ? `包含 ${children.length} 个子智能体执行` : "尚未委派子智能体"}</span>{children.length > 0 && <div className="execution-children">{children.map((child) => <div className="execution-child" key={child.id}><i>↳</i><div><b>{runTitle(child)}</b><small>子智能体 · {statusLabel(child.status)}</small></div></div>)}</div>}</div></div>; })}</div>}</section>;
 }
 
-function RunPanel({ runs, events, onSelect, onCancel, onResume, onDelete, onDeleteMany, busy }: { runs: Run[]; events: Event[]; onSelect: (id: string) => Promise<void>; onCancel: (id: string) => Promise<void>; onResume: (id: string) => Promise<void>; onDelete: (id: string) => Promise<void>; onDeleteMany: (ids: string[]) => Promise<void>; busy: boolean }) {
+function RunPanel({ runs, selectedRunId, events, onSelect, onCancel, onResume, onDelete, onDeleteMany, busy }: { runs: Run[]; selectedRunId: string | null; events: Event[]; onSelect: (id: string) => Promise<void>; onCancel: (id: string) => Promise<void>; onResume: (id: string) => Promise<void>; onDelete: (id: string) => Promise<void>; onDeleteMany: (ids: string[]) => Promise<void>; busy: boolean }) {
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [bulkDeletePending, setBulkDeletePending] = useState(false);
-  const deletableIds = runs.filter((run) => !ACTIVE_RUN_STATUSES.has(run.status)).map((run) => run.id);
+  const deletableIds = runs.filter((run) => !isActiveRun(run)).map((run) => run.id);
   const allSelected = deletableIds.length > 0 && deletableIds.every((id) => selectedIds.includes(id));
+  const groups = [...groupRunsByTask(runs).entries()];
 
   useEffect(() => {
     const currentIds = new Set(runs.map((run) => run.id));
@@ -613,11 +648,21 @@ function RunPanel({ runs, events, onSelect, onCancel, onResume, onDelete, onDele
     await onDeleteMany(ids);
   };
 
-  return <section className="panel two-col"><div><div className="panel-head run-panel-head"><div><span className="eyebrow">持久化运行</span><h2>运行记录</h2></div><div className="run-bulk-actions"><label className="run-select-all"><input type="checkbox" checked={allSelected} disabled={busy || deletableIds.length === 0} onChange={toggleAll} />全选可删除记录</label>{selectedIds.length > 0 && <><span className="run-selected-count">已选 {selectedIds.length} 条</span>{bulkDeletePending ? <div className="run-bulk-confirm"><span>删除已选记录？</span><button type="button" className="conversation-confirm-delete" onClick={() => void confirmBulkDelete()}>确认删除</button><button type="button" className="conversation-confirm-cancel" onClick={() => setBulkDeletePending(false)}>取消</button></div> : <button type="button" className="small-action danger" disabled={busy} onClick={() => setBulkDeletePending(true)}>删除已选</button>}</>}</div></div>{runs.length === 0 ? <Empty text="还没有运行记录。" /> : <div className="run-list">{runs.map((run) => { const active = ACTIVE_RUN_STATUSES.has(run.status); return <div className="run-row" key={run.id}><label className="run-check" title={active ? "正在运行的记录不能删除" : "选择运行记录"}><input type="checkbox" checked={selectedIds.includes(run.id)} disabled={busy || active} onChange={() => toggleRun(run.id)} aria-label={`选择运行记录 ${run.id}`} /></label><button className="run-select" onClick={() => void onSelect(run.id)}><span className={`run-state ${run.status.toLowerCase()}`} /><div><b>{run.id}</b><small>{agentLabel(run.agent_id)} · {run.tool_call_count} 次工具调用</small></div><em>{statusLabel(run.status)}</em></button><div className="run-actions">{active && <button className="small-action danger" onClick={() => void onCancel(run.id)}>取消</button>}{RESUMABLE_RUN_STATUSES.has(run.status) && <button className="small-action" disabled={busy} onClick={() => void onResume(run.id)}>恢复</button>}{!active && <button className="small-action danger" disabled={busy} onClick={() => setPendingDeleteId((current) => current === run.id ? null : run.id)}>删除</button>}</div>{pendingDeleteId === run.id && <div className="run-delete-confirm" role="dialog" aria-label={`确认删除运行 ${run.id}`}><span>删除这条运行记录？</span><div><button type="button" className="conversation-confirm-delete" onClick={() => { setPendingDeleteId(null); void onDelete(run.id); }}>删除</button><button type="button" className="conversation-confirm-cancel" onClick={() => setPendingDeleteId(null)}>取消</button></div></div>}</div>; })}</div>}</div><div className="trace-box"><div className="eyebrow">运行追踪 · {events.length} 个事件</div>{events.length === 0 ? <Empty text="选择一个运行记录查看事件。" /> : events.map((event) => <div className="event" key={event.id}><span>{String(event.sequence).padStart(2, "0")}</span><div><b>{eventLabel(event.event_type)}</b><small>{displayEventMessage(event.message)}</small></div></div>)}</div></section>;
+  const renderRun = (run: Run, nested = false) => {
+    const active = isActiveRun(run);
+    const source = lineageSource(run);
+    return <div className={`run-row ${nested ? "nested-run" : ""} ${selectedRunId === run.id ? "selected" : ""}`} key={run.id}>
+      <label className="run-check" title={active ? "正在运行的记录不能删除" : "选择运行记录"}><input type="checkbox" checked={selectedIds.includes(run.id)} disabled={busy || active} onChange={() => toggleRun(run.id)} aria-label={`选择运行记录 ${run.id}`} /></label>
+      <button className="run-select" onClick={() => void onSelect(run.id)}><span className={`run-state ${run.status.toLowerCase()}`} /><div><b>{runTitle(run)}</b><small>{run.id} · {run.metadata.interaction_mode ? interactionModeLabel(run.metadata.interaction_mode) : agentLabel(run.agent_id)} · {run.tool_call_count} 次工具调用</small>{source && <small className="lineage-note">来源运行：{source}</small>}</div><em>{statusLabel(run.status)}</em></button>
+      <div className="run-actions">{active && <button className="small-action danger" onClick={() => void onCancel(run.id)}>取消</button>}{RESUMABLE_RUN_STATUSES.has(run.status) && <button className="small-action" disabled={busy} onClick={() => void onResume(run.id)}>恢复</button>}{!active && <button className="small-action danger" disabled={busy} onClick={() => setPendingDeleteId((current) => current === run.id ? null : run.id)}>删除</button>}</div>
+      {pendingDeleteId === run.id && <div className="run-delete-confirm" role="dialog" aria-label={`确认删除运行 ${run.id}`}><span>删除这条运行记录？</span><div><button type="button" className="conversation-confirm-delete" onClick={() => { setPendingDeleteId(null); void onDelete(run.id); }}>删除</button><button type="button" className="conversation-confirm-cancel" onClick={() => setPendingDeleteId(null)}>取消</button></div></div>}
+    </div>;
+  };
+  return <section className="panel two-col"><div><div className="panel-head run-panel-head"><div><span className="eyebrow">当前对话运行</span><h2>运行记录</h2></div><div className="run-bulk-actions"><label className="run-select-all"><input type="checkbox" checked={allSelected} disabled={busy || deletableIds.length === 0} onChange={toggleAll} />全选可删除记录</label>{selectedIds.length > 0 && <><span className="run-selected-count">已选 {selectedIds.length} 条</span>{bulkDeletePending ? <div className="run-bulk-confirm"><span>删除已选记录？</span><button type="button" className="conversation-confirm-delete" onClick={() => void confirmBulkDelete()}>确认删除</button><button type="button" className="conversation-confirm-cancel" onClick={() => setBulkDeletePending(false)}>取消</button></div> : <button type="button" className="small-action danger" disabled={busy} onClick={() => setBulkDeletePending(true)}>删除已选</button>}</>}</div></div>{runs.length === 0 ? <Empty text="当前对话还没有运行记录。" /> : <div className="run-list">{groups.map(([taskId, taskRuns]) => { const commandGroup = taskId === "__command__"; const mains = taskRuns.filter(isMainRun); const linkedIds = new Set(mains.flatMap((main) => [main.id, ...childRunsOf(main.id, taskRuns).map((child) => child.id)])); const orphanRuns = taskRuns.filter((run) => !linkedIds.has(run.id)); return <section className="run-task-group" key={taskId}><div className="run-task-heading"><b>{commandGroup ? "查询 / 命令运行" : `任务 ${taskId}`}</b>{!commandGroup && <small>{runTitle(mains[0] ?? taskRuns[0])}</small>}</div>{mains.map((main) => <div key={main.id}>{renderRun(main)}{childRunsOf(main.id, taskRuns).map((child) => renderRun(child, true))}</div>)}{orphanRuns.map((run) => renderRun(run, !isMainRun(run)))}</section>; })}</div>}</div><div className="trace-box"><div className="eyebrow">运行追踪 · {selectedRunId ?? "未选择"} · {events.length} 个事件</div>{events.length === 0 ? <Empty text="选择一个运行记录查看事件。" /> : events.map((event) => { const eventRun = eventRuns(event, runs); const eventAgent = eventRun ? (isMainRun(eventRun) ? "主智能体" : `子智能体 · ${runTitle(eventRun)}`) : (event.agent_id === "main" ? "主智能体" : "子智能体"); return <div className="event" key={event.id}><span>{String(event.sequence).padStart(2, "0")}</span><div><b>{eventAgent} · {eventLabel(event.event_type)}</b><small>{displayEventMessage(event.message)}</small></div></div>; })}</div></section>;
 }
 
-function ResultPanel({ result, events, artifacts }: { result: Result | null; events: Event[]; artifacts: Artifact[] }) {
-  return <section className="panel result-panel">{!result ? <Empty text="完成一次分析后，结果、证据和运行追踪会显示在这里。" /> : <><div className="result-head"><div><span className={`pill ${result.status.toLowerCase()}`}>{statusLabel(result.status)}</span><h2>{result.summary}</h2></div><code>{result.trace_id}</code></div><div className="result-columns"><div><h3>分析发现</h3>{result.findings.length === 0 ? <Empty text="没有结构化发现。" /> : result.findings.map((finding, index) => <pre key={index}>{findingText(finding)}</pre>)}<h3>结果文件</h3>{result.artifacts.length === 0 ? <p className="muted-text">本次运行没有产物。</p> : <div className="artifact-list">{result.artifacts.map((artifactId) => { const artifact = artifacts.find((item) => item.id === artifactId); return <a className="artifact-link" href={api.artifactUrl(artifactId)} target="_blank" rel="noreferrer" key={artifactId}>{artifact?.name ?? artifactId} <span>↗</span></a>; })}</div>}</div><div><h3>执行情况</h3><div className="metric"><b>{events.length}</b><span>追踪事件</span></div><div className="metric"><b>{result.datasets.length}</b><span>涉及数据集</span></div><div className="metric"><b>{result.artifacts.length}</b><span>结果文件</span></div>{result.warnings.map((warning) => <p className="warning" key={warning}>{warning}</p>)}</div></div></> }</section>;
+function ResultPanel({ result, datasets, events, artifacts }: { result: Result | null; datasets: Dataset[]; events: Event[]; artifacts: Artifact[] }) {
+  return <section className="panel result-panel">{!result ? <Empty text="完成一次分析后，结果、证据和运行追踪会显示在这里。" /> : <><div className="result-head"><div><span className={`pill ${result.status.toLowerCase()}`}>{statusLabel(result.status)}</span><h2>{result.summary}</h2></div><code>{result.trace_id}</code></div>{result.error && <div className="result-error"><b>错误</b><span>{result.error}</span></div>}<div className="result-columns"><div><h3>分析发现</h3>{result.findings.length === 0 ? <Empty text="没有结构化发现。" /> : result.findings.map((finding, index) => <pre key={index}>{findingText(finding)}</pre>)}<h3>关联数据集</h3>{result.datasets.length === 0 ? <p className="muted-text">本次运行没有关联数据集。</p> : <div className="dataset-result-list">{result.datasets.map((datasetId) => { const dataset = datasets.find((item) => item.id === datasetId); return <div className="dataset-result-item" key={datasetId}><b>{dataset?.name ?? datasetId}</b><small>{dataset?.kind ? kindLabel(dataset.kind) : "数据集"} · {datasetId}</small></div>; })}</div>}<h3>结果文件</h3>{result.artifacts.length === 0 ? <p className="muted-text">本次运行没有产物。</p> : <div className="artifact-list">{result.artifacts.map((artifactId) => { const artifact = artifacts.find((item) => item.id === artifactId); return <a className="artifact-link" href={api.artifactUrl(artifactId)} target="_blank" rel="noreferrer" key={artifactId}>{artifact?.name ?? artifactId} <span>↗</span></a>; })}</div>}{result.evidence.length > 0 && <><h3>证据</h3>{result.evidence.map((evidence, index) => <pre key={index}>{findingText(evidence)}</pre>)}</>}</div><div><h3>执行情况</h3><div className="metric"><b>{events.length}</b><span>追踪事件</span></div><div className="metric"><b>{result.datasets.length}</b><span>涉及数据集</span></div><div className="metric"><b>{result.artifacts.length}</b><span>结果文件</span></div>{result.warnings.length > 0 && <><h3>警告</h3>{result.warnings.map((warning) => <p className="warning" key={warning}>{warning}</p>)}</>}</div></div></> }</section>;
 }
 
 function SettingsPanel({ modelStatus }: { modelStatus: ModelStatus | null }) {
