@@ -663,13 +663,15 @@ class RunBudget(StrictModel):
     """运行预算；``max_tokens`` 仅表示模型最大输出 token 数。"""
 
     max_agent_turns: int = Field(default=20, ge=1)
+    max_runtime_transitions: int = Field(default=100, ge=1)
     max_tool_calls: int = Field(default=40, ge=1)
     max_retry_per_action: int = Field(default=2, ge=0)
     max_replans: int = Field(default=2, ge=0)
     max_subagents: int = Field(default=5, ge=0)
     max_parallel_agents: int = Field(default=3, ge=1)
     max_tokens: int = Field(default=1200, ge=1)
-    model_input_tokens: int = Field(default=12000, ge=128)
+    # 模型工具声明包含 GIS 工具和内部控制能力，默认输入预算需覆盖其固定成本。
+    model_input_tokens: int = Field(default=13000, ge=128)
     model_context_tokens: int = Field(default=6000, ge=128)
     protocol_history_tokens: int = Field(default=3000, ge=128)
     subagent_context_tokens: int = Field(default=3000, ge=128)

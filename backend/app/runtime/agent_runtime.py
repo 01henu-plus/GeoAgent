@@ -21,6 +21,8 @@ class RuntimeTransition:
     error: str | None = None
     observation: dict[str, Any] | None = None
     directive: LoopDirective = LoopDirective.CONTINUE
+    latest_failure: dict[str, Any] | None = None
+    clear_failure: bool = False
     findings: tuple[Any, ...] = ()
     dataset_ids: tuple[str, ...] = ()
     artifact_ids: tuple[str, ...] = ()
@@ -57,8 +59,9 @@ FastPathCallback = Callable[[AgentState], Awaitable[RuntimeTransition | None] | 
 class AgentRuntime:
     """统一 Observe -> Decide -> Execute -> Observe 的运行时控制流。"""
 
-    def __init__(self, *, max_iterations: int = 32) -> None:
-        self.max_iterations = max(1, max_iterations)
+    def __init__(self, *, max_runtime_transitions: int = 100, max_iterations: int | None = None) -> None:
+        # max_iterations 仅作为旧调用方兼容别名；语义统一为 Runtime transition safety limit。
+        self.max_runtime_transitions = max(1, max_iterations if max_iterations is not None else max_runtime_transitions)
 
     async def run(
         self,
@@ -68,10 +71,11 @@ class AgentRuntime:
         dispatch: DispatchCallback,
         refresh_state: RefreshCallback | None = None,
         fast_path: FastPathCallback | None = None,
+        max_runtime_transitions: int | None = None,
         max_iterations: int | None = None,
     ) -> RuntimeOutcome:
         state = initial_state.model_copy(deep=True)
-        limit = max(1, max_iterations or self.max_iterations)
+        limit = max(1, max_iterations or max_runtime_transitions or self.max_runtime_transitions)
         last_decision: AgentDecision | None = None
         last_transition = RuntimeTransition()
         for iteration in range(limit):
@@ -121,6 +125,10 @@ class AgentRuntime:
             "active_dataset_ids": _unique([*state.active_dataset_ids, *transition.dataset_ids]),
             "active_artifact_ids": _unique([*state.active_artifact_ids, *transition.artifact_ids]),
         }
+        if transition.clear_failure:
+            updates["latest_failure"] = None
+        elif transition.latest_failure is not None:
+            updates["latest_failure"] = transition.latest_failure
         if transition.clear_plan:
             updates["current_plan"] = None
         elif transition.current_plan is not None:

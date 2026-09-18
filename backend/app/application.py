@@ -100,6 +100,7 @@ class Application:
         }
         self.budget = RunBudget(
             max_agent_turns=self.settings.max_agent_turns,
+            max_runtime_transitions=self.settings.max_runtime_transitions,
             max_tool_calls=self.settings.max_tool_calls,
             max_retry_per_action=self.settings.max_retries,
             max_replans=self.settings.max_replans,
