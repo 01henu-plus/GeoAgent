@@ -21,6 +21,7 @@ class ProtocolBatch:
 
     assistant: dict[str, Any]
     tool_messages: tuple[dict[str, Any], ...] = ()
+    complete: bool = True
 
     def messages(self) -> list[dict[str, Any]]:
         return [deepcopy(self.assistant), *(deepcopy(item) for item in self.tool_messages)]
@@ -44,7 +45,7 @@ def extract_protocol_messages(
 
 
 def group_protocol_batches(messages: list[dict[str, Any]]) -> list[ProtocolBatch]:
-    """按 assistant tool_calls 分组，保证压缩时不留下孤立 tool 消息。"""
+    """按 assistant tool_calls 分组，并校验 tool_call_id 基本对应关系。"""
 
     batches: list[ProtocolBatch] = []
     index = 0
@@ -52,13 +53,29 @@ def group_protocol_batches(messages: list[dict[str, Any]]) -> list[ProtocolBatch
         assistant = deepcopy(messages[index])
         tool_calls = assistant.get("tool_calls") if assistant.get("role") == "assistant" else None
         if isinstance(tool_calls, list) and tool_calls:
+            expected_ids = {
+                str(item.get("id"))
+                for item in tool_calls
+                if isinstance(item, dict) and item.get("id")
+            }
             tools: list[dict[str, Any]] = []
+            seen_ids: set[str] = set()
             cursor = index + 1
             while cursor < len(messages) and messages[cursor].get("role") == "tool":
-                tools.append(deepcopy(messages[cursor]))
+                tool_message = messages[cursor]
+                tool_id = str(tool_message.get("tool_call_id", ""))
+                if not tool_id or tool_id not in expected_ids or tool_id in seen_ids:
+                    break
+                tools.append(deepcopy(tool_message))
+                seen_ids.add(tool_id)
                 cursor += 1
-            batches.append(ProtocolBatch(assistant=assistant, tool_messages=tuple(tools)))
+            complete = bool(expected_ids) and seen_ids == expected_ids
+            batches.append(ProtocolBatch(assistant=assistant, tool_messages=tuple(tools), complete=complete))
             index = cursor
+            continue
+        if assistant.get("role") == "tool":
+            # 没有紧邻合法 assistant tool_calls 的 tool 消息不能进入协议历史。
+            index += 1
             continue
         batches.append(ProtocolBatch(assistant=assistant))
         index += 1
@@ -76,7 +93,8 @@ def compact_protocol_messages(
     batches = group_protocol_batches(messages)
     if max_batches > 0:
         batches = batches[-max_batches:]
-    compacted = [_compact_batch(batch) for batch in batches]
+    # 不完整批次整体丢弃，避免 assistant + 部分 tool 或孤立 tool 进入 Provider。
+    compacted = [_compact_batch(batch) for batch in batches if batch.complete]
     budget = max(1, max_tokens)
     while len(compacted) > 1 and estimate_tokens(_flatten(compacted)) > budget:
         compacted.pop(0)

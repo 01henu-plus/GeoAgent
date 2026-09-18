@@ -499,7 +499,22 @@ def _observation_view(value: Any) -> Any:
         return _compact_value(value)
     return {
         key: _compact_value(raw.get(key))
-        for key in ("call_id", "status", "output", "error", "warnings", "datasets", "artifacts", "retryable", "duration_ms")
+        for key in (
+            "call_id",
+            "status",
+            "output",
+            "error",
+            "warnings",
+            "datasets",
+            "artifacts",
+            "retryable",
+            "duration_ms",
+            "accepted",
+            "verified",
+            "verification_problems",
+            "recovery_action",
+            "attempts",
+        )
         if raw.get(key) not in (None, [], {}, "")
     }
 

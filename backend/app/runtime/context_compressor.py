@@ -49,44 +49,37 @@ class ContextCompressor:
                     changed.add(section.name)
                     working[index] = replacement
 
-        # 极端情况下才压缩 REQUIRED section；section 本身仍然保留。
-        while self._estimate(working) > target:
-            candidates = [
-                section
-                for section in working
-                if section.required and section.compressible and self._can_shrink_required(section)
-            ]
-            if not candidates:
-                break
-            section = max(candidates, key=lambda item: (item.estimated_tokens, item.name))
-            replacement = self._shrink_required(section)
-            if replacement is None:
-                break
-            changed.add(section.name)
-            working[working.index(section)] = replacement
-
         payload = {section.name: section.content for section in working}
         required_sections = {section.name: section.content for section in working if section.required}
         required_tokens = estimate_tokens(required_sections)
-        estimated_tokens = estimate_tokens(payload)
-        over_budget = estimated_tokens > budget
-        truncated = bool(changed or dropped or over_budget)
+        payload["truncated"] = False
         payload["context_meta"] = {
-            "truncated": truncated,
-            "over_budget": over_budget,
+            "truncated": False,
+            "over_budget": False,
             "budget_tokens": budget,
-            "estimated_tokens": estimated_tokens,
-            "overflow_tokens": max(0, estimated_tokens - budget),
+            "estimated_tokens": estimate_tokens(payload),
+            "overflow_tokens": 0,
             "required_tokens": required_tokens,
         }
-        payload["context_meta"]["estimated_tokens"] = estimate_tokens(payload)
-        payload["context_meta"]["overflow_tokens"] = max(0, payload["context_meta"]["estimated_tokens"] - budget)
-        payload["context_meta"]["over_budget"] = payload["context_meta"]["overflow_tokens"] > 0
-        payload["truncated"] = truncated or payload["context_meta"]["over_budget"]
         if changed:
             payload["context_meta"]["compressed_sections"] = sorted(changed)
         if dropped:
             payload["context_meta"]["dropped_sections"] = dropped
+        # metadata 自身也占用少量 token，因此固定点迭代一次，确保顶层兼容
+        # 字段和 context_meta 使用同一个 canonical truncated 值。
+        for _ in range(2):
+            estimated_tokens = estimate_tokens(payload)
+            overflow_tokens = max(0, estimated_tokens - budget)
+            truncated = bool(changed or dropped or overflow_tokens > 0)
+            payload["context_meta"].update(
+                {
+                    "truncated": truncated,
+                    "over_budget": overflow_tokens > 0,
+                    "estimated_tokens": estimated_tokens,
+                    "overflow_tokens": overflow_tokens,
+                }
+            )
+            payload["truncated"] = truncated
         return payload
 
     @staticmethod
@@ -144,46 +137,6 @@ class ContextCompressor:
 
         if isinstance(content, str) and len(content) > 256:
             return self._replace_content(section, _clip(content, max(256, int(len(content) * 0.7))))
-        return None
-
-    def _can_shrink_required(self, section: ContextSection) -> bool:
-        if isinstance(section.content, str):
-            minimum = int(section.metadata.get("hard_min_chars", 128))
-            return len(section.content) > minimum
-        if section.name == "request_frame" and isinstance(section.content, dict):
-            return any(key in section.content for key in ("capabilities", "confidence", "unresolved_references"))
-        if section.name == "current_observation" and isinstance(section.content, dict):
-            output = section.content.get("output")
-            return isinstance(output, (str, dict, list)) and estimate_tokens(output) > 200
-        return False
-
-    def _shrink_required(self, section: ContextSection) -> ContextSection | None:
-        if isinstance(section.content, str):
-            minimum = int(section.metadata.get("hard_min_chars", 128))
-            if len(section.content) <= minimum:
-                return None
-            return self._replace_content(section, _clip(section.content, max(minimum, int(len(section.content) * 0.7))))
-
-        if section.name == "request_frame" and isinstance(section.content, dict):
-            updated = dict(section.content)
-            for key in ("capabilities", "confidence", "unresolved_references"):
-                if key in updated:
-                    updated.pop(key)
-                    return self._replace_content(section, updated)
-            return None
-
-        if section.name == "current_observation" and isinstance(section.content, dict):
-            updated = deepcopy(section.content)
-            output = updated.get("output")
-            if isinstance(output, str) and len(output) > 500:
-                updated["output"] = _clip(output, max(500, int(len(output) * 0.6)))
-                return self._replace_content(section, updated)
-            if isinstance(output, list) and len(output) > 4:
-                updated["output"] = output[:4]
-                return self._replace_content(section, updated)
-            if isinstance(output, dict) and len(output) > 8:
-                updated["output"] = dict(list(output.items())[:8])
-                return self._replace_content(section, updated)
         return None
 
     @staticmethod

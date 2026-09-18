@@ -1,9 +1,16 @@
 import json
 
-from app.core.models import AgentRequest, RunBudget, ToolResult, ToolStatus
+import pytest
+
+from app.core.models import AgentRequest, RequestResources, Run, RunBudget, ToolResult, ToolStatus
+from app.runtime.budget import BudgetExceeded
 from app.runtime.context_manager import ContextManager
 from app.runtime.model_input_budget import ModelInputBudget
-from app.runtime.protocol_history import compact_protocol_messages, extract_protocol_messages
+from app.runtime.protocol_history import (
+    compact_protocol_messages,
+    extract_protocol_messages,
+    group_protocol_batches,
+)
 
 
 def _tool_batches(count: int, output_size: int = 40) -> list[dict]:
@@ -102,3 +109,85 @@ def test_tool_result_view_is_small_and_preserves_status():
     payload = json.loads(compacted[1]["content"])
     assert payload["status"] == ToolStatus.SUCCESS.value
     assert len(compacted[1]["content"]) < 5_000
+
+
+def test_fixed_input_cost_overflow_has_no_fake_context_space():
+    budget = ModelInputBudget(input_tokens=10, context_tokens=6000, protocol_tokens=3000)
+
+    allocation = budget.allocate("x" * 500, [{"schema": "y" * 500}], _tool_batches(1, output_size=500))
+
+    assert allocation.over_budget is True
+    assert allocation.overflow_tokens > 0
+    assert allocation.available_context_tokens == 0
+
+
+def test_context_meta_and_compatibility_truncated_flag_are_identical():
+    context = ContextManager(max_tokens=128).main_context(AgentRequest(user_input="x" * 500), [], None, [])
+
+    assert context["truncated"] == context["context_meta"]["truncated"]
+
+
+def test_multi_tool_protocol_batch_is_kept_or_removed_as_a_whole():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "one", "arguments": "{}"}},
+                {"id": "b", "type": "function", "function": {"name": "two", "arguments": "{}"}},
+                {"id": "c", "type": "function", "function": {"name": "three", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "a", "content": "{}"},
+        {"role": "tool", "tool_call_id": "b", "content": "{}"},
+        {"role": "tool", "tool_call_id": "c", "content": "{}"},
+    ]
+
+    batches = group_protocol_batches(messages)
+    compacted = compact_protocol_messages(messages, max_tokens=10_000)
+
+    assert batches[0].complete is True
+    assert [item["tool_call_id"] for item in compacted[1:]] == ["a", "b", "c"]
+
+
+def test_mismatched_tool_call_id_does_not_form_a_valid_batch():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "expected", "type": "function", "function": {"name": "one", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "other", "content": "{}"},
+    ]
+
+    batches = group_protocol_batches(messages)
+    compacted = compact_protocol_messages(messages, max_tokens=10_000)
+
+    assert batches[0].complete is False
+    assert compacted == []
+
+
+def test_main_agent_rejects_fixed_cost_input_overflow(application):
+    application.main_agent.budget = RunBudget(
+        model_input_tokens=128,
+        model_context_tokens=128,
+        protocol_history_tokens=128,
+    )
+    task = application.task_service.create("预算测试", conversation_id="budget-test")
+    request = AgentRequest(user_input="检查数据", conversation_id=task.conversation_id)
+
+    current_run = Run(task_id=task.id, conversation_id=task.conversation_id, agent_id="main")
+    with pytest.raises(BudgetExceeded, match="MODEL_INPUT_BUDGET_EXCEEDED"):
+        application.main_agent._build_model_messages(
+            request,
+            current_run,
+            task,
+            [],
+            None,
+            None,
+            None,
+            [],
+            working_memory=None,
+            request_resources=RequestResources(),
+            current_observation=None,
+        )
