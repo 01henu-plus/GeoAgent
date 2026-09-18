@@ -8,6 +8,7 @@ from app.core.models import (
     Dataset,
     DatasetKind,
     FailureAction,
+    LoopDirective,
     Run,
     RunBudget,
     ToolError,
@@ -105,6 +106,7 @@ def test_success_and_verification_update_working_memory():
 
     assert outcome.accepted is True
     assert outcome.verified is True
+    assert outcome.directive is LoopDirective.CONTINUE
     assert outcome.attempts == 1
     assert updater.accepted[0][1].datasets == ["out"]
 
@@ -119,6 +121,7 @@ def test_verification_failure_does_not_update_working_memory():
 
     assert outcome.accepted is False
     assert outcome.verification_problems == ["结果不可读"]
+    assert outcome.directive is LoopDirective.ABORT
     assert updater.accepted == []
 
 

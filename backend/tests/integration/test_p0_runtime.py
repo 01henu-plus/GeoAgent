@@ -7,6 +7,11 @@ from app.config import Settings
 from app.core.models import (
     AgentRequest,
     AgentResultStatus,
+    IntentResult,
+    IntentType,
+    LoopDirective,
+    Plan,
+    PlanStep,
     Run,
     RunStatus,
     TaskStatus,
@@ -17,6 +22,7 @@ from app.demo import seed_demo
 from app.models import ModelAdapter, ModelRequest, ModelResponse, ModelStreamChunk
 from app.models.config import ModelProfile
 from app.runtime.context_assembler import estimate_tokens
+from app.runtime.tool_execution_cycle import ExecutionOutcome
 
 
 class FakeToolModel(ModelAdapter):
@@ -60,6 +66,90 @@ def test_model_loop_passes_tools_and_executes_tool(application):
     second_context = json.loads(fake.requests[1].messages[1]["content"].split("\n", 1)[1])
     assert first_context["run_state"]["turn_count"] == 1
     assert second_context["run_state"]["turn_count"] == 2
+
+
+def test_model_multi_tool_observation_keeps_every_execution_outcome(application):
+    ids = seed_demo(application)
+
+    class MultiToolModel(ModelAdapter):
+        def __init__(self):
+            self.requests: list[ModelRequest] = []
+
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return ModelResponse(
+                    model="fake",
+                    tool_calls=[
+                        {"id": "call-a", "function": {"name": "dataset.inspect", "arguments": json.dumps({"dataset_id": ids["roads"]})}},
+                        {"id": "call-b", "function": {"name": "dataset.inspect", "arguments": json.dumps({"dataset_id": ids["population"]})}},
+                        {"id": "call-c", "function": {"name": "dataset.inspect", "arguments": json.dumps({"dataset_id": ids["roads"]})}},
+                    ],
+                )
+            return ModelResponse(model="fake", content="三个工具结果都已收到。")
+
+    model = MultiToolModel()
+    application.main_agent.model_adapter = model
+
+    result = asyncio.run(application.ask("检查道路和建筑数据"))
+
+    assert result.status is AgentResultStatus.SUCCESS
+    second_context = json.loads(model.requests[1].messages[1]["content"].split("\n", 1)[1])
+    observations = second_context["current_observation"]["tool_observations"]
+    assert [item["call_id"] for item in observations] == ["call-a", "call-b", "call-c"]
+    assert all(item["accepted"] is True and item["verified"] is True for item in observations)
+    tool_messages = [message for message in model.requests[1].messages if message.get("role") == "tool"]
+    assert len(tool_messages) == 3
+    assert all(json.loads(message["content"])["accepted"] is True for message in tool_messages)
+    checkpoint = application.checkpoints.latest(result.trace_id)
+    assert checkpoint is not None
+    assert len(checkpoint.state["latest_observation"]["tool_observations"]) == 3
+
+
+def test_model_multi_tool_observation_keeps_failed_and_successful_results_together(application):
+    ids = seed_demo(application)
+
+    class MixedToolModel(ModelAdapter):
+        def __init__(self):
+            self.requests: list[ModelRequest] = []
+
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return ModelResponse(
+                    model="fake",
+                    tool_calls=[
+                        {"id": "call-failed", "function": {"name": "raster.slope", "arguments": "{}"}},
+                        {"id": "call-ok-a", "function": {"name": "dataset.inspect", "arguments": json.dumps({"dataset_id": ids["roads"]})}},
+                        {"id": "call-ok-b", "function": {"name": "dataset.inspect", "arguments": json.dumps({"dataset_id": ids["population"]})}},
+                    ],
+                )
+            return ModelResponse(model="fake", content="已收到混合执行结果。")
+
+    model = MixedToolModel()
+    application.main_agent.model_adapter = model
+    original_tool = application.main_agent._tool
+
+    async def fake_raw_tool(current_run, name, arguments, *, call_id=None):
+        if name == "raster.slope":
+            return ToolResult(call_id=call_id or "call-failed", status=ToolStatus.SUCCESS, datasets=["missing-output"])
+        return ToolResult(call_id=call_id or name, status=ToolStatus.SUCCESS, output={"ok": True})
+
+    application.main_agent._tool = fake_raw_tool
+    try:
+        result = asyncio.run(application.ask("同时检查数据并计算坡度"))
+    finally:
+        application.main_agent._tool = original_tool
+
+    assert result.status is AgentResultStatus.SUCCESS
+    second_context = json.loads(model.requests[1].messages[1]["content"].split("\n", 1)[1])
+    observations = second_context["current_observation"]["tool_observations"]
+    assert observations[0]["call_id"] == "call-failed"
+    assert observations[0]["accepted"] is False
+    assert observations[0]["verified"] is False
+    assert observations[1]["accepted"] is True
+    assert observations[2]["accepted"] is True
+    assert "missing-output" not in application.store.get_working_memory(result.task_id).active_dataset_ids
 
 
 def test_planner_path_uses_tool_execution_cycle(application):
@@ -115,6 +205,60 @@ def test_model_path_verification_failure_is_not_accepted_into_working_memory(app
     assert "accepted" in second_context
     assert "结果引用了未知 Dataset" in second_context
     assert "missing-output" not in application.store.get_working_memory(result.task_id).active_dataset_ids
+
+
+def test_main_agent_planner_path_maps_loop_directives_without_replanning(application):
+    task = application.task_service.create("执行控制信号测试", conversation_id="directive-conversation")
+    run = Run(task_id=task.id, conversation_id=task.conversation_id, agent_id="main")
+    application.store.save_run(run)
+    request = AgentRequest(user_input="执行控制信号测试", conversation_id=task.conversation_id)
+    intent = IntentResult(intent=IntentType.DATA_INSPECTION, confidence=1.0)
+    plan = Plan(
+        goal="执行控制信号测试",
+        intent=IntentType.DATA_INSPECTION,
+        steps=[PlanStep(id="step-directive", title="检查", action="inspect", tool_name="dataset.inspect")],
+    )
+
+    async def resolved(value):
+        return value
+
+    async def run_with_directive(directive):
+        outcome = ExecutionOutcome(
+            result=ToolResult(call_id="directive-call", status=ToolStatus.FAILED),
+            verified=False,
+            verification_problems=[],
+            recovery_action=None,
+            attempts=1,
+            accepted=False,
+            directive=directive,
+            rationale="执行层返回控制信号",
+        )
+        original = application.main_agent.tool_execution_cycle.execute
+        application.main_agent.tool_execution_cycle.execute = lambda *args, **kwargs: resolved(outcome)
+        try:
+            return await application.main_agent._execute_plan(
+                request,
+                run,
+                task,
+                [],
+                intent,
+                plan.model_copy(deep=True),
+                {},
+                request_frame=None,
+            )
+        finally:
+            application.main_agent.tool_execution_cycle.execute = original
+
+    ask_user = asyncio.run(run_with_directive(LoopDirective.ASK_USER))
+    replan = asyncio.run(run_with_directive(LoopDirective.REPLAN))
+    abort = asyncio.run(run_with_directive(LoopDirective.ABORT))
+
+    assert ask_user.status is AgentResultStatus.BLOCKED
+    assert ask_user.error == "WAITING_USER"
+    assert replan.status is AgentResultStatus.BLOCKED
+    assert replan.error == "REPLAN_REQUIRED"
+    assert abort.status is AgentResultStatus.FAILED
+    assert abort.error == "执行层返回控制信号"
 
 
 def test_model_runtime_gets_first_chance_when_offline_rules_would_ask(application):

@@ -2,7 +2,15 @@ import json
 
 import pytest
 
-from app.core.models import AgentRequest, RequestResources, Run, RunBudget, ToolResult, ToolStatus
+from app.core.models import (
+    AgentRequest,
+    LoopDirective,
+    RequestResources,
+    Run,
+    RunBudget,
+    ToolResult,
+    ToolStatus,
+)
 from app.runtime.budget import BudgetExceeded
 from app.runtime.context_manager import ContextManager
 from app.runtime.model_input_budget import ModelInputBudget
@@ -10,7 +18,9 @@ from app.runtime.protocol_history import (
     compact_protocol_messages,
     extract_protocol_messages,
     group_protocol_batches,
+    protocol_tool_message,
 )
+from app.runtime.tool_execution_cycle import ExecutionOutcome
 
 
 def _tool_batches(count: int, output_size: int = 40) -> list[dict]:
@@ -165,6 +175,28 @@ def test_mismatched_tool_call_id_does_not_form_a_valid_batch():
 
     assert batches[0].complete is False
     assert compacted == []
+
+
+def test_protocol_tool_message_exposes_execution_acceptance_and_verification():
+    outcome = ExecutionOutcome(
+        result=ToolResult(call_id="call-bad", status=ToolStatus.SUCCESS, datasets=["missing"]),
+        verified=False,
+        verification_problems=["结果不可读"],
+        recovery_action=None,
+        attempts=1,
+        accepted=False,
+        directive=LoopDirective.ABORT,
+    )
+
+    message = protocol_tool_message(outcome)
+    payload = json.loads(message["content"])
+
+    assert message["tool_call_id"] == "call-bad"
+    assert payload["status"] == ToolStatus.SUCCESS.value
+    assert payload["accepted"] is False
+    assert payload["verified"] is False
+    assert payload["verification_problems"] == ["结果不可读"]
+    assert payload["directive"] == LoopDirective.ABORT.value
 
 
 def test_main_agent_rejects_fixed_cost_input_overflow(application):
