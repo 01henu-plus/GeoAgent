@@ -24,7 +24,10 @@ class ContextCompressor:
                 candidates = [
                     section
                     for section in working
-                    if section.priority == priority and section.compressible and not section.required
+                    if section.priority == priority
+                    and section.compressible
+                    and not section.required
+                    and self._can_reduce_optional(section)
                 ]
                 if not candidates:
                     break
@@ -74,6 +77,15 @@ class ContextCompressor:
         if dropped:
             payload["context_meta"]["dropped_sections"] = dropped
         return payload
+
+    @staticmethod
+    def _can_reduce_optional(section: ContextSection) -> bool:
+        """列表达到最小保留数时停止压缩，避免丢掉最高相关项。"""
+
+        if not isinstance(section.content, list):
+            return True
+        minimum = max(0, int(section.metadata.get("min_items", 0)))
+        return len(section.content) > minimum
 
     @staticmethod
     def _estimate(sections: list[ContextSection]) -> int:

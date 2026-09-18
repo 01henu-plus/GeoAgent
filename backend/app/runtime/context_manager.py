@@ -33,7 +33,7 @@ class ContextManager:
         self.max_tokens = max_tokens
         self._legacy_max_chars = max_chars
         self.assembler = ContextAssembler()
-        self.compressor = ContextCompressor(estimator=self.assembler.estimator)
+        self.compressor = ContextCompressor(max_tokens=max_tokens)
 
     def main_context(
         self,
@@ -58,7 +58,8 @@ class ContextManager:
         user_profile: UserProfile | dict[str, Any] | None = None,
         conversation_memory: ConversationMemory | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        sections = self.assembler.main_sections(
+        resource_view = _request_resources_view(request, request_resources)
+        sections = self.assembler.assemble_main(
             request,
             datasets,
             plan,
@@ -72,14 +73,14 @@ class ContextManager:
             errors=errors,
             intent_hint=intent_hint,
             request_frame=request_frame,
-            request_resources=request_resources,
+            request_resources=resource_view,
             task_goal=task_goal,
             run_state=run_state,
             current_observation=current_observation,
             user_profile=user_profile,
             conversation_memory=conversation_memory,
         )
-        context = self.compressor.compress(sections, max_tokens=self.max_tokens)
+        context = self.compressor.compress(sections)
         if self._legacy_max_chars is not None:
             return self._legacy_bound(context)
         return context
@@ -95,7 +96,7 @@ class ContextManager:
         budget: dict[str, Any] | None = None,
         allowed_tools: list[str] | None = None,
     ) -> dict[str, Any]:
-        sections = self.assembler.sub_sections(
+        sections = self.assembler.assemble_sub(
             request,
             subtask,
             datasets,
@@ -104,7 +105,7 @@ class ContextManager:
             budget=budget,
             allowed_tools=allowed_tools,
         )
-        context = self.compressor.compress(sections, max_tokens=self.max_tokens)
+        context = self.compressor.compress(sections)
         if self._legacy_max_chars is not None:
             return self._legacy_bound(context)
         return context
@@ -125,6 +126,14 @@ class ContextManager:
 
 def _serialize(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+
+
+def _request_resources_view(request: AgentRequest, resources: RequestResources | None) -> dict[str, Any]:
+    return {
+        "dataset_ids": list(dict.fromkeys([*(item.id for item in resources.datasets)] if resources else [*request.dataset_ids])),
+        "attachment_ids": list(dict.fromkeys(request.attachment_ids)),
+        "referenced_run_ids": list(dict.fromkeys([*(item.id for item in resources.runs)] if resources else [*request.referenced_run_ids])),
+    }
 
 
 __all__ = ["ContextManager"]

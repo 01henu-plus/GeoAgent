@@ -65,10 +65,11 @@ class ContextAssembler:
         user_profile: UserProfile | dict[str, Any] | None = None,
         conversation_memory: ConversationMemory | dict[str, Any] | None = None,
         request_resources: dict[str, Any] | None = None,
+        task_goal: str | None = None,
         run_state: Any = None,
         current_observation: Any = None,
     ) -> list[ContextSection]:
-        goal = request_frame.goal if request_frame else request.user_input
+        goal = task_goal or (request_frame.goal if request_frame else request.user_input)
         working_core, working_details = _working_memory_views(working_memory)
         sections = [
             self._section(
