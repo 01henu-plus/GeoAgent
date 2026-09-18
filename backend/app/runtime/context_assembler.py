@@ -68,6 +68,8 @@ class ContextAssembler:
         task_goal: str | None = None,
         run_state: Any = None,
         current_observation: Any = None,
+        plan_progress: dict[str, Any] | None = None,
+        latest_failure: dict[str, Any] | None = None,
     ) -> list[ContextSection]:
         goal = task_goal or (request_frame.goal if request_frame else request.user_input)
         working_core, working_details = _working_memory_views(working_memory)
@@ -117,6 +119,25 @@ class ContextAssembler:
                     ContextPriority.REQUIRED,
                     _observation_view(current_observation),
                     required=True,
+                )
+            )
+
+        if plan is not None:
+            sections.append(
+                self._section(
+                    "plan_state",
+                    ContextPriority.HIGH,
+                    _plan_state_view(plan, plan_progress),
+                    metadata={"drop_rank": 65, "kind": "plan_state"},
+                )
+            )
+        if latest_failure:
+            sections.append(
+                self._section(
+                    "latest_failure",
+                    ContextPriority.HIGH,
+                    _compact_value(latest_failure),
+                    metadata={"drop_rank": 25},
                 )
             )
 
@@ -328,6 +349,33 @@ def _request_frame_view(frame: RequestFrame | None, goal: str) -> dict[str, Any]
         "unresolved_references": list(frame.unresolved_references),
         "resolution_status": frame.resolution_status.value,
         "blocking_issues": list(frame.blocking_issues),
+    }
+
+
+def _plan_state_view(plan: Plan, progress: dict[str, Any] | None) -> dict[str, Any]:
+    progress = progress or {}
+    completed = set(progress.get("completed_steps") or [])
+    steps = []
+    for step in plan.steps:
+        steps.append(
+            {
+                "id": step.id,
+                "title": step.title,
+                "action": step.action,
+                "tool_name": step.tool_name,
+                "depends_on": list(step.depends_on),
+                "status": "SUCCEEDED" if step.id in completed else step.status.value,
+            }
+        )
+    return {
+        "id": plan.id,
+        "goal": plan.goal,
+        "intent": plan.intent.value,
+        "revision": plan.revision,
+        "clarification": plan.clarification,
+        "steps": steps,
+        "completed_steps": sorted(completed),
+        "step_outputs": _compact_value(progress.get("step_outputs") or {}),
     }
 
 

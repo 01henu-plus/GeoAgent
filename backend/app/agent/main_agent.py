@@ -39,6 +39,7 @@ from app.core.models import (
 )
 from app.decision import (
     AgentRouter,
+    DecisionEngine,
     FailureAnalyzer,
     IntentResolver,
     Planner,
@@ -57,7 +58,9 @@ from app.models import ModelAdapter, ModelRequest, ModelResponse
 from app.observability import TraceRecorder
 from app.profile import ProfilePreferenceExtractor, UserProfileService
 from app.run.lifecycle import PreparedRequest, RequestLifecycleBinder
-from app.runtime.agent_loop import AgentLoop
+from app.runtime.agent_loop import AgentLoop, resolve_plan_arguments
+from app.runtime.agent_runtime import AgentRuntime, RuntimeTransition
+from app.runtime.agent_state import AgentStateBuilder
 from app.runtime.budget import BudgetExceeded, BudgetGuard
 from app.runtime.context_manager import ContextManager
 from app.runtime.lifecycle import finish_run
@@ -136,6 +139,9 @@ class MainAgent:
         self.context_manager = context_manager or ContextManager()
         self.services_factory = services_factory
         self.loop = AgentLoop()
+        self.state_builder = AgentStateBuilder(store)
+        self.decision_engine = DecisionEngine()
+        self.agent_runtime = AgentRuntime(max_iterations=self.budget.max_agent_turns)
         self.lifecycle_binder = RequestLifecycleBinder(store, task_service)
 
     async def prepare_request(
@@ -281,6 +287,8 @@ class MainAgent:
                     initial_dataset_ids=resume_state.get("model_dataset_ids") if resume_from and resume_state.get("model_dataset_ids") else None,
                     initial_artifact_ids=resume_state.get("model_artifact_ids") if resume_from and resume_state.get("model_artifact_ids") else None,
                     working_memory=working_memory,
+                    initial_plan_completed_steps=resume_state.get("completed_steps") if resume_from and isinstance(resume_state.get("completed_steps"), list) else None,
+                    initial_plan_step_outputs=resume_state.get("step_outputs") if resume_from and isinstance(resume_state.get("step_outputs"), dict) else None,
                     on_model_delta=on_model_delta,
                 )
                 if model_result is not None:
@@ -396,43 +404,97 @@ class MainAgent:
         initial_dataset_ids: list[str] | None = None,
         initial_artifact_ids: list[str] | None = None,
         working_memory: WorkingMemory | None = None,
+        initial_plan_completed_steps: list[str] | None = None,
+        initial_plan_step_outputs: dict[str, Any] | None = None,
         on_model_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> AgentResult | None:
         model_adapter = self._model_adapter_for(request)
         if model_adapter is None:
             return None
-        protocol_messages = extract_protocol_messages(protocol_messages=initial_protocol_messages, legacy_messages=initial_messages)
-        findings: list[Any] = list(initial_findings or [])
-        dataset_ids: set[str] = set(initial_dataset_ids or [])
-        artifact_ids: set[str] = set(initial_artifact_ids or [])
-        latest_observation = _observation_from_checkpoint(initial_latest_observation)
-        for turn in range(self.budget.max_agent_turns):
-            current = self.store.get_run(run.id) or run
+        session: dict[str, Any] = {
+            "protocol_messages": extract_protocol_messages(protocol_messages=initial_protocol_messages, legacy_messages=initial_messages),
+            "findings": list(initial_findings or []),
+            "dataset_ids": set(initial_dataset_ids or []),
+            "artifact_ids": set(initial_artifact_ids or []),
+            "latest_observation": _observation_from_checkpoint(initial_latest_observation),
+            "latest_failure": None,
+            "datasets": list(datasets),
+            "plan": plan,
+            "completed_steps": set(initial_plan_completed_steps or []),
+            "step_outputs": dict(initial_plan_step_outputs or {}),
+            "run": run,
+            "working_memory": working_memory,
+            "fast_path_enabled": plan is not None,
+        }
+
+        initial_state = self.state_builder.build(
+            request,
+            request_frame,
+            run,
+            task=task,
+            current_plan=plan,
+            plan_completed_steps=session["completed_steps"],
+            plan_step_outputs=session["step_outputs"],
+            latest_observation=session["latest_observation"],
+            active_dataset_ids=sorted(session["dataset_ids"]),
+            active_artifact_ids=sorted(session["artifact_ids"]),
+            working_memory=working_memory,
+        )
+
+        async def refresh_state(_state):
+            current = self.store.get_run(run.id) or session["run"]
+            return self.state_builder.build(
+                request,
+                request_frame,
+                current,
+                task=task,
+                current_plan=session["plan"],
+                plan_completed_steps=session["completed_steps"],
+                plan_step_outputs=session["step_outputs"],
+                latest_observation=session["latest_observation"],
+                latest_failure=session["latest_failure"],
+                active_dataset_ids=sorted(session["dataset_ids"]),
+                active_artifact_ids=sorted(session["artifact_ids"]),
+                working_memory=session["working_memory"],
+            )
+
+        async def decide(state):
+            current = self.store.get_run(run.id) or session["run"]
             self.guard.check_turn(current)
             self.guard.check_execution_time(current)
             current = current.model_copy(update={"turn_count": current.turn_count + 1, "status": RunStatus.RUNNING})
             self.store.save_run(current)
+            session["run"] = current
             current_memory = self.store.get_working_memory(current.task_id) if current.task_id else None
-            current_memory = current_memory or working_memory
-            refreshed_datasets = self._refresh_model_datasets(request, datasets, dataset_ids, current_memory, latest_observation)
+            session["working_memory"] = current_memory or session["working_memory"]
+            refreshed_datasets = self._refresh_model_datasets(
+                request,
+                datasets,
+                session["dataset_ids"],
+                session["working_memory"],
+                session["latest_observation"],
+            )
+            session["datasets"] = refreshed_datasets
             request_resources = self._resolve_request_resources(request)
-            messages, protocol_messages, tools = self._build_model_messages(
+            messages, bounded_protocol, tools = self._build_model_messages(
                 request,
                 current,
                 task,
                 refreshed_datasets,
                 intent,
-                plan,
+                session["plan"],
                 request_frame,
-                protocol_messages,
-                working_memory=current_memory,
+                session["protocol_messages"],
+                working_memory=session["working_memory"],
                 request_resources=request_resources,
-                current_observation=latest_observation,
+                current_observation=session["latest_observation"],
+                plan_progress={"completed_steps": sorted(session["completed_steps"]), "step_outputs": session["step_outputs"]},
+                latest_failure=session["latest_failure"],
             )
+            session["protocol_messages"] = bounded_protocol
             content_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
-            input_tokens = 0
-            output_tokens = 0
+            input_tokens = output_tokens = 0
             model_name: str | None = None
             async for chunk in model_adapter.stream(ModelRequest(messages=messages, tools=tools, max_tokens=self.budget.max_tokens)):
                 if chunk.content:
@@ -444,79 +506,272 @@ class MainAgent:
                 input_tokens = chunk.input_tokens or input_tokens
                 output_tokens = chunk.output_tokens or output_tokens
                 model_name = chunk.model or model_name
-            response = ModelResponse(content="".join(content_parts), tool_calls=tool_calls, input_tokens=input_tokens, output_tokens=output_tokens, model=model_name)
-            if not response.tool_calls:
-                if not response.content.strip():
-                    return None
-                await self.trace.emit(run.id, EventType.DECISION_MADE, "模型运行时决定直接回复，不执行空间工具。", payload={"source": "model_runtime", "action": "final", "model": response.model}, agent_id="main")
-                findings.append({"model": response.model, "content": response.content})
-                return AgentResult(agent_id="main", task_id=task.id if task else run.task_id, status=AgentResultStatus.SUCCESS, summary=response.content.strip(), findings=findings, datasets=sorted(dataset_ids), artifacts=sorted(artifact_ids), trace_id=run.id)
-
-            await self.trace.emit(run.id, EventType.DECISION_MADE, f"模型运行时决定调用 {len(response.tool_calls)} 个工具。", payload={"source": "model_runtime", "action": "tool", "tools": [_model_tool_name(item) for item in response.tool_calls]}, agent_id="main")
-            protocol_messages.append({"role": "assistant", "content": response.content or "", "tool_calls": response.tool_calls})
-            batch_observations: list[dict[str, Any]] = []
-            for index, raw_call in enumerate(response.tool_calls):
-                call_id = str(raw_call.get("id") or f"model_call_{turn}_{index}")
-                try:
-                    name, arguments = _parse_model_tool_call(raw_call)
-                except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                    tool_result = ToolResult(
-                        call_id=call_id,
-                        status=ToolStatus.FAILED,
-                        error=ToolError(
-                            code="INVALID_TOOL_ARGUMENTS",
-                            category=ErrorCategory.INPUT,
-                            message=f"模型工具参数不是有效 JSON：{exc}",
-                        ),
-                    )
-                    name = "model.tool_call"
-                    observation = _invalid_tool_call_observation(call_id, tool_result, str(exc))
-                    execution_outcome = None
-                else:
-                    execution_outcome = await self.tool_execution_cycle.execute(
-                        run,
-                        name,
-                        arguments,
-                        user_id=self.store.user_id_for_run(run.id),
-                        call_id=call_id,
-                    )
-                    tool_result = execution_outcome.result
-                    observation = _execution_observation(execution_outcome)
-                batch_observations.append(observation)
-                findings.append(
-                    {
-                        "tool": name,
-                        "status": tool_result.status.value,
-                        "accepted": execution_outcome.accepted if execution_outcome else False,
-                        "verification_problems": execution_outcome.verification_problems if execution_outcome else [],
-                        "recovery_action": execution_outcome.recovery_action.value if execution_outcome and execution_outcome.recovery_action else None,
-                        "directive": execution_outcome.directive.value if execution_outcome else LoopDirective.ABORT.value,
-                        "verified": execution_outcome.verified if execution_outcome else False,
-                        "attempts": execution_outcome.attempts if execution_outcome else 1,
-                        "output": tool_result.output,
-                        "error": tool_result.error.model_dump(mode="json") if tool_result.error else None,
-                    }
-                )
-                if execution_outcome is not None and execution_outcome.accepted:
-                    self._accept_main_tool_result(run, tool_result)
-                    dataset_ids.update(tool_result.datasets)
-                    artifact_ids.update(tool_result.artifacts)
-                protocol_messages.append(protocol_tool_message(execution_outcome or observation))
-            latest_observation = _batch_observation(batch_observations)
-            bounded_protocol = compact_protocol_messages(protocol_messages, max_tokens=self.budget.protocol_history_tokens)
-            await self._checkpoint(
-                run.id,
-                "model_tool_completed",
-                {
-                    **self._checkpoint_state(request, intent, plan, datasets, request_frame),
-                    "protocol_messages": bounded_protocol,
-                    "latest_observation": latest_observation,
-                    "model_findings": findings,
-                    "model_dataset_ids": sorted(dataset_ids),
-                    "model_artifact_ids": sorted(artifact_ids),
-                },
+            response = ModelResponse(
+                content="".join(content_parts),
+                tool_calls=tool_calls,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                model=model_name,
             )
-        raise BudgetExceeded("Agent turn budget exceeded")
+            session["last_response"] = response
+            return self.decision_engine.from_model_response(response, source="model")
+
+        async def dispatch(decision, state):
+            return await self._dispatch_runtime_decision(
+                decision,
+                state,
+                request=request,
+                run=session["run"],
+                task=task,
+                intent=intent,
+                request_frame=request_frame,
+                session=session,
+            )
+
+        async def fast_path(state):
+            if not session["fast_path_enabled"] or session["plan"] is None:
+                return None
+            step = self.loop.next_executable_step(session["plan"], session["completed_steps"])
+            if step is None:
+                session["fast_path_enabled"] = False
+                return None
+            return await self._execute_runtime_plan_step(
+                step,
+                request=request,
+                run=session["run"],
+                task=task,
+                intent=intent,
+                request_frame=request_frame,
+                session=session,
+            )
+
+        outcome = await self.agent_runtime.run(
+            initial_state,
+            decide=decide,
+            dispatch=dispatch,
+            refresh_state=refresh_state,
+            fast_path=fast_path,
+            max_iterations=self.budget.max_agent_turns,
+        )
+        if outcome.error == "EMPTY_MODEL_RESPONSE":
+            return None
+        if outcome.error == "AGENT_RUNTIME_BUDGET_EXCEEDED":
+            raise BudgetExceeded("Agent turn budget exceeded")
+        if outcome.status is None:
+            return None
+        summary = outcome.final_response or outcome.error or "当前运行已结束。"
+        return AgentResult(
+            agent_id="main",
+            task_id=task.id if task else run.task_id,
+            status=outcome.status,
+            summary=summary,
+            findings=list(outcome.findings),
+            datasets=sorted(set(outcome.dataset_ids)),
+            artifacts=sorted(set(outcome.artifact_ids)),
+            error=outcome.error,
+            trace_id=run.id,
+        )
+
+    async def _dispatch_runtime_decision(
+        self,
+        decision,
+        state,
+        *,
+        request: AgentRequest,
+        run: Run,
+        task: Task | None,
+        intent: IntentResult | None,
+        request_frame: RequestFrame | None,
+        session: dict[str, Any],
+    ) -> RuntimeTransition:
+        """把 AgentDecision 分派到已有执行能力，不在此处重复实现工具语义。"""
+
+        if decision.type.value == "FINAL":
+            response = (decision.final_response or "").strip()
+            if not response:
+                return RuntimeTransition(terminal=True, error="EMPTY_MODEL_RESPONSE")
+            await self.trace.emit(run.id, EventType.DECISION_MADE, "模型运行时决定直接回复，不执行空间工具。", payload={"source": "model_runtime", "action": "final", "model": decision.metadata.get("model")}, agent_id="main")
+            session["findings"].append({"model": decision.metadata.get("model"), "content": response})
+            return RuntimeTransition(
+                terminal=True,
+                status=AgentResultStatus.SUCCESS,
+                final_response=response,
+                findings=tuple(session["findings"]),
+                dataset_ids=tuple(sorted(session["dataset_ids"])),
+                artifact_ids=tuple(sorted(session["artifact_ids"])),
+            )
+        if decision.type.value == "ASK_USER":
+            return RuntimeTransition(
+                terminal=True,
+                status=AgentResultStatus.BLOCKED,
+                final_response=decision.final_response or decision.reasoning_summary,
+                error="WAITING_USER",
+            )
+        if decision.type.value == "ABORT":
+            if decision.metadata.get("empty_response"):
+                return RuntimeTransition(terminal=True, error="EMPTY_MODEL_RESPONSE")
+            return RuntimeTransition(terminal=True, status=AgentResultStatus.FAILED, error=decision.reasoning_summary)
+        if decision.type.value == "PLAN":
+            if intent is None:
+                intent = self.legacy_intent_adapter.to_intent(request_frame, request, session["datasets"])
+            new_plan = self.planner.build(decision.plan_goal or state.goal, intent, session["datasets"])
+            session["plan"] = new_plan
+            session["fast_path_enabled"] = True
+            await self.trace.emit(run.id, EventType.PLAN_CREATED, f"生成运行时计划：{len(new_plan.steps)} 步", payload={**new_plan.model_dump(mode="json"), "source": "agent_runtime"}, agent_id="main")
+            await self._checkpoint(run.id, "plan_created", self._checkpoint_state(request, intent, new_plan, session["datasets"], request_frame))
+            return RuntimeTransition(current_plan=new_plan)
+        if decision.type.value == "DELEGATE":
+            if task is None:
+                return RuntimeTransition(terminal=True, status=AgentResultStatus.BLOCKED, error="WAITING_USER", final_response="当前请求没有可委派的业务任务。")
+            result = await self._delegate(request, run, task, session["datasets"], decision.subtasks, intent=intent, plan=session["plan"], request_frame=request_frame, working_memory=session["working_memory"])
+            return RuntimeTransition(terminal=True, status=result.status, final_response=result.summary, error=result.error, findings=tuple(result.findings), dataset_ids=tuple(result.datasets), artifact_ids=tuple(result.artifacts))
+        if decision.type.value == "REPLAN":
+            return RuntimeTransition(terminal=True, status=AgentResultStatus.BLOCKED, error="REPLAN_REQUIRED", final_response=decision.reasoning_summary, directive=LoopDirective.REPLAN)
+
+        if decision.type.value != "TOOL":
+            return RuntimeTransition(terminal=True, status=AgentResultStatus.FAILED, error=f"不支持的运行时动作：{decision.type.value}")
+
+        raw_calls = decision.metadata.get("raw_tool_calls") or []
+        session["protocol_messages"].append({"role": "assistant", "content": decision.metadata.get("content", ""), "tool_calls": raw_calls})
+        invalid_calls = {item.get("id"): item for item in decision.metadata.get("invalid_tool_calls", []) if isinstance(item, dict)}
+        batch_observations: list[dict[str, Any]] = []
+        for call in decision.normalized_tool_calls():
+            invalid = invalid_calls.get(call.id)
+            if invalid is not None:
+                tool_result = ToolResult(
+                    call_id=call.id,
+                    status=ToolStatus.FAILED,
+                    error=ToolError(code="INVALID_TOOL_ARGUMENTS", category=ErrorCategory.INPUT, message=f"模型工具参数不是有效 JSON：{invalid.get('error', '未知错误')}"),
+                )
+                execution_outcome = None
+                observation = _invalid_tool_call_observation(call.id, tool_result, str(invalid.get("error", "未知错误")))
+                name = call.name
+            else:
+                execution_outcome = await self.tool_execution_cycle.execute(
+                    session["run"],
+                    call.name,
+                    call.arguments,
+                    user_id=self.store.user_id_for_run(session["run"].id),
+                    call_id=call.id,
+                )
+                tool_result = execution_outcome.result
+                observation = _execution_observation(execution_outcome)
+                name = call.name
+            batch_observations.append(observation)
+            session["findings"].append(
+                {
+                    "tool": name,
+                    "status": tool_result.status.value,
+                    "accepted": execution_outcome.accepted if execution_outcome else False,
+                    "verification_problems": execution_outcome.verification_problems if execution_outcome else [],
+                    "recovery_action": execution_outcome.recovery_action.value if execution_outcome and execution_outcome.recovery_action else None,
+                    "directive": execution_outcome.directive.value if execution_outcome else LoopDirective.ABORT.value,
+                    "verified": execution_outcome.verified if execution_outcome else False,
+                    "attempts": execution_outcome.attempts if execution_outcome else 1,
+                    "output": tool_result.output,
+                    "error": tool_result.error.model_dump(mode="json") if tool_result.error else None,
+                }
+            )
+            if execution_outcome is not None and execution_outcome.accepted:
+                self._accept_main_tool_result(session["run"], tool_result)
+                session["dataset_ids"].update(tool_result.datasets)
+                session["artifact_ids"].update(tool_result.artifacts)
+            elif execution_outcome is not None:
+                session["latest_failure"] = {
+                    "action": execution_outcome.directive.value,
+                    "error": tool_result.error.message if tool_result.error else execution_outcome.rationale,
+                }
+            session["protocol_messages"].append(protocol_tool_message(execution_outcome or observation))
+        latest_observation = _batch_observation(batch_observations)
+        session["latest_observation"] = latest_observation
+        bounded_protocol = compact_protocol_messages(session["protocol_messages"], max_tokens=self.budget.protocol_history_tokens)
+        session["protocol_messages"] = bounded_protocol
+        await self._checkpoint(
+            session["run"].id,
+            "model_tool_completed",
+            {
+                **self._checkpoint_state(request, intent, session["plan"], session["datasets"], request_frame),
+                "protocol_messages": bounded_protocol,
+                "latest_observation": latest_observation,
+                "model_findings": session["findings"],
+                "model_dataset_ids": sorted(session["dataset_ids"]),
+                "model_artifact_ids": sorted(session["artifact_ids"]),
+            },
+        )
+        return RuntimeTransition(
+            observation=latest_observation,
+            findings=tuple(session["findings"]),
+            dataset_ids=tuple(sorted(session["dataset_ids"])),
+            artifact_ids=tuple(sorted(session["artifact_ids"])),
+        )
+
+    async def _execute_runtime_plan_step(
+        self,
+        step,
+        *,
+        request: AgentRequest,
+        run: Run,
+        task: Task | None,
+        intent: IntentResult | None,
+        request_frame: RequestFrame | None,
+        session: dict[str, Any],
+    ) -> RuntimeTransition:
+        if step.tool_name is None:
+            session["completed_steps"].add(step.id)
+            step.status = TaskStatus.SUCCEEDED
+            return RuntimeTransition(completed_steps=(step.id,), current_plan=session["plan"])
+        arguments = self._complete_plan_arguments(step.tool_name, resolve_plan_arguments(step.arguments, session["step_outputs"]), user_id=request.user_id)
+        outcome = await self.tool_execution_cycle.execute(session["run"], step.tool_name, arguments, user_id=request.user_id)
+        session["findings"].append(
+            {
+                "step_id": step.id,
+                "tool": step.tool_name,
+                "status": outcome.result.status.value,
+                "accepted": outcome.accepted,
+                "verified": outcome.verified,
+                "verification_problems": list(outcome.verification_problems),
+                "directive": outcome.directive.value,
+                "attempts": outcome.attempts,
+                "datasets": list(outcome.result.datasets),
+                "artifacts": list(outcome.result.artifacts),
+            }
+        )
+        if outcome.accepted:
+            self._accept_main_tool_result(session["run"], outcome.result)
+            session["dataset_ids"].update(outcome.result.datasets)
+            session["artifact_ids"].update(outcome.result.artifacts)
+            session["completed_steps"].add(step.id)
+            step.status = TaskStatus.SUCCEEDED
+            session["step_outputs"][step.id] = {
+                "dataset_id": outcome.result.datasets[-1] if outcome.result.datasets else None,
+                "dataset_ids": list(outcome.result.datasets),
+                "artifact_ids": list(outcome.result.artifacts),
+                "output": outcome.result.output,
+            }
+        else:
+            session["fast_path_enabled"] = False
+        observation = _execution_observation(outcome)
+        session["latest_observation"] = observation
+        await self._checkpoint(
+            session["run"].id,
+            "plan_step_completed" if outcome.accepted else "plan_step_failed",
+            {
+                **self._checkpoint_state(request, intent, session["plan"], session["datasets"], request_frame),
+                "completed_steps": sorted(session["completed_steps"]),
+                "step_outputs": session["step_outputs"],
+                "latest_observation": observation,
+            },
+        )
+        return RuntimeTransition(
+            observation=observation,
+            directive=outcome.directive,
+            findings=tuple(session["findings"]),
+            dataset_ids=tuple(sorted(session["dataset_ids"])),
+            artifact_ids=tuple(sorted(session["artifact_ids"])),
+            current_plan=session["plan"],
+            completed_steps=(step.id,) if outcome.accepted else (),
+            step_outputs={step.id: session["step_outputs"][step.id]} if outcome.accepted else {},
+        )
 
     def _build_model_messages(
         self,
@@ -532,6 +787,8 @@ class MainAgent:
         working_memory: WorkingMemory | None,
         request_resources: RequestResources,
         current_observation: ToolResult | dict[str, Any] | None,
+        plan_progress: dict[str, Any] | None = None,
+        latest_failure: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         """为当前 turn 计算完整输入预算，并生成动态 Context + 协议历史。"""
 
@@ -564,6 +821,8 @@ class MainAgent:
             working_memory=working_memory,
             request_resources=request_resources,
             current_observation=current_observation,
+            plan_progress=plan_progress,
+            latest_failure=latest_failure,
             task_goal=task.goal if task else None,
             context_tokens=dynamic_tokens,
         )
@@ -625,6 +884,8 @@ class MainAgent:
         request_resources: RequestResources | None = None,
         current_observation: ToolResult | dict[str, Any] | None = None,
         task_goal: str | None = None,
+        plan_progress: dict[str, Any] | None = None,
+        latest_failure: dict[str, Any] | None = None,
         context_tokens: int | None = None,
     ) -> str:
         history = self.store.list_messages(request.conversation_id, limit=8)
@@ -660,6 +921,8 @@ class MainAgent:
             task_goal=task_goal,
             run_state=run,
             current_observation=current_observation,
+            plan_progress=plan_progress,
+            latest_failure=latest_failure,
             max_tokens=context_tokens,
         )
         return _MODEL_CONTEXT_INSTRUCTION + "\n" + json.dumps(context, ensure_ascii=False, default=str)

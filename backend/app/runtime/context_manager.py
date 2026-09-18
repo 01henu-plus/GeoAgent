@@ -55,6 +55,8 @@ class ContextManager:
         current_observation: Any = None,
         user_profile: UserProfile | dict[str, Any] | None = None,
         conversation_memory: ConversationMemory | dict[str, Any] | None = None,
+        plan_progress: dict[str, Any] | None = None,
+        latest_failure: dict[str, Any] | None = None,
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
         resource_view = _request_resources_view(request, request_resources)
@@ -76,6 +78,8 @@ class ContextManager:
             task_goal=task_goal,
             run_state=run_state,
             current_observation=current_observation,
+            plan_progress=plan_progress,
+            latest_failure=latest_failure,
             user_profile=user_profile,
             conversation_memory=conversation_memory,
         )
