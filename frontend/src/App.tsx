@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { api, Artifact, Conversation, Dataset, Event, fetchRunView, ModelStatus, Result, Run } from "./api";
+import { api, Artifact, Conversation, Dataset, Event, fetchRunView, ModelStatus, Result, Run, User } from "./api";
 import { childRunsOf, eventRuns, groupRunsByTask, interactionModeLabel, isActiveRun, isMainRun, lineageSource, RESUMABLE_RUN_STATUSES, runTitle, runsForConversation } from "./domain";
 
 type View = "chat" | "datasets" | "agents" | "runs" | "results" | "settings";
@@ -208,6 +208,8 @@ function formatDuration(durationMs: number): string {
 }
 
 export function App() {
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [view, setView] = useState<View>("chat");
   const [accountOpen, setAccountOpen] = useState(false);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
@@ -321,7 +323,55 @@ export function App() {
     }
   };
 
-  useEffect(() => { void refresh(); void initializeConversations(); }, []);
+  useEffect(() => {
+    let disposed = false;
+    void api.me().then((user) => {
+      if (!disposed) setCurrentUser(user);
+    }).catch(() => {
+      if (!disposed) setCurrentUser(null);
+    }).finally(() => {
+      if (!disposed) setAuthLoading(false);
+    });
+    return () => { disposed = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    void refresh();
+    void initializeConversations();
+  }, [currentUser?.id]);
+
+  const clearSessionState = () => {
+    setConversationId("");
+    setConversations([]);
+    setMessages([]);
+    setDatasets([]);
+    setSelectedDatasetIds([]);
+    setUploadedFiles([]);
+    setRuns([]);
+    setEvents([]);
+    setArtifacts([]);
+    setResult(null);
+    setActiveRunId(null);
+    setSelectedRunId(null);
+    setStreamingReply("");
+    setMessage("");
+    setModelStatus(null);
+    setSelectedModelProfile("");
+    window.sessionStorage.removeItem("geoagent.conversation_id");
+  };
+
+  const logout = async () => {
+    try {
+      await api.logout();
+    } catch {
+      // 即使服务端 Session 已失效，也必须清理当前浏览器状态。
+    }
+    clearSessionState();
+    setCurrentUser(null);
+    setAccountOpen(false);
+    setView("chat");
+  };
 
   const selectConversation = async (id: string) => {
     if (busy) return;
@@ -553,12 +603,15 @@ export function App() {
     }
   };
 
+  if (authLoading) return <div className="auth-shell"><div className="auth-card"><span className="eyebrow">GeoAgent</span><h1>正在检查登录状态</h1><p>请稍候…</p></div></div>;
+  if (!currentUser) return <AuthPage onAuthenticated={setCurrentUser} />;
+
   return <div className="shell">
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark">G</span><div><b>GeoAgent</b><small>空间智能</small></div></div>
       <section className="sidebar-block workspace-block"><div className="sidebar-block-title">工作区</div><Nav label="数据集" icon="◇" count={datasets.length} active={view === "datasets"} onClick={() => setView("datasets")} /><Nav label="智能体" icon="◎" count={agentCount} active={view === "agents"} onClick={() => setView("agents")} /><Nav label="运行与追踪" icon="⌁" count={conversationRuns.length} active={view === "runs"} onClick={() => setView("runs")} /><Nav label="结果" icon="▣" active={view === "results"} onClick={() => setView("results")} /></section>
       <section className="sidebar-block conversation-block"><div className="sidebar-block-head"><span>对话</span><button type="button" className="new-conversation" aria-label="新建对话" title="新建对话" disabled={busy} onClick={() => void createNewConversation()}>＋</button></div><div className="conversation-list">{conversations.length === 0 ? <span className="conversation-empty">正在加载对话…</span> : conversations.map((item) => <div className="conversation-row" key={item.id}><button type="button" className={`conversation-select ${item.id === conversationId ? "active" : ""}`} disabled={busy} onClick={() => void selectConversation(item.id)}><span className="conversation-dot" /><span className="conversation-title">{item.title || "新对话"}</span></button><button type="button" className="conversation-delete" aria-label={`删除对话 ${item.title}`} title="删除对话" disabled={busy} onClick={() => setPendingDeleteId((current) => current === item.id ? null : item.id)}>×</button>{pendingDeleteId === item.id && <div className="conversation-confirm" role="dialog" aria-label={`确认删除对话 ${item.title}`}><span>删除这个对话？</span><div><button type="button" className="conversation-confirm-delete" onClick={() => void deleteConversation(item)}>删除</button><button type="button" className="conversation-confirm-cancel" onClick={() => setPendingDeleteId(null)}>取消</button></div></div>}</div>)}</div></section>
-      <div className="account-area">{accountOpen && <div className="account-menu"><button type="button" onClick={() => { setView("settings"); setAccountOpen(false); }}>设置</button><div className="account-menu-note">当前为本地用户模式</div></div>}<button type="button" className="account-button" aria-expanded={accountOpen} onClick={() => setAccountOpen((current) => !current)}><span className="account-avatar">本</span><span className="account-copy"><b>本地用户</b><small>已登录</small></span><span className={`account-chevron ${accountOpen ? "open" : ""}`}>⌃</span></button></div>
+      <div className="account-area">{accountOpen && <div className="account-menu"><button type="button" onClick={() => { setView("settings"); setAccountOpen(false); }}>设置</button><button type="button" onClick={() => void logout()}>退出登录</button><div className="account-menu-note">当前账号：{currentUser.username}</div></div>}<button type="button" className="account-button" aria-expanded={accountOpen} onClick={() => setAccountOpen((current) => !current)}><span className="account-avatar">{(currentUser.display_name || currentUser.username).slice(0, 1).toUpperCase()}</span><span className="account-copy"><b>{currentUser.display_name || currentUser.username}</b><small>@{currentUser.username}</small></span><span className={`account-chevron ${accountOpen ? "open" : ""}`}>⌃</span></button></div>
     </aside>
     <main className="main">
       {view !== "chat" && <header className="topbar"><div><h1>{view === "datasets" ? "数据集登记" : view === "agents" ? "智能体活动" : view === "runs" ? "运行追踪" : view === "settings" ? "设置" : "结果中心"}</h1></div><div className="topbar-actions"><button className="ghost" onClick={() => setView("chat")}>返回对话</button><button className="close-view" type="button" aria-label="关闭当前页面" title="关闭" onClick={() => setView("chat")}>×</button><button className="ghost" onClick={() => void refresh()}>↻ 刷新</button></div></header>}
@@ -568,7 +621,7 @@ export function App() {
       {view === "agents" && <AgentPanel runs={conversationRuns} />}
       {view === "runs" && <RunPanel runs={conversationRuns} selectedRunId={selectedRunId} events={events} onSelect={loadRun} onCancel={cancelRun} onResume={resumeRun} onDelete={deleteRun} onDeleteMany={deleteRunRecords} busy={busy} />}
       {view === "results" && <ResultPanel result={result} datasets={datasets} events={events} artifacts={artifacts} />}
-      {view === "settings" && <SettingsPanel modelStatus={modelStatus} />}
+      {view === "settings" && <SettingsPanel currentUser={currentUser} onSaved={setCurrentUser} modelStatus={modelStatus} />}
     </main>
   </div>;
 }
@@ -665,8 +718,54 @@ function ResultPanel({ result, datasets, events, artifacts }: { result: Result |
   return <section className="panel result-panel">{!result ? <Empty text="完成一次分析后，结果、证据和运行追踪会显示在这里。" /> : <><div className="result-head"><div><span className={`pill ${result.status.toLowerCase()}`}>{statusLabel(result.status)}</span><h2>{result.summary}</h2></div><code>{result.trace_id}</code></div>{result.error && <div className="result-error"><b>错误</b><span>{result.error}</span></div>}<div className="result-columns"><div><h3>分析发现</h3>{result.findings.length === 0 ? <Empty text="没有结构化发现。" /> : result.findings.map((finding, index) => <pre key={index}>{findingText(finding)}</pre>)}<h3>关联数据集</h3>{result.datasets.length === 0 ? <p className="muted-text">本次运行没有关联数据集。</p> : <div className="dataset-result-list">{result.datasets.map((datasetId) => { const dataset = datasets.find((item) => item.id === datasetId); return <div className="dataset-result-item" key={datasetId}><b>{dataset?.name ?? datasetId}</b><small>{dataset?.kind ? kindLabel(dataset.kind) : "数据集"} · {datasetId}</small></div>; })}</div>}<h3>结果文件</h3>{result.artifacts.length === 0 ? <p className="muted-text">本次运行没有产物。</p> : <div className="artifact-list">{result.artifacts.map((artifactId) => { const artifact = artifacts.find((item) => item.id === artifactId); return <a className="artifact-link" href={api.artifactUrl(artifactId)} target="_blank" rel="noreferrer" key={artifactId}>{artifact?.name ?? artifactId} <span>↗</span></a>; })}</div>}{result.evidence.length > 0 && <><h3>证据</h3>{result.evidence.map((evidence, index) => <pre key={index}>{findingText(evidence)}</pre>)}</>}</div><div><h3>执行情况</h3><div className="metric"><b>{events.length}</b><span>追踪事件</span></div><div className="metric"><b>{result.datasets.length}</b><span>涉及数据集</span></div><div className="metric"><b>{result.artifacts.length}</b><span>结果文件</span></div>{result.warnings.length > 0 && <><h3>警告</h3>{result.warnings.map((warning) => <p className="warning" key={warning}>{warning}</p>)}</>}</div></div></> }</section>;
 }
 
-function SettingsPanel({ modelStatus }: { modelStatus: ModelStatus | null }) {
-  return <section className="panel settings-panel"><div className="panel-head"><div><span className="eyebrow">本地账户与运行配置</span><h2>设置</h2></div></div><div className="settings-grid"><div className="setting-item"><span>用户名称</span><b>本地用户</b></div><div className="setting-item"><span>登录状态</span><b>已登录（本地模式）</b></div><div className="setting-item"><span>默认模型</span><b>{modelStatus?.profiles.find((profile) => profile.id === modelStatus.default_profile)?.label ?? "未配置"}</b></div><div className="setting-item"><span>可用模型</span><b>{modelStatus?.profiles.length ?? 0} 个</b></div></div><p className="settings-note">模型接口从后端环境配置中读取，发送消息时可在对话框右下角切换。</p></section>;
+function SettingsPanel({ currentUser, onSaved, modelStatus }: { currentUser: User; onSaved: (user: User) => void; modelStatus: ModelStatus | null }) {
+  const [displayName, setDisplayName] = useState(currentUser.display_name);
+  const [email, setEmail] = useState(currentUser.email ?? "");
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState("");
+  const save = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSaving(true);
+    setSaved(false);
+    setError("");
+    try {
+      const user = await api.updateMe(displayName, email);
+      onSaved(user);
+      setSaved(true);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <section className="panel settings-panel"><div className="panel-head"><div><span className="eyebrow">账号与运行配置</span><h2>设置</h2></div></div><form className="account-settings-form" onSubmit={(event) => void save(event)}><label>显示名称<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label><label>用户名<input value={currentUser.username} readOnly /></label><label>邮箱<input value={email} onChange={(event) => setEmail(event.target.value)} type="email" /></label><button className="primary" disabled={saving || !displayName.trim()}>{saving ? "正在保存…" : "保存账号信息"}</button>{saved && <span className="settings-success">已保存</span>}{error && <span className="settings-inline-error">{error}</span>}</form><div className="settings-grid"><div className="setting-item"><span>登录状态</span><b>已登录</b></div><div className="setting-item"><span>默认模型</span><b>{modelStatus?.profiles.find((profile) => profile.id === modelStatus.default_profile)?.label ?? "未配置"}</b></div><div className="setting-item"><span>可用模型</span><b>{modelStatus?.profiles.length ?? 0} 个</b></div></div><p className="settings-note">模型接口从后端环境配置中读取，发送消息时可在对话框右下角切换。</p></section>;
+}
+
+function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => void }) {
+  const [registering, setRegistering] = useState(false);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [email, setEmail] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const user = registering
+        ? await api.register(username, password, displayName || username, email)
+        : await api.login(username, password);
+      onAuthenticated(user);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <div className="auth-shell"><div className="auth-card"><div className="brand auth-brand"><span className="brand-mark">G</span><div><b>GeoAgent</b><small>空间智能</small></div></div><span className="eyebrow">{registering ? "创建账号" : "欢迎回来"}</span><h1>{registering ? "创建你的 GeoAgent 账号" : "登录 GeoAgent"}</h1><p>{registering ? "账号创建后，你的数据、对话和运行记录将独立保存。" : "登录后继续访问你的对话和空间数据。"}</p><form className="auth-form" onSubmit={(event) => void submit(event)}><label>用户名或邮箱<input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" required /></label><label>密码<input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete={registering ? "new-password" : "current-password"} required /></label>{registering && <><label>显示名称<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="可选，默认使用用户名" /></label><label>邮箱<input value={email} onChange={(event) => setEmail(event.target.value)} type="email" placeholder="可选" /></label></>}<button className="primary auth-submit" disabled={busy}>{busy ? "处理中…" : registering ? "注册并登录" : "登录"}</button>{error && <div className="error auth-error">{error}</div>}</form><button type="button" className="auth-switch" onClick={() => { setRegistering((value) => !value); setError(""); }}>{registering ? "已有账号？返回登录" : "还没有账号？注册"}</button></div></div>;
 }
 
 function Empty({ text }: { text: string }) { return <div className="empty">{text}</div>; }

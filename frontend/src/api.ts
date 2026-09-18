@@ -10,13 +10,14 @@ export type Event = { id: string; run_id: string; event_type: string; message: s
 export type Artifact = { id: string; name: string; kind: string; path?: string | null; media_type?: string | null; dataset_id?: string | null; run_id?: string | null; description: string; metadata: Record<string, unknown>; created_at?: string | null };
 export type ResumeResponse = { resumed_from: string; run_id: string; checkpoint: string; result: Result };
 export type Conversation = { id: string; title: string; created_at: string; updated_at: string };
+export type User = { id: string; username: string; email?: string | null; display_name: string; is_active: boolean; created_at: string; updated_at: string };
 export type ConversationMessage = { id: string; conversation_id: string; role: string; content: string; run_id?: string | null; created_at?: string };
 export type ModelProfile = { id: string; label: string; provider: string; base_url?: string | null; model: string; timeout_seconds: number; temperature: number; has_api_key: boolean; default: boolean };
 export type ModelStatus = { configured: boolean; source: string; default_profile?: string | null; profiles: ModelProfile[] };
 export type RunDetails = { run: Run; result: Result | null; events: Event[]; artifacts: Artifact[] };
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, { headers: { "Content-Type": "application/json" }, ...init });
+  const response = await fetch(url, { credentials: "include", headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) }, ...init });
   const body = await response.text();
   if (!response.ok) {
     let message = body;
@@ -37,7 +38,7 @@ function websocketUrl(): string {
 async function uploadAttachment(file: File): Promise<Dataset> {
   const form = new FormData();
   form.append("file", file);
-  const response = await fetch("/api/v1/attachments", { method: "POST", body: form });
+  const response = await fetch("/api/v1/attachments", { method: "POST", credentials: "include", body: form });
   const body = await response.text();
   if (!response.ok) {
     let message = body;
@@ -88,6 +89,11 @@ function streamAsk(message: string, datasetIds: string[], attachmentIds: string[
 }
 
 export const api = {
+  me: () => request<User>("/api/v1/users/me"),
+  register: (username: string, password: string, displayName: string, email?: string) => request<User>("/api/v1/auth/register", { method: "POST", body: JSON.stringify({ username, password, display_name: displayName, email: email || undefined }) }),
+  login: (identifier: string, password: string) => request<User>("/api/v1/auth/login", { method: "POST", body: JSON.stringify({ identifier, password }) }),
+  logout: () => request<{ logged_out: boolean }>("/api/v1/auth/logout", { method: "POST" }),
+  updateMe: (displayName: string, email?: string) => request<User>("/api/v1/users/me", { method: "PATCH", body: JSON.stringify({ display_name: displayName, email: email || null }) }),
   datasets: () => request<Dataset[]>("/api/v1/datasets"),
   uploadAttachment,
   conversations: (limit = 50) => request<Conversation[]>(`/api/v1/conversations?limit=${limit}`),
