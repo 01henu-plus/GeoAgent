@@ -378,6 +378,8 @@ class MainAgent:
             self.store.save_run(run)
             previous_checkpoint = self.checkpoint_store.latest(run.id) if self.checkpoint_store else None
             state = dict(previous_checkpoint.state) if previous_checkpoint else {}
+            # 历史 checkpoint 可能带有旧 IntentResult；新 checkpoint 不再延续该字段。
+            state.pop("intent", None)
             state.update(
                 {
                     "request": request.model_dump(mode="json"),
