@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.core.models import Dataset, RequestFrame, RequestResources
+from app.core.models import Dataset, InteractionMode, RequestFrame, RequestResources
 from app.models import ModelAdapter
 from app.state import StateStore
 from app.understanding.deterministic import extract_request_hints
@@ -56,7 +56,10 @@ class RequestUnderstandingPipeline:
                 model_adapter=model_adapter,
                 datasets=datasets,
             )
-        frame = merge_deterministic_fields(frame, extract_request_hints(normalized, datasets or state.recent_datasets))
+        semantic_text = normalized
+        if frame.mode in {InteractionMode.CONTINUE_TASK, InteractionMode.RETRY_TASK} and frame.goal != normalized:
+            semantic_text = frame.goal
+        frame = merge_deterministic_fields(frame, extract_request_hints(semantic_text, datasets or state.recent_datasets))
         merged = _merge_references(frame, resolution)
         return self.validator.validate(merged, state, request_resources)
 
