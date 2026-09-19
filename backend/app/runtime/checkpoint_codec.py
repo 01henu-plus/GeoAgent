@@ -79,7 +79,6 @@ class RuntimeCheckpointCodec:
         payload: dict[str, Any] = {
             "request": request.model_dump(mode="json"),
             "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
-            "plan": plan.model_dump(mode="json") if plan else None,
             "current_plan": plan.model_dump(mode="json") if plan else None,
             "original_plan": session.original_plan.model_dump(mode="json") if session.original_plan else None,
             "completed_steps": sorted(session.completed_steps),

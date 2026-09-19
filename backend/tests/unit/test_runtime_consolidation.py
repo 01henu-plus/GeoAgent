@@ -63,6 +63,7 @@ def test_checkpoint_codec_round_trips_canonical_state_and_reads_legacy_aliases()
     payload = RuntimeCheckpointCodec.encode(request, frame, session)
 
     assert all(key in payload for key in RuntimeCheckpointCodec.CANONICAL_FIELDS)
+    assert "plan" not in payload
     assert "model_findings" not in payload
     assert "model_dataset_ids" not in payload
     assert "model_artifact_ids" not in payload

@@ -99,7 +99,6 @@ class RuntimeActionHandlers:
         registry,
         default_crs: str,
         checkpoint: Callable[[], CheckpointWriter],
-        step_checkpoint: Callable[..., Awaitable[None]] | None = None,
         checkpoint_codec: RuntimeCheckpointCodec,
     ) -> None:
         self.store = store
@@ -116,7 +115,6 @@ class RuntimeActionHandlers:
         self.registry = registry
         self.default_crs = default_crs
         self.checkpoint = checkpoint
-        self.step_checkpoint = step_checkpoint
         self.checkpoint_codec = checkpoint_codec
 
     async def handle_tool(
@@ -305,7 +303,7 @@ class RuntimeActionHandlers:
             step.status = TaskStatus.FAILED
         observation = _execution_observation(outcome)
         session.latest_observation = observation
-        await self._step_checkpoint(
+        await self._checkpoint_runtime(
             request,
             request_frame,
             session,
@@ -467,19 +465,12 @@ class RuntimeActionHandlers:
             task,
             session.datasets,
             tasks,
-            plan=session.current_plan,
+            session=session,
             request_frame=request_frame,
             working_memory=session.working_memory,
             fingerprint=fingerprint,
         )
         session.fast_path_enabled = False
-        session.completed_delegation_fingerprints.add(delegation.fingerprint)
-        session.subagent_results = _merge_subagent_views(session.subagent_results, delegation.subagent_results)
-        session.findings.extend(delegation.findings)
-        session.dataset_ids.update(delegation.dataset_ids)
-        session.artifact_ids.update(delegation.artifact_ids)
-        session.latest_observation = delegation.observation
-        session.latest_failure = delegation.latest_failure
         return RuntimeTransition(
             observation=delegation.observation,
             directive=delegation.directive,
@@ -499,7 +490,7 @@ class RuntimeActionHandlers:
         datasets,
         tasks=None,
         *,
-        plan: Plan | None,
+        session: AgentRuntimeSession,
         request_frame: RequestFrame | None,
         working_memory: WorkingMemory | None,
         fingerprint: str,
@@ -517,14 +508,14 @@ class RuntimeActionHandlers:
                 payload=subtask.model_dump(mode="json"),
                 agent_id="main",
             )
-        await self._checkpoint_writer()(
-            run.id,
+        await self._checkpoint_runtime(
+            request,
+            request_frame,
+            session,
             "delegation_started",
-            {
-                **_checkpoint_state(request, plan, datasets, request_frame),
+            extra={
                 "subtask_ids": [item.id for item in tasks],
                 "delegation_fingerprint": fingerprint,
-                "completed_delegation_fingerprints": [],
                 "runtime_delegation": True,
             },
         )
@@ -543,7 +534,9 @@ class RuntimeActionHandlers:
             parent_memory = self.working_memory_updater.merge_deltas(parent_memory, deltas)
             self.store.save_working_memory(parent_memory)
         current_run = self.store.get_run(run.id) or run
-        self.store.save_run(current_run.model_copy(update={"status": RunStatus.RUNNING}))
+        current_run = current_run.model_copy(update={"status": RunStatus.RUNNING})
+        self.store.save_run(current_run)
+        session.run = current_run
 
         views = tuple(
             _subagent_result_view(subtask, execution)
@@ -579,16 +572,22 @@ class RuntimeActionHandlers:
             },
             agent_id="main",
         )
-        await self._checkpoint_writer()(
-            run.id,
+        session.subagent_results = _merge_subagent_views(session.subagent_results, views)
+        session.findings.extend(findings)
+        session.dataset_ids.update(output_ids)
+        session.artifact_ids.update(artifact_ids)
+        session.latest_observation = observation
+        session.latest_failure = latest_failure
+        session.completed_delegation_fingerprints.add(fingerprint)
+        session.working_memory = parent_memory
+        await self._checkpoint_runtime(
+            request,
+            request_frame,
+            session,
             "delegation_completed",
-            {
-                **_checkpoint_state(request, plan, datasets, request_frame),
+            extra={
                 "subtask_ids": [item.id for item in tasks],
                 "delegation_fingerprint": fingerprint,
-                "subagent_results": [dict(item) for item in views],
-                "dataset_ids": list(output_ids),
-                "artifact_ids": list(artifact_ids),
                 "directive": directive.value,
                 "working_memory_refs": _working_memory_refs(parent_memory),
                 "runtime_delegation": True,
@@ -663,35 +662,26 @@ class RuntimeActionHandlers:
         )
         replanning_run = current_run.model_copy(update={"status": RunStatus.REPLANNING, "replan_count": next_count})
         self.store.save_run(replanning_run)
-        await self._checkpoint_writer()(
-            run.id,
+        session.run = replanning_run
+        await self._checkpoint_runtime(
+            request,
+            request_frame,
+            session,
             "replan_started",
-            {
-                "request": request.model_dump(mode="json"),
-                "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
-                "plan": current_plan.model_dump(mode="json"),
-                "original_plan": original_plan.model_dump(mode="json"),
+            extra={
                 "replan_context": context.model_dump(mode="json"),
-                "replan_count": next_count,
-                **_plan_state_from_session(session, reasons, error_message),
             },
         )
         revised = self._replanner().replan(context, request_frame or RequestFrame(mode="new_task", goal=context.goal), datasets)
-        self.store.save_run(replanning_run.model_copy(update={"status": RunStatus.RUNNING}))
         next_state = _plan_state_from_session(session, reasons, error_message)
-        next_state["errors"] = []
-        await self._checkpoint_writer()(
-            run.id,
-            "replan_completed",
-            {
-                "request": request.model_dump(mode="json"),
-                "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
-                "plan": revised.model_dump(mode="json"),
-                "original_plan": original_plan.model_dump(mode="json"),
-                "replan_count": next_count,
-                **next_state,
-            },
-        )
+        running_run = replanning_run.model_copy(update={"status": RunStatus.RUNNING})
+        self.store.save_run(running_run)
+        session.run = running_run
+        session.current_plan = revised
+        session.original_plan = original_plan
+        session.previous_replan_reasons = reasons
+        session.latest_failure = None
+        await self._checkpoint_runtime(request, request_frame, session, "replan_completed")
         await self.trace.emit(
             run.id,
             EventType.PLAN_CREATED,
@@ -740,36 +730,20 @@ class RuntimeActionHandlers:
         request_frame: RequestFrame | None,
         session: AgentRuntimeSession,
         phase: str,
+        *,
+        extra: dict[str, Any] | None = None,
     ) -> None:
+        state = self.checkpoint_codec.encode(request, request_frame, session)
+        if extra:
+            state.update(extra)
         await self._checkpoint_writer()(
             session.run.id,
             phase,
-            self.checkpoint_codec.encode(request, request_frame, session),
+            state,
         )
-
-    async def _step_checkpoint(
-        self,
-        request: AgentRequest,
-        request_frame: RequestFrame | None,
-        session: AgentRuntimeSession,
-        phase: str,
-    ) -> None:
-        if self.step_checkpoint is not None:
-            await self.step_checkpoint(request, request_frame, session, phase)
-            return
-        await self._checkpoint_runtime(request, request_frame, session, phase)
 
     def _checkpoint_writer(self) -> CheckpointWriter:
         return self.checkpoint()
-
-
-def _checkpoint_state(request, plan, datasets, request_frame):
-    return {
-        "request": request.model_dump(mode="json"),
-        "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
-        "plan": plan.model_dump(mode="json") if plan else None,
-        "dataset_ids": [item.id for item in datasets],
-    }
 
 
 def _execution_observation(outcome: ExecutionOutcome) -> dict[str, Any]:

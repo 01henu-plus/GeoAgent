@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.application import Application
 from app.core.models import AgentRequest, AgentResult, User, UserView, new_id
+from app.runtime.checkpoint_codec import RuntimeCheckpointCodec
 
 
 class AskBody(BaseModel):
@@ -367,16 +368,10 @@ def create_app(application: Application | None = None) -> FastAPI:
             goal = str(previous.metadata.get("goal", "继续上一次 GIS 任务"))
             saved_request = {"user_input": goal, "conversation_id": previous.conversation_id or new_id("conv")}
         request = AgentRequest.model_validate(saved_request).model_copy(update={"user_id": current_user.id})
-        # 新 checkpoint 以 RequestFrame 为理解依据；旧 checkpoint 仍可通过 intent
-        # 字段满足恢复前置检查，具体运行时只读取 canonical plan/request_frame。
-        has_saved_plan = bool(
-            checkpoint.state.get("plan")
-            and (checkpoint.state.get("request_frame") or checkpoint.state.get("intent"))
-        )
-        has_model_context = any(
-            isinstance(checkpoint.state.get(key), list) and bool(checkpoint.state[key])
-            for key in ("protocol_messages", "messages")
-        )
+        # API 只消费 Codec 解析出的 canonical resume view；旧字段兼容只存在 Codec 内部。
+        runtime_resume = RuntimeCheckpointCodec.decode(checkpoint.state)
+        has_saved_plan = runtime_resume.current_plan is not None and isinstance(checkpoint.state.get("request_frame"), dict)
+        has_model_context = bool(runtime_resume.protocol_messages)
         if not has_saved_plan and not has_model_context:
             raise HTTPException(status_code=409, detail="checkpoint 还没有可恢复的上下文")
         run = await geoagent.run_manager.submit(request, resume_from=checkpoint, metadata={"resumed_from": run_id})

@@ -111,4 +111,5 @@ def test_planner_replan_increments_revision_and_skips_completed_step(application
     assert application.store.get_run(run.id).replan_count == 1
     checkpoint = application.checkpoints.latest(run.id)
     assert checkpoint is not None
-    assert checkpoint.state["plan"]["revision"] == 2
+    assert checkpoint.state["current_plan"]["revision"] == 2
+    assert "plan" not in checkpoint.state

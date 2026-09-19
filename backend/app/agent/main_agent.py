@@ -272,7 +272,7 @@ class MainAgent:
         )
         try:
             datasets = self._resolve_datasets(request)
-            if resume_from and (resume_state.get("current_plan") or resume_state.get("plan")):
+            if resume_from and runtime_resume.current_plan is not None:
                 plan = runtime_resume.current_plan
                 phase = resume_from.phase
                 await self.trace.emit(run.id, EventType.RESUME_STARTED, f"从 Checkpoint 继续：{resume_from.phase}", payload={"checkpoint_id": resume_from.id, "phase": resume_from.phase}, agent_id="main")
@@ -335,26 +335,7 @@ class MainAgent:
             completion_state = {"status": final_status.value, "result": result.model_dump(mode="json")}
             previous_checkpoint = self.checkpoint_store.latest(run.id) if self.checkpoint_store else None
             if previous_checkpoint is not None:
-                for key in (
-                    "request",
-                    "request_frame",
-                    "plan",
-                    "current_plan",
-                    "original_plan",
-                    "completed_steps",
-                    "step_outputs",
-                    "protocol_messages",
-                    "latest_observation",
-                    "latest_failure",
-                    "findings",
-                    "dataset_ids",
-                    "artifact_ids",
-                    "subagent_results",
-                    "completed_delegation_fingerprints",
-                    "replan_count",
-                    "previous_replan_reasons",
-                    "runtime_mode",
-                ):
+                for key in RuntimeCheckpointCodec.CANONICAL_FIELDS:
                     if key in previous_checkpoint.state:
                         completion_state[key] = previous_checkpoint.state[key]
             await self._checkpoint(run.id, "run_completed", completion_state)
