@@ -69,6 +69,7 @@ from app.observability import TraceRecorder
 from app.profile import ProfilePreferenceExtractor, UserProfileService
 from app.run.lifecycle import PreparedRequest, RequestLifecycleBinder
 from app.runtime.action_dispatcher import RuntimeActionDispatcher
+from app.runtime.action_handlers import RuntimeActionHandlers
 from app.runtime.agent_loop import AgentLoop, PlanLoopOutcome, resolve_plan_arguments
 from app.runtime.agent_runtime import AgentRuntime, RuntimeTransition
 from app.runtime.agent_state import AgentStateBuilder
@@ -176,6 +177,33 @@ class MainAgent:
         self.agent_runtime = AgentRuntime(max_runtime_transitions=self.budget.max_runtime_transitions)
         self.lifecycle_binder = RequestLifecycleBinder(store, task_service)
         self.runtime_checkpoint_codec = RuntimeCheckpointCodec()
+        self.runtime_action_handlers = RuntimeActionHandlers(
+            store=self.store,
+            trace=self.trace,
+            budget=self.budget,
+            guard=self.guard,
+            planner=lambda: self.planner,
+            replanner=lambda: self.replanner,
+            decomposer=self.decomposer,
+            agent_manager=lambda: self.agent_manager,
+            task_service=self.task_service,
+            legacy_intent_adapter=self.legacy_intent_adapter,
+            intent_resolver=self.intent_resolver,
+            plan_loop=self.loop,
+            tool_execution_cycle=lambda: self.tool_execution_cycle,
+            working_memory_updater=self.working_memory_updater,
+            registry=self.registry,
+            default_crs=self.settings.default_crs,
+            checkpoint=lambda: self._checkpoint,
+            checkpoint_codec=self.runtime_checkpoint_codec,
+            step_checkpoint=lambda request, intent, request_frame, session, phase: self._runtime_step_checkpoint(
+                request,
+                intent,
+                request_frame,
+                session,
+                phase,
+            ),
+        )
         self.model_decision_provider = ModelDecisionProvider(
             decision_engine=self.decision_engine,
             build_messages=self._build_model_messages,
@@ -196,6 +224,12 @@ class MainAgent:
             conversation_reply=_conversation_reply,
         )
         self.runtime_action_dispatcher = RuntimeActionDispatcher(
+            handlers={
+                DecisionType.TOOL: self.runtime_action_handlers.handle_tool,
+                DecisionType.PLAN: self.runtime_action_handlers.handle_plan,
+                DecisionType.REPLAN: self.runtime_action_handlers.handle_replan,
+                DecisionType.DELEGATE: self.runtime_action_handlers.handle_delegate,
+            },
             compatibility_handler=self._dispatch_runtime_decision,
         )
         self.runtime_controller = AgentRuntimeController(
@@ -213,7 +247,7 @@ class MainAgent:
             trace_decision=self._trace_runtime_decision,
             checkpoint=self._checkpoint,
             checkpoint_codec=self.runtime_checkpoint_codec,
-            plan_fast_path=self._execute_runtime_plan_step,
+            plan_fast_path=self.runtime_action_handlers.execute_plan_step,
         )
 
     async def prepare_request(
@@ -903,6 +937,18 @@ class MainAgent:
     ) -> RuntimeTransition:
         """把 AgentDecision 分派到已有执行能力，不在此处重复实现工具语义。"""
 
+        if decision.type in {DecisionType.TOOL, DecisionType.PLAN, DecisionType.REPLAN, DecisionType.DELEGATE}:
+            return await self.runtime_action_dispatcher.dispatch(
+                decision,
+                state,
+                session,
+                request=request,
+                run=run,
+                task=task,
+                intent=intent,
+                request_frame=request_frame,
+            )
+
         if decision.type.value == "FINAL":
             response = (decision.final_response or "").strip()
             if not response:
@@ -1117,6 +1163,19 @@ class MainAgent:
         request_frame: RequestFrame | None,
         session: AgentRuntimeSession,
     ) -> RuntimeTransition:
+        """兼容旧调用方；实际 Plan fast path 由 RuntimeActionHandlers 执行。"""
+
+        return await self.runtime_action_handlers.execute_plan_step(
+            step,
+            request=request,
+            run=run,
+            task=task,
+            intent=intent,
+            request_frame=request_frame,
+            session=session,
+        )
+
+        # 下面保留旧实现的源码边界，供历史 checkpoint/调用方升级期间参考。
         if step.tool_name is None:
             session["completed_steps"].add(step.id)
             step.status = TaskStatus.SUCCEEDED
@@ -1206,6 +1265,17 @@ class MainAgent:
         session: dict[str, Any],
     ) -> RuntimeTransition:
         """把运行时 REPLAN 请求接到现有 Replanner，不在 Decision 层重建计划。"""
+
+        return await self.runtime_action_handlers.handle_replan(
+            decision,
+            state,
+            request=request,
+            run=run,
+            task=task,
+            intent=intent,
+            request_frame=request_frame,
+            session=session,
+        )
 
         current_plan = session.get("plan")
         if current_plan is None:
@@ -1601,6 +1671,28 @@ class MainAgent:
         self.checkpoint_store.save(checkpoint)
         await self.trace.emit(run_id, EventType.CHECKPOINT_SAVED, f"保存 Checkpoint：{phase}", payload={"checkpoint_id": checkpoint.id, "phase": phase}, agent_id="main")
 
+    async def _runtime_step_checkpoint(
+        self,
+        request: AgentRequest,
+        intent: IntentResult | None,
+        request_frame: RequestFrame | None,
+        session: AgentRuntimeSession,
+        phase: str,
+    ) -> None:
+        """为 runtime handler 保留旧 checkpoint hook 的兼容边界。"""
+
+        await self._step_checkpoint(
+            session.run.id,
+            request,
+            intent,
+            session.current_plan,
+            session.datasets,
+            set(session.completed_steps),
+            request_frame=request_frame,
+            phase=phase,
+            runtime_session=session,
+        )
+
     async def _step_checkpoint(
         self,
         run_id: str,
@@ -1867,6 +1959,35 @@ class MainAgent:
         legacy_plan_progress: bool = False,
     ) -> DelegationExecutionResult:
         """只执行一次委派并返回 Observation；不构造 MainAgent 最终结果。"""
+
+        delegation = await self.runtime_action_handlers.execute_delegation(
+            request,
+            run,
+            task,
+            datasets,
+            tasks,
+            intent=intent,
+            plan=plan,
+            request_frame=request_frame,
+            working_memory=working_memory,
+            fingerprint=fingerprint or _delegation_fingerprint(list(tasks or self.decomposer.decompose(request, datasets))),
+            completed_fingerprints=completed_fingerprints,
+            legacy_plan_progress=legacy_plan_progress,
+        )
+        return DelegationExecutionResult(
+            tasks=delegation.tasks,
+            executions=delegation.executions,
+            directive=delegation.directive,
+            findings=delegation.findings,
+            dataset_ids=delegation.dataset_ids,
+            artifact_ids=delegation.artifact_ids,
+            observation=delegation.observation,
+            subagent_results=delegation.subagent_results,
+            latest_failure=delegation.latest_failure,
+            fingerprint=delegation.fingerprint,
+        )
+
+        # 保留旧实现的源码边界，旧调用方已通过上面的 runtime wrapper 迁移。
 
         tasks = list(tasks or self.decomposer.decompose(request, datasets))
         self.guard.check_subagents(len(tasks))
