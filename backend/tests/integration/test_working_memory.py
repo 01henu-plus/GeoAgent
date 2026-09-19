@@ -18,6 +18,7 @@ from app.core.models import (
 )
 from app.memory import MemoryExtractor
 from app.memory.models import MemoryCandidate
+from app.models import ModelAdapter, ModelResponse
 from app.state import WorkingMemoryUpdater
 
 
@@ -232,17 +233,15 @@ def test_resume_uses_current_task_working_memory_instead_of_old_checkpoint(appli
     )
     version_two = version_one.model_copy(update={"active_dataset_ids": ["dataset-v2"]})
     application.store.save_working_memory(version_two)
-    seen: dict[str, WorkingMemory] = {}
+    class FinalModel(ModelAdapter):
+        async def complete(self, request):
+            return ModelResponse(content="恢复完成", model="test")
 
-    async def fake_model_loop(*args, **kwargs):
-        seen["memory"] = kwargs["working_memory"]
-        return AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.SUCCESS, summary="恢复完成", trace_id=args[1].id)
-
-    application.main_agent._model_loop = fake_model_loop
+    application.main_agent.model_adapter = FinalModel()
     prepared = asyncio.run(application.main_agent.prepare_request(request, resume_from=checkpoint))
+    assert prepared.working_memory.active_dataset_ids == ["dataset-v2"]
     asyncio.run(application.main_agent.run(request, prepared=prepared, resume_from=checkpoint))
 
-    assert seen["memory"].active_dataset_ids == ["dataset-v2"]
     assert application.store.get_working_memory(task.id).active_dataset_ids == ["dataset-v2"]
 
 
@@ -258,15 +257,12 @@ def test_resume_restores_checkpoint_working_memory_when_store_is_missing(applica
         phase="plan_created",
         state={"request": request.model_dump(mode="json"), "request_frame": frame.model_dump(mode="json"), "working_memory": version_one.model_dump(mode="json")},
     )
-    seen: dict[str, WorkingMemory] = {}
+    class FinalModel(ModelAdapter):
+        async def complete(self, request):
+            return ModelResponse(content="恢复完成", model="test")
 
-    async def fake_model_loop(*args, **kwargs):
-        seen["memory"] = kwargs["working_memory"]
-        return AgentResult(agent_id="main", task_id=task.id, status=AgentResultStatus.SUCCESS, summary="恢复完成", trace_id=args[1].id)
-
-    application.main_agent._model_loop = fake_model_loop
+    application.main_agent.model_adapter = FinalModel()
     prepared = asyncio.run(application.main_agent.prepare_request(request, resume_from=checkpoint))
     asyncio.run(application.main_agent.run(request, prepared=prepared, resume_from=checkpoint))
 
-    assert seen["memory"].active_dataset_ids == ["dataset-checkpoint"]
     assert application.store.get_working_memory(task.id).active_dataset_ids == ["dataset-checkpoint"]

@@ -20,6 +20,7 @@ from app.core.models import (
     WorkingMemoryItem,
 )
 from app.models import ModelAdapter, ModelRequest, ModelResponse
+from app.run.lifecycle import LifecycleAction, PreparedRequest
 from app.runtime.context_manager import ContextManager
 
 
@@ -187,7 +188,15 @@ def test_model_second_turn_reads_updated_working_memory(application):
     application.main_agent._tool = fake_tool
     request = AgentRequest(user_input="分析结果", conversation_id=task.conversation_id)
     frame = RequestFrame(mode=InteractionMode.CONTINUE_TASK, goal="分析结果", target_task_id=task.id)
-    result = asyncio.run(application.main_agent._model_loop(request, run, task, [], None, None, request_frame=frame, working_memory=memory))
+    prepared = PreparedRequest(
+        request=request,
+        frame=frame,
+        action=LifecycleAction.BIND_TASK,
+        task=task,
+        run=run,
+        working_memory=memory,
+    )
+    result = asyncio.run(application.main_agent.run(request, prepared=prepared))
 
     assert result is not None
     second_context = model.requests[1].messages[1]["content"]

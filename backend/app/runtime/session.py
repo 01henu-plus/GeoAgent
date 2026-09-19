@@ -53,7 +53,6 @@ class AgentRuntimeSession:
     previous_replan_reasons: list[str] = field(default_factory=list)
     subagent_results: list[Any] = field(default_factory=list)
     completed_delegation_fingerprints: set[str] = field(default_factory=set)
-    legacy_delegation_result: dict[str, Any] | None = None
     run: Run | None = None
     working_memory: WorkingMemory | None = None
     fast_path_enabled: bool = False
@@ -91,7 +90,6 @@ class AgentRuntimeSession:
             previous_replan_reasons=list(resume.previous_replan_reasons),
             subagent_results=list(resume.subagent_results),
             completed_delegation_fingerprints=set(resume.completed_delegation_fingerprints),
-            legacy_delegation_result=_deep_copy_dict(resume.legacy_delegation_result) if resume.legacy_delegation_result else None,
             run=run,
             working_memory=working_memory.model_copy(deep=True) if working_memory is not None else None,
             fast_path_enabled=current_plan is not None,
@@ -119,29 +117,6 @@ class AgentRuntimeSession:
             resume=resume,
             decision_provider=decision_provider,
         )
-
-    # 旧 runtime helper 在迁移期间仍使用字典访问。本适配只提供同一对象上的
-    # 受控映射视图，避免复制出第二份 mutable state。
-    _KEY_ALIASES = {"plan": "current_plan"}
-
-    def __getitem__(self, key: str) -> Any:
-        name = self._KEY_ALIASES.get(key, key)
-        if not hasattr(self, name):
-            raise KeyError(key)
-        return getattr(self, name)
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        name = self._KEY_ALIASES.get(key, key)
-        if not hasattr(self, name):
-            raise KeyError(key)
-        setattr(self, name, value)
-
-    def get(self, key: str, default: Any = None) -> Any:
-        try:
-            return self[key]
-        except KeyError:
-            return default
-
 
 def _deep_copy_dict(value: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}

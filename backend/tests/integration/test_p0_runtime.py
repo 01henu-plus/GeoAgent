@@ -21,7 +21,9 @@ from app.core.models import (
 from app.demo import seed_demo
 from app.models import ModelAdapter, ModelRequest, ModelResponse, ModelStreamChunk
 from app.models.config import ModelProfile
+from app.runtime.checkpoint_codec import RuntimeCheckpointCodec
 from app.runtime.context_assembler import estimate_tokens
+from app.runtime.session import AgentRuntimeSession
 from app.runtime.tool_execution_cycle import ExecutionOutcome
 
 
@@ -219,9 +221,6 @@ def test_main_agent_planner_path_maps_loop_directives_without_replanning(applica
         steps=[PlanStep(id="step-directive", title="检查", action="inspect", tool_name="dataset.inspect")],
     )
 
-    async def resolved(value):
-        return value
-
     async def run_with_directive(directive):
         outcome = ExecutionOutcome(
             result=ToolResult(call_id="directive-call", status=ToolStatus.FAILED),
@@ -234,17 +233,26 @@ def test_main_agent_planner_path_maps_loop_directives_without_replanning(applica
             rationale="执行层返回控制信号",
         )
         original = application.main_agent.tool_execution_cycle.execute
-        application.main_agent.tool_execution_cycle.execute = lambda *args, **kwargs: resolved(outcome)
+        async def execute(*args, **kwargs):
+            return outcome
+
+        application.main_agent.tool_execution_cycle.execute = execute
+        current_plan = plan.model_copy(deep=True)
+        session = AgentRuntimeSession(
+            run=run,
+            datasets=[],
+            current_plan=current_plan,
+            original_plan=current_plan.model_copy(deep=True),
+        )
         try:
-            return await application.main_agent._execute_plan(
-                request,
-                run,
-                task,
-                [],
-                intent,
-                plan.model_copy(deep=True),
-                {},
+            return await application.main_agent.runtime_action_handlers.execute_plan_step(
+                current_plan.steps[0],
+                request=request,
+                run=run,
+                task=task,
+                intent=intent,
                 request_frame=None,
+                session=session,
             )
         finally:
             application.main_agent.tool_execution_cycle.execute = original
@@ -253,12 +261,10 @@ def test_main_agent_planner_path_maps_loop_directives_without_replanning(applica
     replan = asyncio.run(run_with_directive(LoopDirective.REPLAN))
     abort = asyncio.run(run_with_directive(LoopDirective.ABORT))
 
-    assert ask_user.status is AgentResultStatus.BLOCKED
-    assert ask_user.error == "WAITING_USER"
-    assert replan.status is AgentResultStatus.BLOCKED
-    assert replan.error == "REPLAN_REQUIRED"
-    assert abort.status is AgentResultStatus.FAILED
-    assert abort.error == "执行层返回控制信号"
+    assert ask_user.directive is LoopDirective.ASK_USER
+    assert replan.directive is LoopDirective.REPLAN
+    assert abort.directive is LoopDirective.ABORT
+    assert all(item.latest_failure is not None for item in (ask_user, replan, abort))
 
 
 def test_model_runtime_gets_first_chance_when_offline_rules_would_ask(application):
@@ -388,7 +394,14 @@ def test_resume_uses_saved_checkpoint_plan(application, authenticated_client):
     datasets = application.main_agent._resolve_datasets(request)
     intent = application.main_agent.intent_resolver.resolve(request, datasets)
     plan = application.main_agent.planner.build(request.user_input, intent, datasets)
-    checkpoint = make_checkpoint(old_run.id, "plan_created", application.main_agent._checkpoint_state(request, intent, plan, datasets))
+    session = AgentRuntimeSession(
+        run=old_run,
+        datasets=datasets,
+        current_plan=plan,
+        original_plan=plan.model_copy(deep=True),
+    )
+    checkpoint_state = RuntimeCheckpointCodec.encode(request, intent, prepared.frame, session)
+    checkpoint = make_checkpoint(old_run.id, "plan_created", checkpoint_state)
     application.checkpoints.save(checkpoint)
 
     with authenticated_client as client:
@@ -403,12 +416,12 @@ def test_resume_uses_saved_checkpoint_plan(application, authenticated_client):
 
 def test_run_manager_cancels_active_run(application):
     seed_demo(application)
-    stopped = asyncio.Event()
 
-    async def wait_forever(*args, **kwargs):
-        await stopped.wait()
+    class WaitingModel(ModelAdapter):
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            await asyncio.Event().wait()
 
-    application.main_agent._model_loop = wait_forever
+    application.main_agent.model_adapter = WaitingModel()
     request = AgentRequest(user_input="等待取消", conversation_id="conv_cancel")
 
     async def run_case():

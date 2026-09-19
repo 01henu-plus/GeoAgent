@@ -15,7 +15,7 @@ from app.core.models import (
     StateSnapshot,
     TaskStatus,
 )
-from app.models import ModelAdapter, ModelRequest
+from app.models import ModelAdapter, ModelRequest, ModelResponse
 from app.understanding.interpreter import RequestInterpreter
 from app.understanding.models import ReferenceResolution
 from app.understanding.pipeline import RequestUnderstandingPipeline
@@ -192,7 +192,11 @@ def test_retry_without_failed_run_is_blocked_without_business_task(application):
 
 
 def test_cancel_cancels_real_active_run_and_task(application):
-    application.main_agent._model_loop = _wait_forever
+    class WaitingModel(ModelAdapter):
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            await asyncio.Event().wait()
+
+    application.main_agent.model_adapter = WaitingModel()
     request = AgentRequest(user_input="分析这份数据", conversation_id="conv-cancel")
 
     async def scenario():
@@ -270,7 +274,3 @@ def test_structured_interpreter_fallback_is_observable(caplog):
 
     assert frame.mode.value == "new_task"
     assert "回退确定性解析" in caplog.text
-
-
-async def _wait_forever(*args, **kwargs):
-    await asyncio.Event().wait()

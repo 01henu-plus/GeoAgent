@@ -61,11 +61,6 @@ class OfflineDecisionProvider:
         intent: IntentResult | None,
         request_frame: RequestFrame | None,
     ) -> AgentDecision:
-        if session.legacy_delegation_result:
-            return self.result_to_decision(
-                AgentResult.model_validate(session.legacy_delegation_result),
-                "offline_compat",
-            )
         if intent is None:
             intent = self.legacy_intent_adapter.to_intent(request_frame, request, session.datasets)
 

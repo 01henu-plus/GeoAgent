@@ -192,7 +192,20 @@ def test_optional_subagent_abort_remains_partial_observation(application):
 
     application.main_agent.agent_manager = FakeManager()
     try:
-        delegation = asyncio.run(application.main_agent._execute_delegation(request, run, task, [], [subtask]))
+        delegation = asyncio.run(
+            application.main_agent.runtime_action_handlers.execute_delegation(
+                request,
+                run,
+                task,
+                [],
+                [subtask],
+                intent=None,
+                plan=None,
+                request_frame=None,
+                working_memory=None,
+                fingerprint="optional-delegation",
+            )
+        )
     finally:
         application.main_agent.agent_manager = original_manager
 
@@ -562,7 +575,18 @@ def test_mainagent_delegation_aggregates_required_directives(application):
 
         application.main_agent.agent_manager = FakeManager()
         try:
-            return await application.main_agent._delegate(request, parent_run, task, [], [subtask], working_memory=None)
+            return await application.main_agent.runtime_action_handlers.execute_delegation(
+                request,
+                parent_run,
+                task,
+                [],
+                [subtask],
+                intent=None,
+                plan=None,
+                request_frame=None,
+                working_memory=None,
+                fingerprint=f"directive-{value.directive.value}",
+            )
         finally:
             application.main_agent.agent_manager = original_manager
 
@@ -570,9 +594,9 @@ def test_mainagent_delegation_aggregates_required_directives(application):
     replan = asyncio.run(run_with(execution(LoopDirective.REPLAN, AgentResultStatus.BLOCKED, "算法不适用")))
     abort = asyncio.run(run_with(execution(LoopDirective.ABORT, AgentResultStatus.FAILED, "工具失败")))
 
-    assert ask.status is AgentResultStatus.BLOCKED and ask.error == "WAITING_USER"
-    assert replan.status is AgentResultStatus.BLOCKED and replan.error == "REPLAN_REQUIRED"
-    assert abort.status is AgentResultStatus.FAILED
+    assert ask.directive is LoopDirective.ASK_USER
+    assert replan.directive is LoopDirective.REPLAN
+    assert abort.directive is LoopDirective.ABORT
 
 
 def test_agent_manager_preserves_subagent_directive(application):

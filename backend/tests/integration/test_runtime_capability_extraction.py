@@ -26,38 +26,29 @@ from app.runtime.session import AgentRuntimeSession
 
 def _forbid_legacy_runtime_methods(application) -> None:
     main_agent = application.main_agent
-
-    def forbidden(*_args, **_kwargs):
-        raise AssertionError("canonical runtime 不应调用 MainAgent 旧动作方法")
-
     for name in (
+        "_model_loop",
         "_dispatch_runtime_decision",
         "_execute_runtime_plan_step",
         "_dispatch_runtime_replan",
         "_execute_delegation",
+        "_execute_plan",
+        "_delegate",
     ):
-        setattr(main_agent, name, forbidden)
-    # Dispatcher 在初始化时保存过兼容回调；显式替换它才能证明 canonical
-    # handler 没有在缺少注册时静默回退到旧路径。
-    main_agent.runtime_action_dispatcher.compatibility_handler = forbidden
+        assert not hasattr(main_agent, name)
+    assert not hasattr(main_agent.runtime_action_dispatcher, "compatibility_handler")
 
 
-def test_dispatcher_uses_registered_handler_before_compatibility_fallback():
+def test_dispatcher_uses_registered_handler():
     called: list[str] = []
 
     async def canonical(decision, state, *, session, **context):
         called.append("canonical")
         return RuntimeTransition(observation={"source": "runtime"})
 
-    async def forbidden(*_args, **_kwargs):
-        raise AssertionError("不应调用 compatibility_handler")
-
     run = Run(id="runtime-dispatch-proof", agent_id="main")
     session = AgentRuntimeSession(run=run)
-    dispatcher = RuntimeActionDispatcher(
-        handlers={DecisionType.TOOL: canonical},
-        compatibility_handler=forbidden,
-    )
+    dispatcher = RuntimeActionDispatcher(handlers={DecisionType.TOOL: canonical})
     decision = AgentDecision(type=DecisionType.TOOL, reasoning_summary="执行工具")
 
     transition = asyncio.run(dispatcher.dispatch(decision, object(), session))

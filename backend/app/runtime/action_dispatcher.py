@@ -20,10 +20,8 @@ class RuntimeActionDispatcher:
         self,
         *,
         handlers: dict[DecisionType, ActionHandler] | None = None,
-        compatibility_handler: ActionHandler | None = None,
     ) -> None:
         self.handlers = dict(handlers or {})
-        self.compatibility_handler = compatibility_handler
 
     async def dispatch(
         self,
@@ -71,7 +69,7 @@ class RuntimeActionDispatcher:
                 artifact_ids=tuple(sorted(session.artifact_ids)),
             )
 
-        handler = self.handlers.get(decision.type) or self.compatibility_handler
+        handler = self.handlers.get(decision.type)
         if handler is None:
             return RuntimeTransition(
                 terminal=True,

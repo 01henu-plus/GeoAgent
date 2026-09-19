@@ -8,22 +8,16 @@ def test_offline_request_uses_agent_runtime_and_not_legacy_plan_loop(application
     ids = seed_demo(application)
     runtime_calls = []
     original_runtime = application.main_agent.agent_runtime.run
-    original_execute_plan = application.main_agent._execute_plan
 
     async def wrapped_runtime(*args, **kwargs):
         runtime_calls.append(True)
         return await original_runtime(*args, **kwargs)
 
-    async def forbidden_execute_plan(*args, **kwargs):
-        raise AssertionError("正常离线主路径不应调用 _execute_plan")
-
     application.main_agent.agent_runtime.run = wrapped_runtime
-    application.main_agent._execute_plan = forbidden_execute_plan
     try:
         result = asyncio.run(application.ask("检查道路数据", dataset_ids=[ids["roads"]]))
     finally:
         application.main_agent.agent_runtime.run = original_runtime
-        application.main_agent._execute_plan = original_execute_plan
 
     assert result.status is AgentResultStatus.SUCCESS
     assert runtime_calls == [True]
@@ -32,16 +26,7 @@ def test_offline_request_uses_agent_runtime_and_not_legacy_plan_loop(application
 
 def test_offline_delegation_uses_runtime_observation_not_terminal_legacy_wrapper(application):
     ids = seed_demo(application)
-    original_delegate = application.main_agent._delegate
-
-    async def forbidden_delegate(*args, **kwargs):
-        raise AssertionError("正常离线委派不应调用 terminal _delegate")
-
-    application.main_agent._delegate = forbidden_delegate
-    try:
-        result = asyncio.run(application.ask("综合道路、人口和 DEM，从三个方面评价当前区域", dataset_ids=list(ids.values())))
-    finally:
-        application.main_agent._delegate = original_delegate
+    result = asyncio.run(application.ask("综合道路、人口和 DEM，从三个方面评价当前区域", dataset_ids=list(ids.values())))
 
     assert result.status is AgentResultStatus.SUCCESS
     assert len(result.findings) == 3
