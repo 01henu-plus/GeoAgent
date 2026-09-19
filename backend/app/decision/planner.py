@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable
 
 from app.core.models import (
@@ -26,11 +25,10 @@ class Planner:
 
     def build(self, request_frame: RequestFrame, datasets: list[Dataset]) -> Plan:
         goal = request_frame.goal
-        entities = _frame_entities(request_frame)
-        plan_intent = _plan_intent(request_frame, entities)
-        operations = [str(item) for item in entities.get("operations", []) if item]
-        operation = operations[0] if operations else str(entities.get("operation") or "")
-        selected = _ordered_selected(datasets, entities.get("mentioned_dataset_ids"), entities.get("dataset_roles"))
+        plan_intent = _plan_intent(request_frame)
+        operations = [str(item) for item in request_frame.operations if item]
+        operation = operations[0] if operations else ""
+        selected = _ordered_selected(datasets, _mentioned_dataset_ids(request_frame), request_frame.dataset_roles)
         metadata = {
             "operation": operation or None,
             "operation_sequence": operations,
@@ -41,10 +39,10 @@ class Planner:
         if plan_intent in {IntentType.UNKNOWN, IntentType.KNOWLEDGE_QUERY, IntentType.RESULT_INTERPRETATION, IntentType.RUN_DIAGNOSIS}:
             return Plan(goal=goal, intent=plan_intent, metadata=metadata)
 
-        if not selected and entities.get("requires_dataset"):
+        if not selected and _requires_dataset(request_frame):
             return Plan(goal=goal, intent=plan_intent, clarification=_missing_dataset_message(operation), metadata=metadata)
 
-        if entities.get("render_requested") and not operations:
+        if request_frame.render_requested and not operations:
             return self._render_plan(goal, request_frame, selected, metadata)
 
         if len(operations) > 1:
@@ -124,12 +122,11 @@ class Planner:
         """把常见前置处理和空间分析编译成一条真正可执行的链。"""
 
         plan_intent = _plan_intent(request_frame)
-        entities = _frame_entities(request_frame)
         primary = next((item for item in reversed(operations) if item not in {"reproject", "repair", "validate"}), None)
-        target_crs = entities.get("target_crs") or "auto"
+        target_crs = request_frame.parameters.get("target_crs") or "auto"
         if primary == "buffer" and "reproject" in operations:
             vector = _first_kind(datasets, DatasetKind.VECTOR)
-            distance = entities.get("distance")
+            distance = request_frame.parameters.get("distance")
             if vector is None:
                 return Plan(goal=goal, intent=plan_intent, clarification="重投影并生成缓冲区需要一个矢量数据集。", metadata=metadata)
             if not isinstance(distance, (int, float)) or isinstance(distance, bool) or float(distance) <= 0:
@@ -169,7 +166,9 @@ class Planner:
             if primary == "clip":
                 arguments = {"dataset_id": "${reproject_left.dataset_id}", "mask_dataset_id": "${reproject_right.dataset_id}"}
             elif primary == "spatial_join":
-                arguments = {"left_dataset_id": "${reproject_left.dataset_id}", "right_dataset_id": "${reproject_right.dataset_id}", "predicate": entities.get("predicate", "intersects")}
+                arguments = {"left_dataset_id": "${reproject_left.dataset_id}", "right_dataset_id": "${reproject_right.dataset_id}"}
+                if "predicate" in request_frame.parameters:
+                    arguments["predicate"] = request_frame.parameters["predicate"]
             else:
                 arguments = {"left_dataset_id": "${reproject_left.dataset_id}", "right_dataset_id": "${reproject_right.dataset_id}"}
             steps.extend([
@@ -181,7 +180,7 @@ class Planner:
 
         if primary == "buffer" and "repair" in operations:
             vector = _first_kind(datasets, DatasetKind.VECTOR)
-            distance = entities.get("distance")
+            distance = request_frame.parameters.get("distance")
             if vector is None or not isinstance(distance, (int, float)) or isinstance(distance, bool) or float(distance) <= 0:
                 return Plan(goal=goal, intent=plan_intent, clarification="修复后生成缓冲区需要一个矢量数据集和正的缓冲距离。", metadata=metadata)
             steps = _inspection_steps([vector])
@@ -196,9 +195,8 @@ class Planner:
 
     def _buffer_plan(self, goal: str, request_frame: RequestFrame, datasets: list[Dataset], metadata: dict[str, object]) -> Plan:
         plan_intent = _plan_intent(request_frame)
-        entities = _frame_entities(request_frame)
         vector = _first_kind(datasets, DatasetKind.VECTOR)
-        distance = entities.get("distance")
+        distance = request_frame.parameters.get("distance")
         if vector is None:
             return Plan(goal=goal, intent=plan_intent, clarification="缓冲区需要一个矢量数据集，请先添加道路、边界或其他矢量图层。", metadata=metadata)
         if not isinstance(distance, (int, float)) or isinstance(distance, bool) or float(distance) <= 0:
@@ -217,14 +215,13 @@ class Planner:
 
     def _distance_plan(self, goal: str, request_frame: RequestFrame, datasets: list[Dataset], metadata: dict[str, object]) -> Plan:
         plan_intent = _plan_intent(request_frame)
-        entities = _frame_entities(request_frame)
         vectors = [item for item in datasets if item.kind is DatasetKind.VECTOR]
         if len(vectors) < 2:
             return Plan(goal=goal, intent=plan_intent, clarification="距离分析需要两个矢量数据集，请同时选择源数据和目标数据。", metadata=metadata)
         source, target = vectors[:2]
         steps = _inspection_steps([source, target])
         args: dict[str, object] = {"source_dataset_id": source.id, "target_dataset_id": target.id}
-        threshold = entities.get("distance")
+        threshold = request_frame.parameters.get("distance")
         if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
             args["threshold"] = float(threshold)
         steps.append(PlanStep(id="analyze", title="计算距离分布", action="analysis.distance", tool_name="analysis.distance", arguments=args, depends_on=[item.id for item in steps]))
@@ -233,7 +230,6 @@ class Planner:
 
     def _binary_vector_plan(self, goal: str, request_frame: RequestFrame, datasets: list[Dataset], operation: str, metadata: dict[str, object]) -> Plan:
         plan_intent = _plan_intent(request_frame)
-        entities = _frame_entities(request_frame)
         vectors = [item for item in datasets if item.kind is DatasetKind.VECTOR]
         if len(vectors) < 2:
             return Plan(goal=goal, intent=plan_intent, clarification=f"{_operation_label(operation)}需要两个矢量数据集，请选择数据主体和边界/关联图层。", metadata=metadata)
@@ -242,7 +238,9 @@ class Planner:
         if operation == "clip":
             arguments = {"dataset_id": left.id, "mask_dataset_id": right.id}
         elif operation == "spatial_join":
-            arguments = {"left_dataset_id": left.id, "right_dataset_id": right.id, "predicate": entities.get("predicate", "intersects")}
+            arguments = {"left_dataset_id": left.id, "right_dataset_id": right.id}
+            if "predicate" in request_frame.parameters:
+                arguments["predicate"] = request_frame.parameters["predicate"]
         else:
             arguments = {"left_dataset_id": left.id, "right_dataset_id": right.id}
         steps.append(PlanStep(id="operate", title=_operation_label(operation), action=f"vector.{operation}", tool_name=f"vector.{operation}", arguments=arguments, depends_on=[item.id for item in steps]))
@@ -274,11 +272,10 @@ class Planner:
 
     def _reproject_plan(self, goal: str, request_frame: RequestFrame, datasets: list[Dataset], metadata: dict[str, object]) -> Plan:
         plan_intent = _plan_intent(request_frame)
-        entities = _frame_entities(request_frame)
         if not datasets:
             return Plan(goal=goal, intent=plan_intent, clarification="重投影需要一个输入数据集。", metadata=metadata)
         dataset = datasets[0]
-        target_crs = entities.get("target_crs") or "auto"
+        target_crs = request_frame.parameters.get("target_crs") or "auto"
         steps = _inspection_steps([dataset])
         tool_name = "raster.reproject" if dataset.kind is DatasetKind.RASTER else "crs.reproject"
         steps.append(PlanStep(id="reproject", title="执行重投影", action=tool_name, tool_name=tool_name, arguments={"dataset_id": dataset.id, "target_crs": target_crs}, depends_on=["inspect"]))
@@ -287,14 +284,13 @@ class Planner:
 
     def _single_vector_plan(self, goal: str, request_frame: RequestFrame, datasets: list[Dataset], operation: str, metadata: dict[str, object]) -> Plan:
         plan_intent = _plan_intent(request_frame)
-        entities = _frame_entities(request_frame)
         vector = _first_kind(datasets, DatasetKind.VECTOR)
         if vector is None:
             return Plan(goal=goal, intent=plan_intent, clarification=f"{_operation_label(operation)}需要一个矢量数据集。", metadata=metadata)
         steps = _inspection_steps([vector])
         if operation == "dissolve":
             arguments = {"dataset_id": vector.id}
-            field = entities.get("field")
+            field = request_frame.parameters.get("field")
             if isinstance(field, str) and field:
                 arguments["by"] = field
         else:
@@ -306,103 +302,24 @@ class Planner:
         metadata["output_policy"] = "derived_dataset" if operation != "validate" else "analysis_summary"
         return Plan(goal=goal, intent=plan_intent, steps=steps, metadata=metadata)
 
-_OPERATION_TERMS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("buffer", ("缓冲区", "缓冲", "buffer")),
-    ("clip", ("裁剪", "截取", "clip")),
-    ("intersection", ("相交", "交集", "叠加", "intersection", "overlay")),
-    ("spatial_join", ("空间连接", "空间关联", "spatial join", "sjoin")),
-    ("dissolve", ("融合", "溶解", "dissolve")),
-    ("zonal_statistics", ("分区统计", "区域统计", "zonal statistics", "zonal")),
-    ("slope", ("坡度", "坡向", "地形分析", "slope")),
-    ("reproject", ("重投影", "转投影", "坐标转换", "投影转换", "reproject", "transform crs")),
-    ("repair", ("修复几何", "修复无效", "几何修复", "repair")),
-    ("validate", ("验证几何", "几何检查", "有效性检查", "validate")),
-    ("distance", ("距离分析", "距离分布", "最近距离", "测距", "distance")),
-)
-_DISTANCE_RE = re.compile(r"(?P<amount>\d+(?:\.\d+)?)\s*(?P<unit>米|公尺|m|公里|千米|km)", re.IGNORECASE)
-_CRS_RE = re.compile(r"\bEPSG\s*[:：]?\s*(\d{4,6})\b", re.IGNORECASE)
-_FIELD_RE = re.compile(r"(?:字段|列|属性|field|按)\s*[：:=]?\s*[`\"“”']?([\w\u3400-\u9fff-]+)", re.IGNORECASE)
-
-
-def _frame_entities(request_frame: RequestFrame) -> dict[str, object]:
-    """读取 RequestFrame 中用于计划编译的确定性参数。
-
-    这里不重新判断交互模式、引用是否有效或任务生命周期；这些事实已经由
-    Request Understanding 和 Validator 负责。Planner 只从已确认的目标文本和
-    引用中提取执行参数，保持离线 Plan 编译能力。
-    """
-
-    raw = request_frame.goal.strip()
-    text = raw.casefold()
-    found: list[tuple[int, str]] = []
-    for name, terms in _OPERATION_TERMS:
-        positions = [text.find(term.casefold()) for term in terms if text.find(term.casefold()) >= 0]
-        if positions:
-            found.append((min(positions), name))
-    operations = [name for _, name in sorted(found)]
-    roles = {
-        role
-        for role, terms in {
-            "road": ("道路", "路网", "公路", "road", "roads", "street"),
-            "population": ("人口", "居民", "population", "pop"),
-            "terrain": ("dem", "高程", "地形", "坡度", "terrain", "elevation"),
-            "boundary": ("边界", "行政区", "掩膜", "范围", "boundary", "mask", "polygon"),
-        }.items()
-        if any(term.casefold() in text for term in terms)
-    }
-    distance = _DISTANCE_RE.search(text)
-    entities: dict[str, object] = {
-        "operations": operations,
-        "operation": operations[0] if operations else None,
-        "dataset_roles": sorted(roles),
-        "mentioned_dataset_ids": [
-            reference.target_id
-            for reference in request_frame.references
-            if reference.type in {"dataset", "artifact"} and reference.target_id
-        ],
-        "requires_dataset": request_frame.needs_tool or any(
-            capability in {"dataset_inspection", "raster_analysis", "vector_analysis", "artifact_read", "crs_transform"}
-            for capability in request_frame.capabilities
-        ),
-        "render_requested": any(term in text for term in ("地图", "制图", "可视化", "渲染", "map", "render")),
-        "road_requested": "road" in roles,
-        "population_requested": "population" in roles,
-        "terrain_requested": "terrain" in roles,
-    }
-    if distance:
-        amount = float(distance.group("amount"))
-        entities["distance"] = amount * (1000 if distance.group("unit").casefold() in {"公里", "千米", "km"} else 1)
-    crs = _CRS_RE.search(raw)
-    if crs:
-        entities["target_crs"] = f"EPSG:{crs.group(1)}"
-    elif any(term in text for term in ("wgs84", "wgs 84")):
-        entities["target_crs"] = "EPSG:4326"
-    field = _FIELD_RE.search(raw)
-    if field:
-        entities["field"] = field.group(1).strip("`\"“”'")
-    entities["predicate"] = "within" if any(term in text for term in ("包含", "within")) else "nearest" if any(term in text for term in ("最近", "nearest")) else "intersects"
-    return entities
-
-
-def _plan_intent(request_frame: RequestFrame, entities: dict[str, object] | None = None) -> IntentType:
+def _plan_intent(request_frame: RequestFrame) -> IntentType:
     """仅为旧 Plan.intent 字段生成兼容能力标签，不作为请求理解结果。"""
 
-    entities = entities or _frame_entities(request_frame)
     if request_frame.mode in {InteractionMode.CHAT, InteractionMode.CANCEL_TASK}:
         return IntentType.UNKNOWN
     capabilities = set(request_frame.capabilities)
     if request_frame.mode is InteractionMode.QUERY:
         if "knowledge_lookup" in capabilities:
             return IntentType.KNOWLEDGE_QUERY
-        if any(term in request_frame.goal.casefold() for term in ("运行状态", "运行记录", "失败", "错误", "trace", "日志")):
+        if "run_diagnosis" in capabilities:
             return IntentType.RUN_DIAGNOSIS
         return IntentType.RESULT_INTERPRETATION
-    operations = set(entities.get("operations", []))
+    operations = set(request_frame.operations)
     if operations:
         if operations.issubset({"reproject", "repair", "dissolve"}):
             return IntentType.DATA_TRANSFORMATION
         return IntentType.SPATIAL_ANALYSIS
-    if "dataset_inspection" in capabilities or any(term in request_frame.goal.casefold() for term in ("检查", "属性", "字段", "元数据")):
+    if "dataset_inspection" in capabilities:
         return IntentType.DATA_INSPECTION
     if capabilities.intersection({"raster_analysis", "vector_analysis", "crs_transform", "python_execution"}):
         return IntentType.SPATIAL_ANALYSIS
@@ -417,9 +334,24 @@ def _inspection_steps(datasets: Iterable[Dataset]) -> list[PlanStep]:
     return steps
 
 
-def _ordered_selected(datasets: list[Dataset], mentioned: object, roles: object) -> list[Dataset]:
-    ids = {str(value) for value in mentioned} if isinstance(mentioned, list) else set()
-    role_values = {str(value) for value in roles} if isinstance(roles, list) else set()
+def _mentioned_dataset_ids(request_frame: RequestFrame) -> list[str]:
+    return [
+        reference.target_id
+        for reference in request_frame.references
+        if reference.type in {"dataset", "artifact"} and reference.target_id
+    ]
+
+
+def _requires_dataset(request_frame: RequestFrame) -> bool:
+    return request_frame.needs_tool or bool(
+        set(request_frame.capabilities)
+        & {"dataset_inspection", "raster_analysis", "vector_analysis", "artifact_read", "crs_transform"}
+    )
+
+
+def _ordered_selected(datasets: list[Dataset], mentioned: list[str], roles: list[str]) -> list[Dataset]:
+    ids = {str(value) for value in mentioned}
+    role_values = {str(value) for value in roles}
     if ids:
         selected = [item for item in datasets if item.id in ids]
         if selected:

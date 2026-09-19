@@ -56,7 +56,7 @@ class OfflineDecisionProvider:
         current_plan = session.current_plan
         if current_plan is not None:
             if _should_delegate(frame, session.datasets) and not session.subagent_results:
-                return _delegation_decision(request, session.datasets, self.decomposer)
+                return _delegation_decision(frame, session.datasets, self.decomposer)
             if _should_delegate(frame, session.datasets) and session.subagent_results:
                 completed = sum(item.get("status") == AgentResultStatus.SUCCESS.value for item in session.subagent_results if isinstance(item, dict))
                 total = len(session.subagent_results)
@@ -79,7 +79,7 @@ class OfflineDecisionProvider:
                     source="offline",
                 )
             if self.next_executable_step(current_plan, session.completed_steps) is None:
-                operation = str(current_plan.metadata.get("operation") or _operation_from_goal(frame.goal) or "")
+                operation = str(current_plan.metadata.get("operation") or (frame.operations[-1] if frame.operations else ""))
                 result = AgentResult(
                     agent_id="main",
                     task_id=task.id if task else state.task_id,
@@ -94,7 +94,6 @@ class OfflineDecisionProvider:
 
         if frame.mode is InteractionMode.QUERY and (
             "run_diagnosis" in frame.capabilities
-            or any(term in frame.goal.casefold() for term in ("运行状态", "运行记录", "失败", "错误", "trace", "日志"))
         ):
             return self.result_to_decision(self.diagnose_runs(request, session.run), "offline")
         if frame.mode is InteractionMode.QUERY and "knowledge_lookup" not in frame.capabilities:
@@ -128,37 +127,18 @@ def _plan_result_summary(operation: str, plan, findings: list[Any], dataset_ids:
     return f"已完成{operation_label}，生成或确认 {resource_count} 个结果资源。" if resource_count else f"已完成{operation_label}。"
 
 
-def _delegation_decision(request: AgentRequest, datasets, decomposer: TaskDecomposer) -> AgentDecision:
+def _delegation_decision(request_frame: RequestFrame, datasets, decomposer: TaskDecomposer) -> AgentDecision:
     return AgentDecision(
         type=DecisionType.DELEGATE,
         reasoning_summary="任务包含多个相互独立的 GIS 主题，交给临时智能体并行处理。",
-        subtasks=decomposer.decompose(request, datasets),
+        subtasks=decomposer.decompose(request_frame, datasets),
         source="offline",
     )
 
 
 def _should_delegate(request_frame: RequestFrame, datasets) -> bool:
-    text = request_frame.goal.casefold()
-    roles = sum(
-        any(term in text for term in terms)
-        for terms in (("道路", "路网", "road"), ("人口", "population"), ("dem", "高程", "地形", "terrain"))
-    )
+    roles = len(set(request_frame.dataset_roles) & {"road", "population", "terrain"})
     return roles >= 2 and len(datasets) >= 2 and bool(set(request_frame.capabilities) & {"raster_analysis", "vector_analysis"})
 
 
 __all__ = ["OfflineDecisionProvider"]
-
-
-def _operation_from_goal(goal: str) -> str | None:
-    terms = (
-        ("buffer", ("缓冲", "buffer")),
-        ("clip", ("裁剪", "clip")),
-        ("intersection", ("相交", "交集", "intersection")),
-        ("spatial_join", ("空间连接", "spatial join")),
-        ("zonal_statistics", ("分区统计", "zonal")),
-        ("slope", ("坡度", "slope")),
-        ("reproject", ("重投影", "坐标转换", "reproject")),
-        ("distance", ("距离分析", "测距", "distance")),
-    )
-    lowered = goal.casefold()
-    return next((name for name, names in terms if any(term.casefold() in lowered for term in names)), None)

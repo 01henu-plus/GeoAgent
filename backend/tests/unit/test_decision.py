@@ -44,7 +44,8 @@ def test_decomposer_creates_thematic_tasks():
         Dataset(name="population", kind=DatasetKind.VECTOR, path="population.geojson", format="geojson"),
         Dataset(name="dem", kind=DatasetKind.RASTER, path="dem.tif", format="tif"),
     ]
-    tasks = TaskDecomposer().decompose(request, datasets)
+    frame = RequestFrame(mode="new_task", goal=request.user_input, dataset_roles=["road", "population", "terrain"])
+    tasks = TaskDecomposer().decompose(frame, datasets)
     assert {task.goal.split()[1] for task in tasks} == {"road", "population", "terrain"}
     assert all(task.dataset_ids for task in tasks)
 
@@ -54,7 +55,16 @@ def test_planner_composes_reprojection_before_buffer():
     roads = Dataset(name="roads", kind=DatasetKind.VECTOR, path="roads.geojson", format="geojson")
     hints = extract_request_hints(request.user_input, [roads])
 
-    frame = RequestFrame(mode="new_task", goal=request.user_input, capabilities=["vector_analysis", "crs_transform"], needs_planning=True, needs_tool=True)
+    frame = RequestFrame(
+        mode="new_task",
+        goal=request.user_input,
+        operations=["reproject", "buffer"],
+        parameters={"target_crs": "EPSG:3857", "distance": 500},
+        dataset_roles=["road", "vector"],
+        capabilities=["vector_analysis", "crs_transform"],
+        needs_planning=True,
+        needs_tool=True,
+    )
     plan = Planner().build(frame, [roads])
 
     assert hints.operations == ["reproject", "buffer"]
@@ -72,7 +82,15 @@ def test_planner_composes_reprojection_before_buffer():
 def test_planner_asks_for_missing_required_parameter():
     request = AgentRequest(user_input="给 roads 生成缓冲区")
     roads = Dataset(name="roads", kind=DatasetKind.VECTOR, path="roads.geojson", format="geojson")
-    frame = RequestFrame(mode="new_task", goal=request.user_input, capabilities=["vector_analysis"], needs_planning=True, needs_tool=True)
+    frame = RequestFrame(
+        mode="new_task",
+        goal=request.user_input,
+        operations=["buffer"],
+        dataset_roles=["road"],
+        capabilities=["vector_analysis"],
+        needs_planning=True,
+        needs_tool=True,
+    )
     plan = Planner().build(frame, [roads])
 
     assert plan.clarification is not None
@@ -88,6 +106,7 @@ def test_delegation_is_a_decision_not_fake_plan_steps():
     frame = RequestFrame(
         mode="new_task",
         goal="综合道路、人口和 DEM 分析当前区域",
+        dataset_roles=["road", "population", "terrain"],
         capabilities=["vector_analysis", "raster_analysis"],
         needs_planning=True,
         needs_tool=True,

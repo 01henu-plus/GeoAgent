@@ -18,6 +18,9 @@ def test_planner_consumes_request_frame_without_legacy_intent():
     frame = RequestFrame(
         mode="new_task",
         goal="给 roads 生成 500 米缓冲区",
+        operations=["buffer"],
+        parameters={"distance": 500},
+        dataset_roles=["road"],
         capabilities=["vector_analysis", "artifact_write"],
         needs_planning=True,
         needs_tool=True,

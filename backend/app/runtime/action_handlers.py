@@ -441,7 +441,8 @@ class RuntimeActionHandlers:
                 error="WAITING_USER",
                 final_response="当前请求没有可委派的业务任务。",
             )
-        tasks = decision.subtasks or self.decomposer.decompose(request, session.datasets)
+        frame = request_frame or RequestFrame(mode="new_task", goal=request.user_input)
+        tasks = decision.subtasks or self.decomposer.decompose(frame, session.datasets)
         fingerprint = _delegation_fingerprint(tasks)
         if fingerprint in session.completed_delegation_fingerprints:
             observation = {
@@ -495,7 +496,8 @@ class RuntimeActionHandlers:
         working_memory: WorkingMemory | None,
         fingerprint: str,
     ) -> DelegationExecution:
-        tasks = list(tasks or self.decomposer.decompose(request, datasets))
+        frame = request_frame or RequestFrame(mode="new_task", goal=request.user_input)
+        tasks = list(tasks or self.decomposer.decompose(frame, datasets))
         self.guard.check_subagents(len(tasks))
         attached = self.task_service.attach_subtasks(task, tasks)
         task.subtasks = attached.subtasks
