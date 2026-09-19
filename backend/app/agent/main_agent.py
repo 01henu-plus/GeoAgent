@@ -27,10 +27,8 @@ from app.core.models import (
     RunStatus,
     Task,
     TaskStatus,
-    ToolCall,
     ToolResult,
     WorkingMemory,
-    new_id,
 )
 from app.decision import (
     CONTROL_CAPABILITY_DEFINITIONS,
@@ -44,7 +42,7 @@ from app.decision import (
 from app.decision.model_provider import ModelDecisionProvider
 from app.decision.offline_provider import OfflineDecisionProvider
 from app.events import EventType
-from app.execution.tools import ToolExecutor
+from app.execution.tools import RawToolExecutor, ToolExecutor
 from app.knowledge import KnowledgeRetriever
 from app.memory import MemoryManager
 from app.memory.extractor import MemoryExtractor
@@ -110,9 +108,16 @@ class MainAgent:
         self.profile_service = profile_service
         self.profile_extractor = profile_extractor or ProfilePreferenceExtractor()
         self.conversation_memory = conversation_memory
+        self.services_factory = services_factory
         self.working_memory_updater = WorkingMemoryUpdater(store)
+        self.raw_tool_executor = RawToolExecutor(
+            executor=self.executor,
+            store=self.store,
+            guard=self.guard,
+            services_factory=self.services_factory,
+        )
         self.tool_execution_cycle = ToolExecutionCycle(
-            raw_executor=self._raw_tool_for_cycle,
+            raw_executor=self.raw_tool_executor.execute,
             tool_registry=self.executor.registry,
             registry=self.registry,
             trace=self.trace,
@@ -126,7 +131,6 @@ class MainAgent:
         self.model_adapters = model_adapters if model_adapters is not None else {}
         self.default_model_profile = default_model_profile
         self.context_manager = context_manager or ContextManager()
-        self.services_factory = services_factory
         self.state_builder = AgentStateBuilder(store)
         self.decision_engine = DecisionEngine()
         self.agent_runtime = AgentRuntime(max_runtime_transitions=self.budget.max_runtime_transitions)
@@ -347,17 +351,19 @@ class MainAgent:
             run = finish_run(self.store.get_run(run.id) or run, RunStatus.CANCELLED, error="CANCELLED")
             self.store.save_run(run)
             previous_checkpoint = self.checkpoint_store.latest(run.id) if self.checkpoint_store else None
-            state = dict(previous_checkpoint.state) if previous_checkpoint else {}
-            # 历史 checkpoint 可能带有旧意图字段；新 checkpoint 不再延续该字段。
-            state.pop("intent", None)
+            state = {
+                key: previous_checkpoint.state[key]
+                for key in RuntimeCheckpointCodec.CANONICAL_FIELDS
+                if previous_checkpoint is not None and key in previous_checkpoint.state
+            }
             state.update(
                 {
                     "request": request.model_dump(mode="json"),
                     "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
                 }
             )
-            if plan is not None or "plan" not in state:
-                state["plan"] = plan.model_dump(mode="json") if plan is not None else None
+            if plan is not None:
+                state["current_plan"] = plan.model_dump(mode="json")
             state["phase"] = phase
             await self._checkpoint(run.id, "run_cancelled", state)
             if task is not None and prepared_request.action in {"create_task", "bind_task", "retry_run"}:
@@ -695,33 +701,6 @@ class MainAgent:
             findings=findings,
             trace_id=run.id,
         )
-
-    async def _execute_tool_raw(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None, attempt: int = 1) -> ToolResult:
-        current = self.store.get_run(run.id) or run
-        self.guard.check_turn(current)
-        self.guard.check_execution_time(current)
-        self.guard.check_tool(current)
-        next_run = current.model_copy(update={"tool_call_count": current.tool_call_count + 1, "status": RunStatus.WAITING_TOOL})
-        self.store.save_run(next_run)
-        call = ToolCall(id=call_id or new_id("call"), name=name, arguments=arguments, run_id=run.id, agent_id="main", attempt=attempt)
-        user_id = self.store.user_id_for_run(current.id)
-        services = self.services_factory(user_id) if self.services_factory else self.executor.services
-        return await self.executor.execute(call, agent_id="main", services=services)
-
-    async def _tool(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None, attempt: int = 1) -> ToolResult:
-        """保留给旧测试/调用方的 Raw Tool hook；新路径由 Cycle 负责包裹。"""
-
-        return await self._execute_tool_raw(run, name, arguments, call_id=call_id, attempt=attempt)
-
-    async def _raw_tool_for_cycle(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None, attempt: int = 1) -> ToolResult:
-        """通过兼容 hook 执行 Raw Tool，便于测试替换而不绕过 Cycle。"""
-        try:
-            return await self._tool(run, name, arguments, call_id=call_id, attempt=attempt)
-        except TypeError as exc:
-            if "unexpected keyword argument" not in str(exc):
-                raise
-            return await self._tool(run, name, arguments, call_id=call_id)
-
 
 def _decision_from_agent_result(result: AgentResult, *, source: str) -> AgentDecision:
     if result.status is AgentResultStatus.BLOCKED:

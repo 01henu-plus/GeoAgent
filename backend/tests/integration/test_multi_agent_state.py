@@ -229,11 +229,11 @@ def test_subagent_receives_deep_working_memory_snapshot_without_writing_parent_m
             captured["working_memory"] = kwargs["working_memory"]
             return {"datasets": [item.model_dump(mode="json") for item in datasets]}
 
-    async def fake_call(run, name, arguments):
+    async def fake_call(run, name, arguments, *, call_id=None, attempt=1):
         return ToolResult(call_id=f"call-{name}", status=ToolStatus.SUCCESS, output={"checked": True})
 
     application.sub_agent.context_manager = CaptureContext()
-    application.sub_agent._call = fake_call
+    application.sub_agent.tool_execution_cycle.raw_executor = fake_call
     snapshot_input = memory.model_copy(deep=True)
     execution = asyncio.run(
         application.sub_agent.run(
@@ -404,7 +404,7 @@ def test_subagent_partial_execution_returns_delta_without_persisting_parent_memo
             "raster.reproject": ToolResult(call_id="reproject", status=ToolStatus.SUCCESS, datasets=["projected-dem"]),
         }
 
-    async def fake_call(run, name, arguments):
+    async def fake_call(run, name, arguments, *, call_id=None, attempt=1):
         if name == "raster.slope" and arguments["dataset_id"] == "projected-dem":
             return ToolResult(
                 call_id="slope-retry",
@@ -413,7 +413,7 @@ def test_subagent_partial_execution_returns_delta_without_persisting_parent_memo
             )
         return responses[name]
 
-    application.sub_agent._call = fake_call
+    application.sub_agent.tool_execution_cycle.raw_executor = fake_call
     execution = asyncio.run(
         application.sub_agent.run(
             AgentRequest(user_input="计算坡度", conversation_id=task.conversation_id),
@@ -444,11 +444,11 @@ def test_subagent_retry_uses_shared_cycle_and_accepts_only_final_result(applicat
         ToolResult(call_id="validate-ok", status=ToolStatus.SUCCESS, output={"valid": True}),
     ]
 
-    async def fake_call(run, name, arguments):
+    async def fake_call(run, name, arguments, *, call_id=None, attempt=1):
         calls.append(name)
         return responses.pop(0)
 
-    application.sub_agent._call = fake_call
+    application.sub_agent.tool_execution_cycle.raw_executor = fake_call
     execution = asyncio.run(
         application.sub_agent.run(
             AgentRequest(user_input="检查道路", conversation_id=task.conversation_id),
@@ -481,11 +481,11 @@ def test_subagent_repair_accepts_final_dataset_without_internal_repair_dataset(a
         "raster.reproject": ToolResult(call_id="reproject", status=ToolStatus.SUCCESS, datasets=["projected-dem"]),
     }
 
-    async def fake_call(run, name, arguments):
+    async def fake_call(run, name, arguments, *, call_id=None, attempt=1):
         value = responses[name]
         return value.pop(0) if isinstance(value, list) else value
 
-    application.sub_agent._call = fake_call
+    application.sub_agent.tool_execution_cycle.raw_executor = fake_call
     application.sub_agent.tool_execution_cycle.verifier = type("Verifier", (), {"verify": lambda self, result, datasets: (True, [])})()
     execution = asyncio.run(
         application.sub_agent.run(

@@ -2,7 +2,7 @@
 
 from .executor import ToolExecutor
 from .model import RegisteredTool, ToolContext
+from .raw_executor import RawToolExecutor
 from .registry import ToolRegistry
 
-__all__ = ["ToolContext", "RegisteredTool", "ToolExecutor", "ToolRegistry"]
-
+__all__ = ["RawToolExecutor", "ToolContext", "RegisteredTool", "ToolExecutor", "ToolRegistry"]

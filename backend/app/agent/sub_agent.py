@@ -20,7 +20,6 @@ from app.core.models import (
     RunStatus,
     SubAgentExecutionResult,
     SubTask,
-    ToolCall,
     ToolResult,
     WorkingMemory,
     WorkingMemoryDelta,
@@ -28,7 +27,7 @@ from app.core.models import (
 )
 from app.decision import FailureAnalyzer, ResultVerifier
 from app.events import EventType
-from app.execution.tools import ToolExecutor
+from app.execution.tools import RawToolExecutor, ToolExecutor
 from app.gis.errors import as_tool_error
 from app.observability import TraceRecorder
 from app.runtime.budget import BudgetExceeded, BudgetGuard
@@ -72,8 +71,14 @@ class SubAgent:
         self.default_crs = default_crs or getattr(executor_services.get("settings"), "default_crs", "EPSG:3857")
         if self.registry is None:
             raise ValueError("SubAgent 需要用户作用域 Dataset Registry")
+        self.raw_tool_executor = RawToolExecutor(
+            executor=self.executor,
+            store=self.store,
+            guard=self.guard,
+            services_factory=self.services_factory,
+        )
         self.tool_execution_cycle = ToolExecutionCycle(
-            raw_executor=self._raw_tool_for_cycle,
+            raw_executor=self.raw_tool_executor.execute,
             tool_registry=self.executor.registry,
             registry=self.registry,
             trace=self.trace,
@@ -222,34 +227,6 @@ class SubAgent:
         self.store.save_run(finished.model_copy(update={"metadata": {**finished.metadata, "result": final.model_dump(mode="json"), "directive": directive.value}}))
         await self.trace.emit(parent_run_id, EventType.SUBAGENT_COMPLETED, summary, payload={"agent_id": agent_id, "status": status.value, "directive": directive.value, "result": final.model_dump(mode="json")}, agent_id=agent_id)
         return SubAgentExecutionResult(result=final, working_memory_delta=delta, directive=directive, failure_rationale=failure_rationale)
-
-    async def _execute_tool_raw(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None, attempt: int = 1) -> ToolResult:
-        current = self.store.get_run(run.id) or run
-        self.guard.check_turn(current)
-        self.guard.check_tool(current)
-        self.guard.check_execution_time(current)
-        # SubAgent 当前是确定性执行器，没有独立认知回合；这里只累计工具调用。
-        current = current.model_copy(update={"tool_call_count": current.tool_call_count + 1, "status": RunStatus.WAITING_TOOL})
-        self.store.save_run(current)
-        call = ToolCall(id=call_id or new_id("call"), name=name, arguments=arguments, run_id=current.id, agent_id=current.agent_id, attempt=attempt)
-        user_id = self.store.user_id_for_run(current.id)
-        services = self.services_factory(user_id) if self.services_factory else self.executor.services if hasattr(self.executor, "services") else {}
-        return await self.executor.execute(call, agent_id=current.agent_id, services=services)
-
-    async def _call(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None, attempt: int = 1) -> ToolResult:
-        """Raw Tool hook，保留给测试和旧调用方；业务执行统一经过 Cycle。"""
-
-        return await self._execute_tool_raw(run, name, arguments, call_id=call_id, attempt=attempt)
-
-    async def _raw_tool_for_cycle(self, run: Run, name: str, arguments: dict[str, Any], *, call_id: str | None = None, attempt: int = 1) -> ToolResult:
-        try:
-            return await self._call(run, name, arguments, call_id=call_id, attempt=attempt)
-        except TypeError as exc:
-            # 保留现有测试和外部 hook 的三参数兼容形式；正式 executor 仍会记录 attempt。
-            if "unexpected keyword argument" not in str(exc):
-                raise
-            return await self._call(run, name, arguments)
-
 
 def _require_accepted(outcome: ExecutionOutcome, label: str) -> ToolResult:
     if not outcome.accepted:

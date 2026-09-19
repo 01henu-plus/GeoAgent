@@ -185,7 +185,8 @@ def test_model_second_turn_reads_updated_working_memory(application):
         application.main_agent.working_memory_updater.update_from_tool_result(current_run.task_id, result, run_id=current_run.id)
         return result
 
-    application.main_agent._tool = fake_tool
+    original_raw_executor = application.main_agent.tool_execution_cycle.raw_executor
+    application.main_agent.tool_execution_cycle.raw_executor = fake_tool
     request = AgentRequest(user_input="分析结果", conversation_id=task.conversation_id)
     frame = RequestFrame(mode=InteractionMode.CONTINUE_TASK, goal="分析结果", target_task_id=task.id)
     prepared = PreparedRequest(
@@ -196,7 +197,10 @@ def test_model_second_turn_reads_updated_working_memory(application):
         run=run,
         working_memory=memory,
     )
-    result = asyncio.run(application.main_agent.run(request, prepared=prepared))
+    try:
+        result = asyncio.run(application.main_agent.run(request, prepared=prepared))
+    finally:
+        application.main_agent.tool_execution_cycle.raw_executor = original_raw_executor
 
     assert result is not None
     second_context = model.requests[1].messages[1]["content"]

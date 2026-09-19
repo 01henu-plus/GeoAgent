@@ -129,18 +129,18 @@ def test_model_multi_tool_observation_keeps_failed_and_successful_results_togeth
 
     model = MixedToolModel()
     application.main_agent.model_adapter = model
-    original_tool = application.main_agent._tool
+    original_raw_executor = application.main_agent.tool_execution_cycle.raw_executor
 
     async def fake_raw_tool(current_run, name, arguments, *, call_id=None):
         if name == "raster.slope":
             return ToolResult(call_id=call_id or "call-failed", status=ToolStatus.SUCCESS, datasets=["missing-output"])
         return ToolResult(call_id=call_id or name, status=ToolStatus.SUCCESS, output={"ok": True})
 
-    application.main_agent._tool = fake_raw_tool
+    application.main_agent.tool_execution_cycle.raw_executor = fake_raw_tool
     try:
         result = asyncio.run(application.ask("同时检查数据并计算坡度"))
     finally:
-        application.main_agent._tool = original_tool
+        application.main_agent.tool_execution_cycle.raw_executor = original_raw_executor
 
     assert result.status is AgentResultStatus.SUCCESS
     second_context = json.loads(model.requests[1].messages[1]["content"].split("\n", 1)[1])
@@ -190,16 +190,16 @@ def test_model_path_verification_failure_is_not_accepted_into_working_memory(app
 
     model = VerificationModel()
     application.main_agent.model_adapter = model
-    original_tool = application.main_agent._tool
+    original_raw_executor = application.main_agent.tool_execution_cycle.raw_executor
 
     async def fake_raw_tool(current_run, name, arguments, *, call_id=None):
         return ToolResult(call_id=call_id or "bad-output", status=ToolStatus.SUCCESS, datasets=["missing-output"])
 
-    application.main_agent._tool = fake_raw_tool
+    application.main_agent.tool_execution_cycle.raw_executor = fake_raw_tool
     try:
         result = asyncio.run(application.ask("计算坡度"))
     finally:
-        application.main_agent._tool = original_tool
+        application.main_agent.tool_execution_cycle.raw_executor = original_raw_executor
 
     assert result.summary == "输出未通过验证，需要重新确认数据。"
     second_context = model.requests[1].messages[1]["content"]
