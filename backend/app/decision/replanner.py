@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from app.core.models import Dataset, IntentResult, Plan, ReplanContext
+from app.core.models import Dataset, Plan, ReplanContext, RequestFrame
 
 from .planner import Planner
 
@@ -24,8 +24,9 @@ class Replanner:
     def __init__(self, planner: Planner | None = None) -> None:
         self.planner = planner or Planner()
 
-    def replan(self, context: ReplanContext, intent: IntentResult, datasets: list[Dataset]) -> Plan:
-        rebuilt = self.planner.build(context.goal, intent, datasets)
+    def replan(self, context: ReplanContext, request_frame: RequestFrame, datasets: list[Dataset]) -> Plan:
+        frame = request_frame.model_copy(update={"goal": context.goal})
+        rebuilt = self.planner.build(frame, datasets)
         if rebuilt.clarification:
             raise ReplanNotPossible("REPLAN_NOT_SUPPORTED: " + rebuilt.clarification)
 

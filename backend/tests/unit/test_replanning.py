@@ -2,12 +2,13 @@ import pytest
 
 from app.core.models import (
     FailureAction,
-    IntentResult,
     IntentType,
+    InteractionMode,
     LoopDirective,
     Plan,
     PlanStep,
     ReplanContext,
+    RequestFrame,
     Run,
     RunBudget,
 )
@@ -51,19 +52,20 @@ def _context(plan, *, failed_step=None):
 
 
 class RevisedPlanner:
-    def build(self, goal, intent, datasets):
+    def build(self, request_frame, datasets):
         plan = _plan(revision=2, failed_id="operate__rev2")
         return plan
 
 
 class SamePlanner:
-    def build(self, goal, intent, datasets):
+    def build(self, request_frame, datasets):
         return _plan()
 
 
 def test_replanner_increments_revision_and_reuses_completed_steps():
     plan = _plan()
-    revised = Replanner(RevisedPlanner()).replan(_context(plan), IntentResult(intent=IntentType.SPATIAL_ANALYSIS, confidence=1), [])
+    frame = RequestFrame(mode=InteractionMode.NEW_TASK, goal=plan.goal, capabilities=["vector_analysis"], needs_planning=True, needs_tool=True)
+    revised = Replanner(RevisedPlanner()).replan(_context(plan), frame, [])
 
     assert revised.revision == 2
     assert revised.metadata["source"] == "replan"
@@ -77,7 +79,7 @@ def test_replanner_rejects_same_remaining_plan():
     plan = _plan()
 
     with pytest.raises(ReplanNotPossible, match="REPLAN_NO_PROGRESS"):
-        Replanner(SamePlanner()).replan(_context(plan), IntentResult(intent=IntentType.SPATIAL_ANALYSIS, confidence=1), [])
+        Replanner(SamePlanner()).replan(_context(plan), RequestFrame(mode=InteractionMode.NEW_TASK, goal=plan.goal, capabilities=["vector_analysis"], needs_planning=True, needs_tool=True), [])
 
 
 def test_remaining_fingerprint_ignores_completed_steps_but_keeps_dependencies():

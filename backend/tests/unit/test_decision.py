@@ -1,4 +1,4 @@
-from app.core.models import AgentRequest, Dataset, DatasetKind
+from app.core.models import AgentRequest, Dataset, DatasetKind, RequestFrame
 from app.decision import IntentResolver, ParallelismAnalyzer, Planner, TaskDecomposer
 
 
@@ -52,7 +52,8 @@ def test_planner_composes_reprojection_before_buffer():
     roads = Dataset(name="roads", kind=DatasetKind.VECTOR, path="roads.geojson", format="geojson")
     intent = IntentResolver().resolve(request, [roads])
 
-    plan = Planner().build(request.user_input, intent, [roads])
+    frame = RequestFrame(mode="new_task", goal=request.user_input, capabilities=["vector_analysis", "crs_transform"], needs_planning=True, needs_tool=True)
+    plan = Planner().build(frame, [roads])
 
     assert intent.entities["operations"] == ["reproject", "buffer"]
     assert [step.tool_name for step in plan.steps] == [
@@ -69,9 +70,8 @@ def test_planner_composes_reprojection_before_buffer():
 def test_planner_asks_for_missing_required_parameter():
     request = AgentRequest(user_input="给 roads 生成缓冲区")
     roads = Dataset(name="roads", kind=DatasetKind.VECTOR, path="roads.geojson", format="geojson")
-    intent = IntentResolver().resolve(request, [roads])
-
-    plan = Planner().build(request.user_input, intent, [roads])
+    frame = RequestFrame(mode="new_task", goal=request.user_input, capabilities=["vector_analysis"], needs_planning=True, needs_tool=True)
+    plan = Planner().build(frame, [roads])
 
     assert plan.clarification is not None
     assert not any(step.tool_name for step in plan.steps)
