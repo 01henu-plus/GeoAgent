@@ -60,7 +60,7 @@ def test_checkpoint_codec_round_trips_canonical_state_and_reads_legacy_aliases()
     )
     request = AgentRequest(user_input="继续", conversation_id="conversation-codec")
     frame = RequestFrame(mode=InteractionMode.CONTINUE_TASK, goal="继续分析")
-    payload = RuntimeCheckpointCodec.encode(request, None, frame, session)
+    payload = RuntimeCheckpointCodec.encode(request, frame, session)
 
     assert all(key in payload for key in RuntimeCheckpointCodec.CANONICAL_FIELDS)
     assert "model_findings" not in payload
@@ -109,8 +109,7 @@ def test_model_decision_provider_returns_only_agent_decision():
             session,
             request=request,
             run=run,
-            task=None,
-            intent=None,
+                task=None,
             request_frame=None,
             model_adapter=_TextModel(),
         )

@@ -6,7 +6,6 @@ from app.core.models import (
     AgentRequest,
     DecisionType,
     FailureAction,
-    IntentResult,
     IntentType,
     LoopDirective,
     Plan,
@@ -59,10 +58,10 @@ def test_planner_replan_increments_revision_and_skips_completed_step(application
         return _outcome(ToolResult(call_id="ok", status=ToolStatus.SUCCESS, output={"ok": True}, datasets=["slope-result"] if tool_name == "raster.slope__rev2" else []), accepted=True, directive=LoopDirective.CONTINUE)
 
     class FakeReplanner:
-        def replan(self, context, intent, datasets):
+        def replan(self, context, request_frame, datasets):
             return Plan(
                 goal=context.goal,
-                intent=intent.intent,
+                intent=IntentType.SPATIAL_ANALYSIS,
                 revision=context.current_revision + 1,
                 steps=[
                     PlanStep(id="inspect", title="检查数据", action="dataset.inspect", tool_name="dataset.inspect"),
@@ -73,7 +72,6 @@ def test_planner_replan_increments_revision_and_skips_completed_step(application
 
     request = AgentRequest(user_input="重规划", conversation_id=task.conversation_id)
     frame = RequestFrame(mode="new_task", goal="重规划测试")
-    intent = IntentResult(intent=IntentType.SPATIAL_ANALYSIS, confidence=1)
     session = AgentRuntimeSession(
         run=run,
         datasets=[],
@@ -86,21 +84,20 @@ def test_planner_replan_increments_revision_and_skips_completed_step(application
     application.main_agent.tool_execution_cycle = SimpleNamespace(execute=execute)
     application.main_agent.replanner = FakeReplanner()
     try:
-        inspect = asyncio.run(handlers.execute_plan_step(plan.steps[0], request=request, run=run, task=task, intent=intent, request_frame=frame, session=session))
-        failed = asyncio.run(handlers.execute_plan_step(plan.steps[1], request=request, run=run, task=task, intent=intent, request_frame=frame, session=session))
+        inspect = asyncio.run(handlers.execute_plan_step(plan.steps[0], request=request, run=run, task=task, request_frame=frame, session=session))
+        failed = asyncio.run(handlers.execute_plan_step(plan.steps[1], request=request, run=run, task=task, request_frame=frame, session=session))
         replanned = asyncio.run(
             handlers.handle_replan(
-                    AgentDecision(type=DecisionType.REPLAN, reasoning_summary="当前算法不适用"),
+                AgentDecision(type=DecisionType.REPLAN, reasoning_summary="当前算法不适用"),
                 object(),
                 request=request,
                 run=run,
                 task=task,
-                intent=intent,
                 request_frame=frame,
                 session=session,
             )
         )
-        completed = asyncio.run(handlers.execute_plan_step(session.current_plan.steps[1], request=request, run=run, task=task, intent=intent, request_frame=frame, session=session))
+        completed = asyncio.run(handlers.execute_plan_step(session.current_plan.steps[1], request=request, run=run, task=task, request_frame=frame, session=session))
     finally:
         application.main_agent.tool_execution_cycle = original_cycle
         application.main_agent.replanner = original_replanner

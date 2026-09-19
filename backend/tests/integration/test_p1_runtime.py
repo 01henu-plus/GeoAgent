@@ -13,9 +13,9 @@ def test_resume_skips_completed_offline_steps(application, authenticated_client)
     original_checkpoint = handlers.step_checkpoint
     stopped = False
 
-    async def stop_after_inspection(request, intent, request_frame, session, phase):
+    async def stop_after_inspection(request, request_frame, session, phase):
         nonlocal stopped
-        await handlers._checkpoint_runtime(request, intent, request_frame, session, phase)
+        await handlers._checkpoint_runtime(request, request_frame, session, phase)
         if not stopped and "inspect" in session.completed_steps:
             stopped = True
             raise asyncio.CancelledError()

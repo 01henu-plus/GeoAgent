@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.core.models import AgentRequest, IntentResult, Plan, RequestFrame
+from app.core.models import AgentRequest, Plan, RequestFrame
 from app.runtime.protocol_history import extract_protocol_messages
 from app.runtime.session import AgentRuntimeSession, RuntimeResumeState
 
@@ -68,7 +68,6 @@ class RuntimeCheckpointCodec:
     def encode(
         cls,
         request: AgentRequest,
-        intent: IntentResult | None,
         request_frame: RequestFrame | None,
         session: AgentRuntimeSession,
         *,
@@ -81,7 +80,6 @@ class RuntimeCheckpointCodec:
         payload: dict[str, Any] = {
             "request": request.model_dump(mode="json"),
             "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
-            "intent": intent.model_dump(mode="json") if intent else None,
             "plan": plan.model_dump(mode="json") if plan else None,
             "current_plan": plan.model_dump(mode="json") if plan else None,
             "original_plan": session.original_plan.model_dump(mode="json") if session.original_plan else None,

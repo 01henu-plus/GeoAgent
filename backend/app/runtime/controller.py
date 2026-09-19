@@ -12,7 +12,6 @@ from typing import Any
 
 from app.core.models import (
     AgentRequest,
-    IntentResult,
     RequestFrame,
     Run,
     RunBudget,
@@ -79,7 +78,6 @@ class AgentRuntimeController:
         run: Run,
         task: Task | None,
         datasets: list[Any],
-        intent: IntentResult | None,
         plan,
         request_frame: RequestFrame | None,
         working_memory: WorkingMemory | None,
@@ -103,7 +101,7 @@ class AgentRuntimeController:
         await self.checkpoint(
             current.id,
             "runtime_started",
-            self.checkpoint_codec.encode(request, intent, request_frame, session),
+            self.checkpoint_codec.encode(request, request_frame, session),
         )
 
         initial_state = self.state_builder.build(
@@ -164,7 +162,6 @@ class AgentRuntimeController:
                     request=request,
                     run=current_run,
                     task=task,
-                    intent=intent,
                     request_frame=request_frame,
                     model_adapter=model_adapter,
                     on_model_delta=on_model_delta,
@@ -175,7 +172,6 @@ class AgentRuntimeController:
                     session,
                     request=request,
                     task=task,
-                    intent=intent,
                     request_frame=request_frame,
                 )
             await self.trace_decision(decision, state)
@@ -189,7 +185,6 @@ class AgentRuntimeController:
                 request=request,
                 run=session.run,
                 task=task,
-                intent=intent,
                 request_frame=request_frame,
             )
 
@@ -209,7 +204,6 @@ class AgentRuntimeController:
                 request=request,
                 run=session.run,
                 task=task,
-                intent=intent,
                 request_frame=request_frame,
             )
             return await value if inspect.isawaitable(value) else value

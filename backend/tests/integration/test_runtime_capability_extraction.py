@@ -8,7 +8,6 @@ from app.core.models import (
     AgentRequest,
     AgentResultStatus,
     DecisionType,
-    IntentResult,
     IntentType,
     LoopDirective,
     Plan,
@@ -136,10 +135,10 @@ def test_replan_handler_is_runtime_owned(application):
     )
 
     class Replanner:
-        def replan(self, context, intent, datasets):
+        def replan(self, context, request_frame, datasets):
             return Plan(
                 goal=context.goal,
-                intent=intent.intent,
+                intent=IntentType.SPATIAL_ANALYSIS,
                 revision=context.current_revision + 1,
                 steps=[PlanStep(id="replacement", title="替代步骤", action="检查", tool_name="dataset.inspect")],
             )
@@ -157,7 +156,6 @@ def test_replan_handler_is_runtime_owned(application):
             request=request,
             run=run,
             task=task,
-            intent=IntentResult(intent=IntentType.SPATIAL_ANALYSIS, confidence=1),
             request_frame=frame,
             session=session,
         )

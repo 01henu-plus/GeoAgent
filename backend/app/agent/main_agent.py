@@ -18,7 +18,6 @@ from app.core.models import (
     AgentResultStatus,
     Checkpoint,
     DecisionType,
-    IntentResult,
     InteractionMode,
     Plan,
     RequestFrame,
@@ -70,7 +69,6 @@ from app.runtime.protocol_history import compact_protocol_messages
 from app.runtime.tool_execution_cycle import ToolExecutionCycle
 from app.state import StateStore, WorkingMemoryUpdater
 from app.task.service import TaskService
-from app.understanding.compat import LegacyIntentAdapter
 from app.understanding.interpreter import RequestInterpreter
 from app.understanding.pipeline import RequestUnderstandingPipeline
 
@@ -107,7 +105,6 @@ class MainAgent:
             store,
             interpreter=RequestInterpreter(self.intent_resolver),
         )
-        self.legacy_intent_adapter = LegacyIntentAdapter(self.intent_resolver)
         self.planner = Planner()
         self.replanner = Replanner(self.planner)
         self.router = AgentRouter()
@@ -153,8 +150,6 @@ class MainAgent:
             decomposer=self.decomposer,
             agent_manager=lambda: self.agent_manager,
             task_service=self.task_service,
-            legacy_intent_adapter=self.legacy_intent_adapter,
-            intent_resolver=self.intent_resolver,
             plan_loop=self.loop,
             tool_execution_cycle=lambda: self.tool_execution_cycle,
             working_memory_updater=self.working_memory_updater,
@@ -171,8 +166,6 @@ class MainAgent:
             max_tokens=self.budget.max_tokens,
         )
         self.offline_decision_provider = OfflineDecisionProvider(
-            legacy_intent_adapter=self.legacy_intent_adapter,
-            intent_resolver=self.intent_resolver,
             router=self.router,
             decomposer=self.decomposer,
             knowledge=self.knowledge,
@@ -274,7 +267,6 @@ class MainAgent:
         if isinstance(saved_replan_count, int) and saved_replan_count > 0 and run.replan_count < saved_replan_count:
             run = run.model_copy(update={"replan_count": saved_replan_count})
             self.store.save_run(run)
-        intent: IntentResult | None = None
         plan: Plan | None = None
         request_frame: RequestFrame | None = prepared_request.frame
         if self.conversation_memory is not None:
@@ -291,21 +283,17 @@ class MainAgent:
         )
         try:
             datasets = self._resolve_datasets(request)
-            if resume_from and resume_state.get("intent") and (resume_state.get("current_plan") or resume_state.get("plan")):
-                intent = IntentResult.model_validate(resume_state["intent"])
+            if resume_from and (resume_state.get("current_plan") or resume_state.get("plan")):
                 plan = runtime_resume.current_plan
                 phase = resume_from.phase
                 await self.trace.emit(run.id, EventType.RESUME_STARTED, f"从 Checkpoint 继续：{resume_from.phase}", payload={"checkpoint_id": resume_from.id, "phase": resume_from.phase}, agent_id="main")
             phase = "request_understood"
-            if intent is None:
-                intent = self.legacy_intent_adapter.to_intent(request_frame, request, datasets)
             await self.trace.emit(
                 run.id,
                 EventType.INTENT_RESOLVED,
                 "请求理解完成",
                 payload={
                     "request_frame": request_frame.model_dump(mode="json"),
-                    "legacy_intent": intent.model_dump(mode="json"),
                     "source": "request_understanding",
                 },
                 agent_id="main",
@@ -337,7 +325,6 @@ class MainAgent:
                 run=run,
                 task=task,
                 datasets=datasets,
-                intent=intent,
                 plan=plan,
                 request_frame=request_frame,
                 working_memory=working_memory,
@@ -362,7 +349,6 @@ class MainAgent:
                 for key in (
                     "request",
                     "request_frame",
-                    "intent",
                     "plan",
                     "current_plan",
                     "original_plan",
@@ -396,7 +382,6 @@ class MainAgent:
                 {
                     "request": request.model_dump(mode="json"),
                     "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
-                    "intent": intent.model_dump(mode="json") if intent else None,
                 }
             )
             if plan is not None or "plan" not in state:
@@ -473,7 +458,6 @@ class MainAgent:
         run: Run,
         task: Task | None,
         datasets,
-        intent: IntentResult | None,
         plan: Plan | None,
         request_frame: RequestFrame | None,
         protocol_messages: list[dict[str, Any]],
@@ -509,7 +493,6 @@ class MainAgent:
             request,
             run,
             datasets,
-            intent,
             plan,
             request_frame,
             working_memory=working_memory,
@@ -532,7 +515,6 @@ class MainAgent:
                 request,
                 run,
                 datasets,
-                intent,
                 plan,
                 request_frame,
                 working_memory=working_memory,
@@ -572,7 +554,6 @@ class MainAgent:
         request: AgentRequest,
         run: Run,
         datasets,
-        intent: IntentResult | None,
         plan: Plan | None,
         request_frame: RequestFrame | None = None,
         *,
@@ -609,7 +590,6 @@ class MainAgent:
             working_memory=working_memory,
             budget=self.budget.model_dump(mode="json"),
             referenced_runs=referenced_runs,
-            intent_hint=intent,
             request_frame=request_frame,
             user_profile=user_profile,
             conversation_memory=conversation_memory,

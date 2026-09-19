@@ -219,7 +219,6 @@ def test_main_agent_rejects_fixed_cost_input_overflow(application):
             [],
             None,
             None,
-            None,
             [],
             working_memory=None,
             request_resources=RequestResources(),

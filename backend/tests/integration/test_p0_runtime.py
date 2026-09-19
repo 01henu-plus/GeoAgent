@@ -7,7 +7,6 @@ from app.config import Settings
 from app.core.models import (
     AgentRequest,
     AgentResultStatus,
-    IntentResult,
     IntentType,
     LoopDirective,
     Plan,
@@ -214,7 +213,6 @@ def test_main_agent_planner_path_maps_loop_directives_without_replanning(applica
     run = Run(task_id=task.id, conversation_id=task.conversation_id, agent_id="main")
     application.store.save_run(run)
     request = AgentRequest(user_input="执行控制信号测试", conversation_id=task.conversation_id)
-    intent = IntentResult(intent=IntentType.DATA_INSPECTION, confidence=1.0)
     plan = Plan(
         goal="执行控制信号测试",
         intent=IntentType.DATA_INSPECTION,
@@ -250,7 +248,6 @@ def test_main_agent_planner_path_maps_loop_directives_without_replanning(applica
                 request=request,
                 run=run,
                 task=task,
-                intent=intent,
                 request_frame=None,
                 session=session,
             )
@@ -392,15 +389,15 @@ def test_resume_uses_saved_checkpoint_plan(application, authenticated_client):
     old_run = old_run.model_copy(update={"status": RunStatus.CANCELLED})
     application.store.save_run(old_run)
     datasets = application.main_agent._resolve_datasets(request)
-    intent = application.main_agent.intent_resolver.resolve(request, datasets)
-    plan = application.main_agent.planner.build(request.user_input, intent, datasets)
+    frame = prepared.frame
+    plan = application.main_agent.planner.build(frame, datasets)
     session = AgentRuntimeSession(
         run=old_run,
         datasets=datasets,
         current_plan=plan,
         original_plan=plan.model_copy(deep=True),
     )
-    checkpoint_state = RuntimeCheckpointCodec.encode(request, intent, prepared.frame, session)
+    checkpoint_state = RuntimeCheckpointCodec.encode(request, prepared.frame, session)
     checkpoint = make_checkpoint(old_run.id, "plan_created", checkpoint_state)
     application.checkpoints.save(checkpoint)
 

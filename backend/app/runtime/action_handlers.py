@@ -22,7 +22,6 @@ from app.core.models import (
     AgentResultStatus,
     ErrorCategory,
     FailureAction,
-    IntentResult,
     LoopDirective,
     Plan,
     ReplanContext,
@@ -40,7 +39,6 @@ from app.core.models import (
     WorkingMemory,
 )
 from app.decision import (
-    IntentResolver,
     Planner,
     Replanner,
     ReplanNotPossible,
@@ -56,7 +54,6 @@ from app.runtime.session import AgentRuntimeSession
 from app.runtime.tool_execution_cycle import ExecutionOutcome, ToolExecutionCycle
 from app.state import StateStore, WorkingMemoryUpdater
 from app.task.service import TaskService
-from app.understanding.compat import LegacyIntentAdapter
 
 CheckpointWriter = Callable[[str, str, dict[str, Any]], Awaitable[None]]
 
@@ -97,8 +94,6 @@ class RuntimeActionHandlers:
         decomposer: TaskDecomposer,
         agent_manager: AgentManager | Callable[[], AgentManager],
         task_service: TaskService,
-        legacy_intent_adapter: LegacyIntentAdapter,
-        intent_resolver: IntentResolver,
         plan_loop,
         tool_execution_cycle: ToolExecutionCycle | Callable[[], ToolExecutionCycle],
         working_memory_updater: WorkingMemoryUpdater,
@@ -117,8 +112,6 @@ class RuntimeActionHandlers:
         self.decomposer = decomposer
         self.agent_manager = agent_manager
         self.task_service = task_service
-        self.legacy_intent_adapter = legacy_intent_adapter
-        self.intent_resolver = intent_resolver
         self.plan_loop = plan_loop
         self.tool_execution_cycle = tool_execution_cycle
         self.working_memory_updater = working_memory_updater
@@ -136,7 +129,6 @@ class RuntimeActionHandlers:
         request: AgentRequest,
         run: Run,
         task: Task | None,
-        intent: IntentResult | None,
         request_frame: RequestFrame | None,
         session: AgentRuntimeSession,
     ) -> RuntimeTransition:
@@ -209,7 +201,7 @@ class RuntimeActionHandlers:
             session.protocol_messages,
             max_tokens=self.budget.protocol_history_tokens,
         )
-        await self._checkpoint_runtime(request, intent, request_frame, session, "model_tool_completed")
+        await self._checkpoint_runtime(request, request_frame, session, "model_tool_completed")
         return RuntimeTransition(
             observation=session.latest_observation,
             latest_failure=session.latest_failure,
@@ -227,16 +219,17 @@ class RuntimeActionHandlers:
         request: AgentRequest,
         run: Run,
         task: Task | None,
-        intent: IntentResult | None,
         request_frame: RequestFrame | None,
         session: AgentRuntimeSession,
     ) -> RuntimeTransition:
         """构建计划并开启 runtime-owned fast path。"""
 
-        intent = intent or self.legacy_intent_adapter.to_intent(request_frame, request, session.datasets)
         current_run = self.store.get_run(session.run.id) or session.run
         self.store.save_run(current_run.model_copy(update={"status": RunStatus.PLANNING}))
-        new_plan = self._planner().build(decision.plan_goal or state.goal, intent, session.datasets)
+        frame = request_frame or RequestFrame(mode="new_task", goal=decision.plan_goal or state.goal)
+        if decision.plan_goal and decision.plan_goal != frame.goal:
+            frame = frame.model_copy(update={"goal": decision.plan_goal})
+        new_plan = self._planner().build(frame, session.datasets)
         session.current_plan = new_plan
         session.original_plan = new_plan.model_copy(deep=True)
         session.fast_path_enabled = True
@@ -252,7 +245,7 @@ class RuntimeActionHandlers:
             payload={**new_plan.model_dump(mode="json"), "source": "agent_runtime"},
             agent_id="main",
         )
-        await self._checkpoint_runtime(request, intent, request_frame, session, "plan_created")
+        await self._checkpoint_runtime(request, request_frame, session, "plan_created")
         return RuntimeTransition(current_plan=new_plan, clear_failure=True)
 
     async def execute_plan_step(
@@ -262,7 +255,6 @@ class RuntimeActionHandlers:
         request: AgentRequest,
         run: Run,
         task: Task | None,
-        intent: IntentResult | None,
         request_frame: RequestFrame | None,
         session: AgentRuntimeSession,
     ) -> RuntimeTransition:
@@ -322,7 +314,6 @@ class RuntimeActionHandlers:
         session.latest_observation = observation
         await self._step_checkpoint(
             request,
-            intent,
             request_frame,
             session,
             "plan_step_completed" if outcome.accepted else "plan_step_failed",
@@ -348,7 +339,6 @@ class RuntimeActionHandlers:
         request: AgentRequest,
         run: Run,
         task: Task | None,
-        intent: IntentResult | None,
         request_frame: RequestFrame | None,
         session: AgentRuntimeSession,
     ) -> RuntimeTransition:
@@ -396,7 +386,7 @@ class RuntimeActionHandlers:
             failed_outcome=failed_outcome,
             directive=LoopDirective.REPLAN,
         )
-        intent = intent or self.legacy_intent_adapter.to_intent(request_frame, request, session.datasets)
+        frame = request_frame or RequestFrame(mode="new_task", goal=request.user_input)
         original_plan = session.original_plan or current_plan.model_copy(deep=True)
         current_run = self.store.get_run(run.id) or run
         self.store.save_run(current_run.model_copy(update={"status": RunStatus.REPLANNING}))
@@ -405,12 +395,11 @@ class RuntimeActionHandlers:
                 request,
                 run,
                 session.datasets,
-                intent,
+                frame,
                 original_plan,
                 current_plan,
                 outcome,
                 {"previous_replan_reasons": list(session.previous_replan_reasons)},
-                request_frame=request_frame,
             )
         except ReplanNotPossible as exc:
             running = self.store.get_run(run.id) or run
@@ -461,7 +450,6 @@ class RuntimeActionHandlers:
         request: AgentRequest,
         run: Run,
         task: Task | None,
-        intent: IntentResult | None,
         request_frame: RequestFrame | None,
         session: AgentRuntimeSession,
     ) -> RuntimeTransition:
@@ -496,7 +484,6 @@ class RuntimeActionHandlers:
             task,
             session.datasets,
             tasks,
-            intent=intent,
             plan=session.current_plan,
             request_frame=request_frame,
             working_memory=session.working_memory,
@@ -529,7 +516,6 @@ class RuntimeActionHandlers:
         datasets,
         tasks=None,
         *,
-        intent: IntentResult | None,
         plan: Plan | None,
         request_frame: RequestFrame | None,
         working_memory: WorkingMemory | None,
@@ -545,7 +531,6 @@ class RuntimeActionHandlers:
             task,
             datasets,
             tasks,
-            intent=intent,
             plan=plan,
             request_frame=request_frame,
             working_memory=working_memory,
@@ -562,7 +547,6 @@ class RuntimeActionHandlers:
         datasets,
         tasks=None,
         *,
-        intent: IntentResult | None,
         plan: Plan | None,
         request_frame: RequestFrame | None,
         working_memory: WorkingMemory | None,
@@ -583,14 +567,14 @@ class RuntimeActionHandlers:
                 payload=subtask.model_dump(mode="json"),
                 agent_id="main",
             )
-        if legacy_plan_progress and plan is not None and intent is not None:
+        if legacy_plan_progress and plan is not None:
             _set_plan_step_status(plan, "decompose", TaskStatus.SUCCEEDED)
             _set_plan_step_status(plan, "parallel", TaskStatus.RUNNING)
         await self._checkpoint_writer()(
             run.id,
             "delegation_started",
             {
-                **_checkpoint_state(request, intent, plan, datasets, request_frame),
+                **_checkpoint_state(request, plan, datasets, request_frame),
                 "subtask_ids": [item.id for item in tasks],
                 "delegation_fingerprint": fingerprint,
                 "completed_delegation_fingerprints": sorted(completed_fingerprints or set()),
@@ -652,7 +636,7 @@ class RuntimeActionHandlers:
             run.id,
             "delegation_completed",
             {
-                **_checkpoint_state(request, intent, plan, datasets, request_frame),
+                **_checkpoint_state(request, plan, datasets, request_frame),
                 "subtask_ids": [item.id for item in tasks],
                 "delegation_fingerprint": fingerprint,
                 "subagent_results": [dict(item) for item in views],
@@ -681,13 +665,11 @@ class RuntimeActionHandlers:
         request: AgentRequest,
         run: Run,
         datasets,
-        intent: IntentResult,
+        request_frame: RequestFrame | None,
         original_plan: Plan,
         current_plan: Plan,
         outcome: PlanLoopOutcome,
         state: dict[str, Any],
-        *,
-        request_frame: RequestFrame | None,
     ) -> tuple[Plan, dict[str, Any]]:
         current_run = self.store.get_run(run.id) or run
         self.guard.check_replan(current_run)
@@ -732,7 +714,6 @@ class RuntimeActionHandlers:
             {
                 "request": request.model_dump(mode="json"),
                 "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
-                "intent": intent.model_dump(mode="json"),
                 "plan": current_plan.model_dump(mode="json"),
                 "original_plan": original_plan.model_dump(mode="json"),
                 "replan_context": context.model_dump(mode="json"),
@@ -740,7 +721,7 @@ class RuntimeActionHandlers:
                 **_plan_state_from_outcome(outcome, reasons),
             },
         )
-        revised = self._replanner().replan(context, intent, datasets)
+        revised = self._replanner().replan(context, request_frame or RequestFrame(mode="new_task", goal=context.goal), datasets)
         self.store.save_run(replanning_run.model_copy(update={"status": RunStatus.RUNNING}))
         next_state = _plan_state_from_outcome(outcome, reasons)
         next_state["errors"] = []
@@ -750,7 +731,6 @@ class RuntimeActionHandlers:
             {
                 "request": request.model_dump(mode="json"),
                 "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
-                "intent": intent.model_dump(mode="json"),
                 "plan": revised.model_dump(mode="json"),
                 "original_plan": original_plan.model_dump(mode="json"),
                 "replan_count": next_count,
@@ -802,7 +782,6 @@ class RuntimeActionHandlers:
     async def _checkpoint_runtime(
         self,
         request: AgentRequest,
-        intent: IntentResult | None,
         request_frame: RequestFrame | None,
         session: AgentRuntimeSession,
         phase: str,
@@ -810,31 +789,29 @@ class RuntimeActionHandlers:
         await self._checkpoint_writer()(
             session.run.id,
             phase,
-            self.checkpoint_codec.encode(request, intent, request_frame, session),
+            self.checkpoint_codec.encode(request, request_frame, session),
         )
 
     async def _step_checkpoint(
         self,
         request: AgentRequest,
-        intent: IntentResult | None,
         request_frame: RequestFrame | None,
         session: AgentRuntimeSession,
         phase: str,
     ) -> None:
         if self.step_checkpoint is not None:
-            await self.step_checkpoint(request, intent, request_frame, session, phase)
+            await self.step_checkpoint(request, request_frame, session, phase)
             return
-        await self._checkpoint_runtime(request, intent, request_frame, session, phase)
+        await self._checkpoint_runtime(request, request_frame, session, phase)
 
     def _checkpoint_writer(self) -> CheckpointWriter:
         return self.checkpoint()
 
 
-def _checkpoint_state(request, intent, plan, datasets, request_frame):
+def _checkpoint_state(request, plan, datasets, request_frame):
     return {
         "request": request.model_dump(mode="json"),
         "request_frame": request_frame.model_dump(mode="json") if request_frame else None,
-        "intent": intent.model_dump(mode="json") if intent else None,
         "plan": plan.model_dump(mode="json") if plan else None,
         "dataset_ids": [item.id for item in datasets],
     }

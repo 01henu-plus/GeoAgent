@@ -13,7 +13,6 @@ from app.core.models import (
     AgentRequest,
     ConversationMemory,
     Dataset,
-    IntentResult,
     MemoryItem,
     Plan,
     RequestFrame,
@@ -60,7 +59,6 @@ class ContextAssembler:
         referenced_runs: list[dict[str, Any]] | None = None,
         findings: list[Any] | None = None,
         errors: list[str] | None = None,
-        intent_hint: IntentResult | None = None,
         request_frame: RequestFrame | None = None,
         user_profile: UserProfile | dict[str, Any] | None = None,
         conversation_memory: ConversationMemory | dict[str, Any] | None = None,
@@ -200,11 +198,10 @@ class ContextAssembler:
                 "deterministic_hint",
                 ContextPriority.MEDIUM,
                 {
-                    "intent": _dump(intent_hint),
                     "plan": _dump(plan),
-                    "instruction": "仅供参考，不代表已经确认的用户意图，也不是必须执行的步骤。",
+                    "instruction": "仅供参考，不代表必须执行的步骤。",
                 }
-                if intent_hint is not None or plan is not None
+                if plan is not None
                 else {},
                 metadata={"drop_rank": 80},
             ),
