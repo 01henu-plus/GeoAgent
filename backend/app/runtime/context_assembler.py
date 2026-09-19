@@ -327,6 +327,10 @@ def _request_frame_view(frame: RequestFrame | None, goal: str) -> dict[str, Any]
     return {
         "mode": frame.mode.value,
         "goal": frame.goal,
+        "operations": list(frame.operations),
+        "parameters": dict(frame.parameters),
+        "dataset_roles": list(frame.dataset_roles),
+        "render_requested": frame.render_requested,
         "references": [
             {
                 "mention": item.mention,

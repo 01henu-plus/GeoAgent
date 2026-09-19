@@ -642,10 +642,14 @@ class StateSnapshot(StrictModel):
 
 
 class RequestFrame(StrictModel):
-    """状态感知的请求表达，供 Router/Planner 继续决策。"""
+    """状态感知的请求表达，也是后续决策层的唯一请求语义来源。"""
 
     mode: InteractionMode
     goal: str
+    operations: list[str] = Field(default_factory=list)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    dataset_roles: list[str] = Field(default_factory=list)
+    render_requested: bool = False
     references: list[ResolvedReference] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)

@@ -8,7 +8,7 @@ import re
 
 from app.core.models import Dataset, InteractionMode, RequestFrame, StateSnapshot
 from app.models import ModelAdapter, ModelRequest
-from app.understanding.deterministic import extract_request_hints
+from app.understanding.deterministic import DeterministicRequestHints, extract_request_hints
 from app.understanding.models import ReferenceResolution
 from app.understanding.patterns import (
     is_cancel_request,
@@ -26,6 +26,8 @@ _SYSTEM_PROMPT = """
 mode 只能是 new_task、continue_task、modify_task、retry_task、query、chat、cancel_task；
 goal 是用户当前要完成的目标；references 只能引用输入状态中真实存在的对象；
 capabilities 是完成目标所需能力，不要把能力写成 interaction mode；
+operations 只能使用已识别的 GIS 操作名；parameters 只填写用户明确提供的 distance、target_crs、field、predicate；
+dataset_roles 只填写请求中明确涉及的数据角色；render_requested 表示用户是否明确要求地图/可视化输出；
 target_task_id 和 target_run_id 只能从状态中选择，不能编造；
 无法解析的上下文指代放入 unresolved_references；不要生成执行步骤。
 """.strip()
@@ -45,7 +47,8 @@ class RequestInterpreter:
     ) -> RequestFrame:
         if model_adapter is not None and model_adapter.supports_structured_output:
             try:
-                return await self._interpret_with_model(message, state, resolution, model_adapter)
+                frame = await self._interpret_with_model(message, state, resolution, model_adapter)
+                return merge_deterministic_fields(frame, extract_request_hints(message, datasets))
             except Exception as exc:
                 # 保留离线回退，但让调用方能够在日志中发现结构化理解失败。
                 logger.warning(
@@ -146,6 +149,10 @@ class RequestInterpreter:
         return RequestFrame(
             mode=mode,
             goal=goal,
+            operations=list(hints.operations),
+            parameters=_parameters_from_hints(hints),
+            dataset_roles=list(hints.dataset_roles),
+            render_requested=hints.render_requested,
             references=resolution.references,
             constraints=constraints,
             capabilities=capabilities,
@@ -170,3 +177,49 @@ def _failed_run_id(state: StateSnapshot) -> str | None:
         if run.status.value == "FAILED" or run.error:
             return run.id
     return None
+
+
+def _parameters_from_hints(hints: DeterministicRequestHints) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for key in ("distance", "target_crs", "field", "predicate"):
+        value = getattr(hints, key)
+        if value is not None:
+            values[key] = value
+    return values
+
+
+def merge_deterministic_fields(frame: RequestFrame, hints: DeterministicRequestHints) -> RequestFrame:
+    """补齐模型未输出的可验证字段，并显式记录结构化冲突。"""
+
+    updates: dict[str, object] = {}
+    issues = list(frame.blocking_issues)
+    if hints.operations and frame.operations and frame.operations != hints.operations:
+        updates["operations"] = list(hints.operations)
+        issues.append("结构化请求中的 operations 与可验证文本不一致，已采用确定性解析结果")
+    elif hints.operations and not frame.operations:
+        updates["operations"] = list(hints.operations)
+    if hints.dataset_roles and frame.dataset_roles and set(frame.dataset_roles) != set(hints.dataset_roles):
+        updates["dataset_roles"] = list(hints.dataset_roles)
+        issues.append("结构化请求中的 dataset_roles 与可验证文本不一致，已采用确定性解析结果")
+    elif hints.dataset_roles and not frame.dataset_roles:
+        updates["dataset_roles"] = list(hints.dataset_roles)
+    if hints.render_requested and not frame.render_requested:
+        updates["render_requested"] = True
+
+    parameters = dict(frame.parameters)
+    for key in ("distance", "target_crs", "field", "predicate"):
+        value = getattr(hints, key)
+        if value is None:
+            continue
+        if key in parameters and parameters[key] != value:
+            issues.append(f"结构化请求中的 parameters.{key} 与可验证文本不一致，已采用确定性解析结果")
+        parameters[key] = value
+    if parameters != frame.parameters:
+        updates["parameters"] = parameters
+    if issues != frame.blocking_issues:
+        updates["blocking_issues"] = list(dict.fromkeys(issues))
+        updates["confidence"] = min(frame.confidence, 0.75)
+    return frame.model_copy(update=updates) if updates else frame
+
+
+__all__ = ["RequestInterpreter", "merge_deterministic_fields"]

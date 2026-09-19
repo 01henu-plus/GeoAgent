@@ -12,6 +12,9 @@ from app.core.models import (
 )
 from app.run.predicates import is_active_run, is_retryable_failed_run
 
+_ALLOWED_PARAMETERS = {"distance", "target_crs", "field", "predicate"}
+_ALLOWED_PREDICATES = {"intersects", "within", "nearest"}
+
 
 class RequestFrameValidator:
     def validate(self, frame: RequestFrame, state: StateSnapshot, resources: RequestResources | None = None) -> RequestFrame:
@@ -33,6 +36,10 @@ class RequestFrameValidator:
         target_task_id = None if frame.mode in {InteractionMode.NEW_TASK, InteractionMode.CHAT} else self._valid_target(frame.target_task_id, "task", known, unresolved)
         target_run_id = None if frame.mode in {InteractionMode.NEW_TASK, InteractionMode.CHAT} else self._valid_target(frame.target_run_id, "run", known, unresolved)
         confidence = frame.confidence
+        operations = list(dict.fromkeys(str(item) for item in frame.operations if str(item).strip()))
+        dataset_roles = list(dict.fromkeys(str(item) for item in frame.dataset_roles if str(item).strip()))
+        parameters, parameter_issues = _validate_parameters(frame.parameters)
+        blocking.extend(parameter_issues)
 
         if frame.mode in {InteractionMode.NEW_TASK, InteractionMode.CHAT}:
             target_task_id = None
@@ -79,6 +86,9 @@ class RequestFrameValidator:
         return frame.model_copy(
             update={
                 "references": _dedupe(valid_references),
+                "operations": operations,
+                "parameters": parameters,
+                "dataset_roles": dataset_roles,
                 "target_task_id": target_task_id,
                 "target_run_id": target_run_id,
                 "unresolved_references": list(dict.fromkeys(unresolved)),
@@ -119,3 +129,26 @@ def _dedupe(references: list[ResolvedReference]) -> list[ResolvedReference]:
             seen.add(key)
             result.append(item)
     return result
+
+
+def _validate_parameters(values: dict[str, object]) -> tuple[dict[str, object], list[str]]:
+    valid: dict[str, object] = {}
+    issues: list[str] = []
+    for key, value in values.items():
+        if key not in _ALLOWED_PARAMETERS:
+            issues.append(f"不支持的请求参数：{key}")
+            continue
+        if key == "distance":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                issues.append("distance 必须是大于 0 的数字")
+                continue
+        elif key in {"target_crs", "field"}:
+            if not isinstance(value, str) or not value.strip():
+                issues.append(f"{key} 必须是非空文本")
+                continue
+            value = value.strip()
+        elif key == "predicate" and value not in _ALLOWED_PREDICATES:
+            issues.append("predicate 只能是 intersects、within 或 nearest")
+            continue
+        valid[key] = value
+    return valid, issues

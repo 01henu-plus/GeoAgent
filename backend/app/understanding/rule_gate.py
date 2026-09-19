@@ -26,6 +26,7 @@ _CAPABILITY_TERMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("python_execution", ("python", "脚本", "代码")),
     ("knowledge_lookup", ("什么是", "如何", "原理", "为什么", "区别")),
     ("result_query", ("运行状态", "生成了哪些", "有哪些文件", "结果在哪里")),
+    ("run_diagnosis", ("运行状态", "运行记录", "为什么失败", "错误信息", "trace", "日志")),
 )
 
 

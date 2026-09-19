@@ -15,7 +15,7 @@ from app.core.models import Dataset
 
 _DISTANCE_RE = re.compile(r"(?P<amount>\d+(?:\.\d+)?)\s*(?P<unit>米|公尺|m|公里|千米|km)", re.IGNORECASE)
 _CRS_RE = re.compile(r"\bEPSG\s*[:：]?\s*(\d{4,6})\b", re.IGNORECASE)
-_FIELD_RE = re.compile(r"(?:字段|列|属性|field|按)\s*[：:=]?\s*[`\"“”']?([\w\u3400-\u9fff-]+)", re.IGNORECASE)
+_FIELD_RE = re.compile(r"(?:字段|列|属性|field|按(?:字段|列|属性)?)\s*[：:=]?\s*[`\"“”']?([\w\u3400-\u9fff-]+)", re.IGNORECASE)
 
 OPERATION_TERMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("buffer", ("缓冲区", "缓冲", "buffer")),
@@ -51,7 +51,7 @@ class DeterministicRequestHints:
     distance: float | None = None
     target_crs: str | None = None
     field: str | None = None
-    predicate: str = "intersects"
+    predicate: str | None = None
     dataset_roles: list[str] = dataclass_field(default_factory=list)
     mentioned_dataset_ids: list[str] = dataclass_field(default_factory=list)
     road_requested: bool = False
@@ -94,12 +94,19 @@ def extract_request_hints(message: str, datasets: list[Dataset] | None = None) -
     is_diagnosis = any(term in text for term in DIAGNOSIS_TERMS)
     requires_dataset = bool(operations) or any(term in text for term in INSPECTION_TERMS)
     mentioned = [dataset.id for dataset in datasets or [] if mentions_dataset(text, dataset)]
+    predicate = None
+    if any(term in text for term in ("包含", "within")):
+        predicate = "within"
+    elif any(term in text for term in ("最近", "nearest")):
+        predicate = "nearest"
+    elif any(term in text for term in ("相交", "intersects")):
+        predicate = "intersects"
     return DeterministicRequestHints(
         operations=operations,
         distance=distance,
         target_crs=target_crs,
         field=field_name,
-        predicate=("within" if any(term in text for term in ("包含", "within")) else "nearest" if any(term in text for term in ("最近", "nearest")) else "intersects"),
+        predicate=predicate,
         dataset_roles=roles,
         mentioned_dataset_ids=mentioned,
         road_requested=any(term in text for term in ROLE_TERMS["road"]),

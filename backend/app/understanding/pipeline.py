@@ -5,7 +5,8 @@ from __future__ import annotations
 from app.core.models import Dataset, RequestFrame, RequestResources
 from app.models import ModelAdapter
 from app.state import StateStore
-from app.understanding.interpreter import RequestInterpreter
+from app.understanding.deterministic import extract_request_hints
+from app.understanding.interpreter import RequestInterpreter, merge_deterministic_fields
 from app.understanding.normalizer import RequestNormalizer
 from app.understanding.reference_resolver import ReferenceResolver
 from app.understanding.rule_gate import RuleGate
@@ -55,6 +56,7 @@ class RequestUnderstandingPipeline:
                 model_adapter=model_adapter,
                 datasets=datasets,
             )
+        frame = merge_deterministic_fields(frame, extract_request_hints(normalized, datasets or state.recent_datasets))
         merged = _merge_references(frame, resolution)
         return self.validator.validate(merged, state, request_resources)
 
