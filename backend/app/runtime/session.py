@@ -26,7 +26,6 @@ class RuntimeResumeState:
     artifact_ids: list[str] = field(default_factory=list)
     subagent_results: list[Any] = field(default_factory=list)
     completed_delegation_fingerprints: list[str] = field(default_factory=list)
-    legacy_delegation_result: dict[str, Any] | None = None
     current_plan: Plan | None = None
     original_plan: Plan | None = None
     completed_steps: list[str] = field(default_factory=list)

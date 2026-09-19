@@ -55,7 +55,6 @@ class RuntimeCheckpointCodec:
             artifact_ids=[str(item) for item in (state.get("artifact_ids") or state.get("model_artifact_ids") or [])],
             subagent_results=list(state.get("subagent_results") or []),
             completed_delegation_fingerprints=[str(item) for item in state.get("completed_delegation_fingerprints") or []],
-            legacy_delegation_result=_legacy_result(state),
             current_plan=current_plan,
             original_plan=original_plan,
             completed_steps=[str(item) for item in state.get("completed_steps") or []],
@@ -104,14 +103,6 @@ def _plan(value: Any) -> Plan | None:
     if not isinstance(value, dict):
         return None
     return Plan.model_validate(value)
-
-
-def _legacy_result(state: dict[str, Any]) -> dict[str, Any] | None:
-    for key in ("legacy_result", "delegation_result"):
-        value = state.get(key)
-        if isinstance(value, dict):
-            return dict(value)
-    return None
 
 
 __all__ = ["RuntimeCheckpointCodec"]
