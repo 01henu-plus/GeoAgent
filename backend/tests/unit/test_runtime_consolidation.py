@@ -63,6 +63,9 @@ def test_checkpoint_codec_round_trips_canonical_state_and_reads_legacy_aliases()
     payload = RuntimeCheckpointCodec.encode(request, None, frame, session)
 
     assert all(key in payload for key in RuntimeCheckpointCodec.CANONICAL_FIELDS)
+    assert "model_findings" not in payload
+    assert "model_dataset_ids" not in payload
+    assert "model_artifact_ids" not in payload
     restored = RuntimeCheckpointCodec.decode(payload)
     assert restored.dataset_ids == ["dataset-a"]
     assert restored.current_plan is not None
@@ -138,7 +141,9 @@ def test_action_dispatcher_returns_transition_without_finalizing_run():
 
 
 def test_default_main_agent_uses_controller_as_canonical_entry(application):
-    assert application.main_agent._model_loop_is_overridden() is False
+    assert not hasattr(application.main_agent, "_model_loop")
+    assert not hasattr(application.main_agent, "_execute_plan")
+    assert not hasattr(application.main_agent, "_delegate")
     assert application.main_agent.runtime_controller is not None
 
 

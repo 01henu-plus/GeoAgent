@@ -99,14 +99,6 @@ class RuntimeCheckpointCodec:
             "previous_replan_reasons": list(session.previous_replan_reasons),
             "runtime_mode": session.decision_provider,
         }
-        # 本轮仍保留旧模型恢复读取所需 aliases，但 canonical 代码不再消费它们。
-        payload.update(
-            {
-                "model_findings": list(session.findings),
-                "model_dataset_ids": sorted(session.dataset_ids),
-                "model_artifact_ids": sorted(session.artifact_ids),
-            }
-        )
         return payload
 
 
