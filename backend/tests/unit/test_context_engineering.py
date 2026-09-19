@@ -180,7 +180,7 @@ def test_model_second_turn_reads_updated_working_memory(application):
     model = TwoTurnModel()
     application.main_agent.model_adapter = model
 
-    async def fake_tool(current_run, name, arguments, *, call_id=None):
+    async def fake_tool(current_run, name, arguments, *, call_id=None, attempt=1):
         result = ToolResult(call_id=call_id or "call-refresh", status=ToolStatus.SUCCESS, datasets=[generated.id], output={"ok": True})
         application.main_agent.working_memory_updater.update_from_tool_result(current_run.task_id, result, run_id=current_run.id)
         return result

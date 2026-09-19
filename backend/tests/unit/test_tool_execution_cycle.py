@@ -67,7 +67,7 @@ class SequenceExecutor:
         self.results = list(results)
         self.calls = []
 
-    async def __call__(self, run, name, arguments, *, call_id=None):
+    async def __call__(self, run, name, arguments, *, call_id=None, attempt=1):
         self.calls.append((name, arguments, call_id))
         result = self.results.pop(0)
         return result

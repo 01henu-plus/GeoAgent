@@ -131,7 +131,7 @@ def test_model_multi_tool_observation_keeps_failed_and_successful_results_togeth
     application.main_agent.model_adapter = model
     original_raw_executor = application.main_agent.tool_execution_cycle.raw_executor
 
-    async def fake_raw_tool(current_run, name, arguments, *, call_id=None):
+    async def fake_raw_tool(current_run, name, arguments, *, call_id=None, attempt=1):
         if name == "raster.slope":
             return ToolResult(call_id=call_id or "call-failed", status=ToolStatus.SUCCESS, datasets=["missing-output"])
         return ToolResult(call_id=call_id or name, status=ToolStatus.SUCCESS, output={"ok": True})
@@ -192,7 +192,7 @@ def test_model_path_verification_failure_is_not_accepted_into_working_memory(app
     application.main_agent.model_adapter = model
     original_raw_executor = application.main_agent.tool_execution_cycle.raw_executor
 
-    async def fake_raw_tool(current_run, name, arguments, *, call_id=None):
+    async def fake_raw_tool(current_run, name, arguments, *, call_id=None, attempt=1):
         return ToolResult(call_id=call_id or "bad-output", status=ToolStatus.SUCCESS, datasets=["missing-output"])
 
     application.main_agent.tool_execution_cycle.raw_executor = fake_raw_tool

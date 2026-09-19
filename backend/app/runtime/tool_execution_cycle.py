@@ -224,19 +224,9 @@ class ToolExecutionCycle:
         call_id: str | None = None,
         attempt: int,
     ) -> ToolResult:
-        """把 logical action 的 attempt 传给新 executor，同时兼容旧测试 hook。"""
+        """把 logical action 的 call_id 和 attempt 传给唯一 Raw executor。"""
 
-        kwargs: dict[str, Any] = {"attempt": attempt}
-        if call_id is not None:
-            kwargs["call_id"] = call_id
-        try:
-            return await self.raw_executor(run, tool_name, arguments, **kwargs)
-        except TypeError as exc:
-            if "unexpected keyword argument 'attempt'" not in str(exc):
-                raise
-            if call_id is not None:
-                return await self.raw_executor(run, tool_name, arguments, call_id=call_id)
-            return await self.raw_executor(run, tool_name, arguments)
+        return await self.raw_executor(run, tool_name, arguments, call_id=call_id, attempt=attempt)
 
     async def _repair_arguments(
         self,
