@@ -12,7 +12,6 @@ from typing import Any
 from app.core.models import (
     AgentDecision,
     AgentRequest,
-    IntentResult,
     RequestFrame,
     RequestResources,
     Run,
@@ -49,7 +48,6 @@ class ModelDecisionProvider:
         request: AgentRequest,
         run: Run,
         task: Task | None,
-        intent: IntentResult | None,
         request_frame: RequestFrame | None,
         model_adapter: ModelAdapter,
         on_model_delta: Callable[[str], Awaitable[None]] | None = None,
@@ -68,7 +66,6 @@ class ModelDecisionProvider:
             run,
             task,
             datasets,
-            intent,
             session.current_plan,
             request_frame,
             session.protocol_messages,

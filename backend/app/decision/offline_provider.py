@@ -11,26 +11,22 @@ from app.core.models import (
     AgentResult,
     AgentResultStatus,
     DecisionType,
-    IntentResult,
+    InteractionMode,
     RequestFrame,
     Task,
 )
 from app.decision.decomposer import TaskDecomposer
-from app.decision.intent import IntentResolver
 from app.decision.router import AgentRouter
 from app.knowledge import KnowledgeRetriever
 from app.runtime.session import AgentRuntimeSession
-from app.understanding.compat import LegacyIntentAdapter
 
 
 class OfflineDecisionProvider:
-    """复用旧 Router/Planner 提示，但只产生 AgentDecision。"""
+    """基于 AgentState/RequestFrame 只产生确定性的 AgentDecision。"""
 
     def __init__(
         self,
         *,
-        legacy_intent_adapter: LegacyIntentAdapter,
-        intent_resolver: IntentResolver,
         router: AgentRouter,
         decomposer: TaskDecomposer,
         knowledge: KnowledgeRetriever,
@@ -40,8 +36,6 @@ class OfflineDecisionProvider:
         interpret_result: Callable[[AgentRequest, Any], AgentResult],
         conversation_reply: Callable[[str], str],
     ) -> None:
-        self.legacy_intent_adapter = legacy_intent_adapter
-        self.intent_resolver = intent_resolver
         self.router = router
         self.decomposer = decomposer
         self.knowledge = knowledge
@@ -58,11 +52,9 @@ class OfflineDecisionProvider:
         *,
         request: AgentRequest,
         task: Task | None,
-        intent: IntentResult | None,
         request_frame: RequestFrame | None,
     ) -> AgentDecision:
-        if intent is None:
-            intent = self.legacy_intent_adapter.to_intent(request_frame, request, session.datasets)
+        frame = request_frame or RequestFrame(mode=InteractionMode.NEW_TASK, goal=request.user_input)
 
         current_plan = session.current_plan
         if current_plan is not None:
@@ -75,7 +67,7 @@ class OfflineDecisionProvider:
                 )
             if current_plan.metadata.get("delegated_roles") and not session.subagent_results:
                 return self.router.route(
-                    intent,
+                    frame,
                     current_plan,
                     session.datasets,
                     subtasks=self.decomposer.decompose(request, session.datasets),
@@ -95,7 +87,7 @@ class OfflineDecisionProvider:
                 )
                 return self.result_to_decision(result, "offline")
             if self.next_executable_step(current_plan, session.completed_steps) is None:
-                operation = str(current_plan.metadata.get("operation") or intent.entities.get("operation") or "")
+                operation = str(current_plan.metadata.get("operation") or _operation_from_goal(frame.goal) or "")
                 result = AgentResult(
                     agent_id="main",
                     task_id=task.id if task else state.task_id,
@@ -108,18 +100,23 @@ class OfflineDecisionProvider:
                 )
                 return self.result_to_decision(result, "offline")
 
-        if intent.intent.value == "RUN_DIAGNOSIS":
+        if frame.mode is InteractionMode.QUERY and (
+            "run_diagnosis" in frame.capabilities
+            or any(term in frame.goal.casefold() for term in ("运行状态", "运行记录", "失败", "错误", "trace", "日志"))
+        ):
             return self.result_to_decision(self.diagnose_runs(request, session.run), "offline")
-        if intent.intent.value == "RESULT_INTERPRETATION":
+        if frame.mode is InteractionMode.QUERY and "knowledge_lookup" not in frame.capabilities:
             return self.result_to_decision(self.interpret_result(request, session.run), "offline")
-        if intent.intent.value == "UNKNOWN":
+        if frame.mode in {InteractionMode.CHAT, InteractionMode.CANCEL_TASK} or (
+            not frame.needs_planning and not frame.needs_tool and "knowledge_lookup" not in frame.capabilities
+        ):
             return AgentDecision(
                 type=DecisionType.FINAL,
                 reasoning_summary="当前回合不需要 GIS 执行。",
                 final_response=self.conversation_reply(request.user_input),
                 source="offline",
             )
-        findings = self.knowledge.retrieve(request.user_input) if intent.intent.value == "KNOWLEDGE_QUERY" else []
+        findings = self.knowledge.retrieve(request.user_input) if "knowledge_lookup" in frame.capabilities else []
         result = AgentResult(
             agent_id="main",
             task_id=task.id if task else state.task_id,
@@ -140,3 +137,18 @@ def _plan_result_summary(operation: str, plan, findings: list[Any], dataset_ids:
 
 
 __all__ = ["OfflineDecisionProvider"]
+
+
+def _operation_from_goal(goal: str) -> str | None:
+    terms = (
+        ("buffer", ("缓冲", "buffer")),
+        ("clip", ("裁剪", "clip")),
+        ("intersection", ("相交", "交集", "intersection")),
+        ("spatial_join", ("空间连接", "spatial join")),
+        ("zonal_statistics", ("分区统计", "zonal")),
+        ("slope", ("坡度", "slope")),
+        ("reproject", ("重投影", "坐标转换", "reproject")),
+        ("distance", ("距离分析", "测距", "distance")),
+    )
+    lowered = goal.casefold()
+    return next((name for name, names in terms if any(term.casefold() in lowered for term in names)), None)
