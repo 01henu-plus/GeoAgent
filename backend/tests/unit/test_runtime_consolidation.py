@@ -87,7 +87,7 @@ def test_checkpoint_codec_round_trips_canonical_state_and_reads_legacy_aliases()
     assert legacy.protocol_messages[0]["role"] == "assistant"
     assert legacy.findings == ["旧观察"]
     assert legacy.dataset_ids == ["legacy-dataset"]
-    assert legacy.legacy_delegation_result["summary"] == "旧委派"
+    assert not hasattr(legacy, "legacy_delegation_result")
 
 
 def test_model_decision_provider_returns_only_agent_decision():

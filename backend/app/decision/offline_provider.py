@@ -16,7 +16,6 @@ from app.core.models import (
     Task,
 )
 from app.decision.decomposer import TaskDecomposer
-from app.decision.router import AgentRouter
 from app.knowledge import KnowledgeRetriever
 from app.runtime.session import AgentRuntimeSession
 
@@ -27,7 +26,6 @@ class OfflineDecisionProvider:
     def __init__(
         self,
         *,
-        router: AgentRouter,
         decomposer: TaskDecomposer,
         knowledge: KnowledgeRetriever,
         next_executable_step: Callable[[Any, set[str]], Any],
@@ -36,7 +34,6 @@ class OfflineDecisionProvider:
         interpret_result: Callable[[AgentRequest, Any], AgentResult],
         conversation_reply: Callable[[str], str],
     ) -> None:
-        self.router = router
         self.decomposer = decomposer
         self.knowledge = knowledge
         self.next_executable_step = next_executable_step
@@ -58,21 +55,9 @@ class OfflineDecisionProvider:
 
         current_plan = session.current_plan
         if current_plan is not None:
-            if current_plan.clarification:
-                return AgentDecision(
-                    type=DecisionType.ASK_USER,
-                    reasoning_summary=current_plan.clarification,
-                    final_response=current_plan.clarification,
-                    source="offline",
-                )
-            if current_plan.metadata.get("delegated_roles") and not session.subagent_results:
-                return self.router.route(
-                    frame,
-                    current_plan,
-                    session.datasets,
-                    subtasks=self.decomposer.decompose(request, session.datasets),
-                ).model_copy(update={"source": "offline"})
-            if current_plan.metadata.get("delegated_roles") and session.subagent_results:
+            if _should_delegate(frame, session.datasets) and not session.subagent_results:
+                return _delegation_decision(request, session.datasets, self.decomposer)
+            if _should_delegate(frame, session.datasets) and session.subagent_results:
                 completed = sum(item.get("status") == AgentResultStatus.SUCCESS.value for item in session.subagent_results if isinstance(item, dict))
                 total = len(session.subagent_results)
                 result = AgentResult(
@@ -86,6 +71,13 @@ class OfflineDecisionProvider:
                     trace_id=state.run_id,
                 )
                 return self.result_to_decision(result, "offline")
+            if current_plan.clarification:
+                return AgentDecision(
+                    type=DecisionType.ASK_USER,
+                    reasoning_summary=current_plan.clarification,
+                    final_response=current_plan.clarification,
+                    source="offline",
+                )
             if self.next_executable_step(current_plan, session.completed_steps) is None:
                 operation = str(current_plan.metadata.get("operation") or _operation_from_goal(frame.goal) or "")
                 result = AgentResult(
@@ -134,6 +126,24 @@ def _plan_result_summary(operation: str, plan, findings: list[Any], dataset_ids:
     operation_label = labels.get(operation, "空间分析")
     resource_count = len(dataset_ids) + len(artifact_ids)
     return f"已完成{operation_label}，生成或确认 {resource_count} 个结果资源。" if resource_count else f"已完成{operation_label}。"
+
+
+def _delegation_decision(request: AgentRequest, datasets, decomposer: TaskDecomposer) -> AgentDecision:
+    return AgentDecision(
+        type=DecisionType.DELEGATE,
+        reasoning_summary="任务包含多个相互独立的 GIS 主题，交给临时智能体并行处理。",
+        subtasks=decomposer.decompose(request, datasets),
+        source="offline",
+    )
+
+
+def _should_delegate(request_frame: RequestFrame, datasets) -> bool:
+    text = request_frame.goal.casefold()
+    roles = sum(
+        any(term in text for term in terms)
+        for terms in (("道路", "路网", "road"), ("人口", "population"), ("dem", "高程", "地形", "terrain"))
+    )
+    return roles >= 2 and len(datasets) >= 2 and bool(set(request_frame.capabilities) & {"raster_analysis", "vector_analysis"})
 
 
 __all__ = ["OfflineDecisionProvider"]

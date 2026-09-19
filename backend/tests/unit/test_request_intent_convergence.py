@@ -2,14 +2,12 @@ from app.core.models import (
     AgentRequest,
     Dataset,
     DatasetKind,
-    DecisionType,
     Plan,
     PlanStep,
     RequestFrame,
     Run,
 )
 from app.decision.planner import Planner
-from app.decision.router import AgentRouter
 from app.runtime.checkpoint_codec import RuntimeCheckpointCodec
 from app.runtime.context_manager import ContextManager
 from app.runtime.session import AgentRuntimeSession
@@ -32,7 +30,7 @@ def test_planner_consumes_request_frame_without_legacy_intent():
     assert plan.steps[1].arguments["distance"] == 500
 
 
-def test_router_consumes_request_frame_directly():
+def test_plan_exposes_real_tool_step_to_runtime():
     frame = RequestFrame(mode="new_task", goal="检查数据", capabilities=["dataset_inspection"], needs_planning=True, needs_tool=True)
     plan = Plan(
         goal=frame.goal,
@@ -40,11 +38,8 @@ def test_router_consumes_request_frame_directly():
         steps=[PlanStep(id="inspect", title="检查数据", action="dataset.inspect", tool_name="dataset.inspect")],
     )
 
-    decision = AgentRouter().route(frame, plan, [])
-
-    assert decision.type is DecisionType.TOOL
-    assert decision.tool_call is not None
-    assert decision.tool_call.name == "dataset.inspect"
+    assert plan.steps
+    assert all(step.tool_name for step in plan.steps)
 
 
 def test_new_checkpoint_does_not_write_intent_result():

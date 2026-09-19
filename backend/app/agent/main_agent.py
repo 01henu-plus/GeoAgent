@@ -34,10 +34,8 @@ from app.core.models import (
 )
 from app.decision import (
     CONTROL_CAPABILITY_DEFINITIONS,
-    AgentRouter,
     DecisionEngine,
     FailureAnalyzer,
-    IntentResolver,
     Planner,
     Replanner,
     ResultVerifier,
@@ -56,7 +54,6 @@ from app.profile import ProfilePreferenceExtractor, UserProfileService
 from app.run.lifecycle import PreparedRequest, RequestLifecycleBinder
 from app.runtime.action_dispatcher import RuntimeActionDispatcher
 from app.runtime.action_handlers import RuntimeActionHandlers
-from app.runtime.agent_loop import AgentLoop
 from app.runtime.agent_runtime import AgentRuntime
 from app.runtime.agent_state import AgentStateBuilder
 from app.runtime.budget import BudgetExceeded, BudgetGuard
@@ -65,6 +62,7 @@ from app.runtime.context_manager import ContextManager
 from app.runtime.controller import AgentRuntimeController
 from app.runtime.lifecycle import finish_run
 from app.runtime.model_input_budget import ModelInputBudget
+from app.runtime.plan_execution import next_executable_step
 from app.runtime.protocol_history import compact_protocol_messages
 from app.runtime.tool_execution_cycle import ToolExecutionCycle
 from app.state import StateStore, WorkingMemoryUpdater
@@ -100,14 +98,9 @@ class MainAgent:
         self.settings = settings
         self.budget = budget or RunBudget()
         self.guard = BudgetGuard(self.budget)
-        self.intent_resolver = IntentResolver()
-        self.request_understanding = RequestUnderstandingPipeline(
-            store,
-            interpreter=RequestInterpreter(self.intent_resolver),
-        )
+        self.request_understanding = RequestUnderstandingPipeline(store, interpreter=RequestInterpreter())
         self.planner = Planner()
         self.replanner = Replanner(self.planner)
-        self.router = AgentRouter()
         self.decomposer = TaskDecomposer()
         self.failure_analyzer = FailureAnalyzer()
         self.verifier = ResultVerifier()
@@ -134,7 +127,6 @@ class MainAgent:
         self.default_model_profile = default_model_profile
         self.context_manager = context_manager or ContextManager()
         self.services_factory = services_factory
-        self.loop = AgentLoop()
         self.state_builder = AgentStateBuilder(store)
         self.decision_engine = DecisionEngine()
         self.agent_runtime = AgentRuntime(max_runtime_transitions=self.budget.max_runtime_transitions)
@@ -150,7 +142,6 @@ class MainAgent:
             decomposer=self.decomposer,
             agent_manager=lambda: self.agent_manager,
             task_service=self.task_service,
-            plan_loop=self.loop,
             tool_execution_cycle=lambda: self.tool_execution_cycle,
             working_memory_updater=self.working_memory_updater,
             registry=self.registry,
@@ -166,10 +157,9 @@ class MainAgent:
             max_tokens=self.budget.max_tokens,
         )
         self.offline_decision_provider = OfflineDecisionProvider(
-            router=self.router,
             decomposer=self.decomposer,
             knowledge=self.knowledge,
-            next_executable_step=self.loop.next_executable_step,
+            next_executable_step=next_executable_step,
             result_to_decision=lambda result, source: _decision_from_agent_result(result, source=source),
             diagnose_runs=self._diagnose_runs,
             interpret_result=self._interpret_result,
@@ -193,7 +183,6 @@ class MainAgent:
             model_provider=self.model_decision_provider,
             offline_provider=self.offline_decision_provider,
             dispatcher=self.runtime_action_dispatcher,
-            plan_loop=self.loop,
             model_adapter_for=self._model_adapter_for,
             trace_decision=self._trace_runtime_decision,
             checkpoint=self._checkpoint,
@@ -378,7 +367,7 @@ class MainAgent:
             self.store.save_run(run)
             previous_checkpoint = self.checkpoint_store.latest(run.id) if self.checkpoint_store else None
             state = dict(previous_checkpoint.state) if previous_checkpoint else {}
-            # 历史 checkpoint 可能带有旧 IntentResult；新 checkpoint 不再延续该字段。
+            # 历史 checkpoint 可能带有旧意图字段；新 checkpoint 不再延续该字段。
             state.pop("intent", None)
             state.update(
                 {

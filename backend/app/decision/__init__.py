@@ -1,4 +1,4 @@
-"""意图、计划、拆解、路由、恢复和验证决策。"""
+"""计划、拆解、恢复和验证决策。"""
 
 from .decision_engine import (
     CONTROL_CAPABILITY_DEFINITIONS,
@@ -7,11 +7,9 @@ from .decision_engine import (
 )
 from .decomposer import TaskDecomposer
 from .failure_analyzer import FailureAnalyzer
-from .intent import IntentResolver
 from .parallelism import ParallelismAnalyzer
 from .planner import Planner
 from .replanner import Replanner, ReplanNotPossible, plan_fingerprint, remaining_plan_fingerprint
-from .router import AgentRouter
 from .verifier import ResultVerifier
 
-__all__ = ["AgentRouter", "CONTROL_CAPABILITY_DEFINITIONS", "CONTROL_CAPABILITY_NAMES", "DecisionEngine", "FailureAnalyzer", "IntentResolver", "ParallelismAnalyzer", "Planner", "ReplanNotPossible", "Replanner", "ResultVerifier", "TaskDecomposer", "plan_fingerprint", "remaining_plan_fingerprint"]
+__all__ = ["CONTROL_CAPABILITY_DEFINITIONS", "CONTROL_CAPABILITY_NAMES", "DecisionEngine", "FailureAnalyzer", "ParallelismAnalyzer", "Planner", "ReplanNotPossible", "Replanner", "ResultVerifier", "TaskDecomposer", "plan_fingerprint", "remaining_plan_fingerprint"]

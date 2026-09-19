@@ -46,10 +46,10 @@ from app.decision import (
 )
 from app.events import EventType
 from app.gis.crs.service import CRSService
-from app.runtime.agent_loop import PlanLoopOutcome, resolve_plan_arguments
 from app.runtime.agent_runtime import RuntimeTransition
 from app.runtime.budget import BudgetExceeded, BudgetGuard
 from app.runtime.checkpoint_codec import RuntimeCheckpointCodec
+from app.runtime.plan_execution import resolve_plan_arguments
 from app.runtime.session import AgentRuntimeSession
 from app.runtime.tool_execution_cycle import ExecutionOutcome, ToolExecutionCycle
 from app.state import StateStore, WorkingMemoryUpdater
@@ -94,7 +94,6 @@ class RuntimeActionHandlers:
         decomposer: TaskDecomposer,
         agent_manager: AgentManager | Callable[[], AgentManager],
         task_service: TaskService,
-        plan_loop,
         tool_execution_cycle: ToolExecutionCycle | Callable[[], ToolExecutionCycle],
         working_memory_updater: WorkingMemoryUpdater,
         registry,
@@ -112,7 +111,6 @@ class RuntimeActionHandlers:
         self.decomposer = decomposer
         self.agent_manager = agent_manager
         self.task_service = task_service
-        self.plan_loop = plan_loop
         self.tool_execution_cycle = tool_execution_cycle
         self.working_memory_updater = working_memory_updater
         self.registry = registry
@@ -260,11 +258,6 @@ class RuntimeActionHandlers:
     ) -> RuntimeTransition:
         """执行 Plan fast path 的一个步骤。"""
 
-        if step.tool_name is None:
-            session.completed_steps.add(step.id)
-            step.status = TaskStatus.SUCCEEDED
-            return RuntimeTransition(completed_steps=(step.id,), current_plan=session.current_plan)
-
         arguments = self._complete_plan_arguments(
             step.tool_name,
             resolve_plan_arguments(step.arguments, session.step_outputs),
@@ -375,17 +368,6 @@ class RuntimeActionHandlers:
             directive=LoopDirective.REPLAN,
             rationale=error_message,
         )
-        outcome = PlanLoopOutcome(
-            completed_steps=frozenset(session.completed_steps),
-            findings=tuple(session.findings),
-            output_ids=tuple(sorted(session.dataset_ids)),
-            artifacts=tuple(sorted(session.artifact_ids)),
-            errors=(error_message,),
-            step_outputs=dict(session.step_outputs),
-            failed_step=failed_step,
-            failed_outcome=failed_outcome,
-            directive=LoopDirective.REPLAN,
-        )
         frame = request_frame or RequestFrame(mode="new_task", goal=request.user_input)
         original_plan = session.original_plan or current_plan.model_copy(deep=True)
         current_run = self.store.get_run(run.id) or run
@@ -398,8 +380,9 @@ class RuntimeActionHandlers:
                 frame,
                 original_plan,
                 current_plan,
-                outcome,
-                {"previous_replan_reasons": list(session.previous_replan_reasons)},
+                session,
+                failed_step=failed_step,
+                failed_outcome=failed_outcome,
             )
         except ReplanNotPossible as exc:
             running = self.store.get_run(run.id) or run
@@ -508,37 +491,6 @@ class RuntimeActionHandlers:
             subagent_results=tuple(session.subagent_results),
         )
 
-    async def execute_delegation(
-        self,
-        request: AgentRequest,
-        run: Run,
-        task: Task,
-        datasets,
-        tasks=None,
-        *,
-        plan: Plan | None,
-        request_frame: RequestFrame | None,
-        working_memory: WorkingMemory | None,
-        fingerprint: str,
-        completed_fingerprints: set[str] | None = None,
-        legacy_plan_progress: bool = False,
-    ) -> DelegationExecution:
-        """兼容旧委派调用方的薄包装，实际逻辑仍在 runtime 内。"""
-
-        return await self._execute_delegation(
-            request,
-            run,
-            task,
-            datasets,
-            tasks,
-            plan=plan,
-            request_frame=request_frame,
-            working_memory=working_memory,
-            fingerprint=fingerprint,
-            completed_fingerprints=completed_fingerprints,
-            legacy_plan_progress=legacy_plan_progress,
-        )
-
     async def _execute_delegation(
         self,
         request: AgentRequest,
@@ -551,8 +503,6 @@ class RuntimeActionHandlers:
         request_frame: RequestFrame | None,
         working_memory: WorkingMemory | None,
         fingerprint: str,
-        completed_fingerprints: set[str] | None = None,
-        legacy_plan_progress: bool = False,
     ) -> DelegationExecution:
         tasks = list(tasks or self.decomposer.decompose(request, datasets))
         self.guard.check_subagents(len(tasks))
@@ -567,9 +517,6 @@ class RuntimeActionHandlers:
                 payload=subtask.model_dump(mode="json"),
                 agent_id="main",
             )
-        if legacy_plan_progress and plan is not None:
-            _set_plan_step_status(plan, "decompose", TaskStatus.SUCCEEDED)
-            _set_plan_step_status(plan, "parallel", TaskStatus.RUNNING)
         await self._checkpoint_writer()(
             run.id,
             "delegation_started",
@@ -577,8 +524,8 @@ class RuntimeActionHandlers:
                 **_checkpoint_state(request, plan, datasets, request_frame),
                 "subtask_ids": [item.id for item in tasks],
                 "delegation_fingerprint": fingerprint,
-                "completed_delegation_fingerprints": sorted(completed_fingerprints or set()),
-                "runtime_delegation": not legacy_plan_progress,
+                "completed_delegation_fingerprints": [],
+                "runtime_delegation": True,
             },
         )
         self.store.save_run(run.model_copy(update={"status": RunStatus.WAITING_SUBAGENT}))
@@ -644,7 +591,7 @@ class RuntimeActionHandlers:
                 "artifact_ids": list(artifact_ids),
                 "directive": directive.value,
                 "working_memory_refs": _working_memory_refs(parent_memory),
-                "runtime_delegation": not legacy_plan_progress,
+                "runtime_delegation": True,
             },
         )
         return DelegationExecution(
@@ -668,30 +615,38 @@ class RuntimeActionHandlers:
         request_frame: RequestFrame | None,
         original_plan: Plan,
         current_plan: Plan,
-        outcome: PlanLoopOutcome,
-        state: dict[str, Any],
+        session: AgentRuntimeSession,
+        *,
+        failed_step,
+        failed_outcome: ExecutionOutcome,
     ) -> tuple[Plan, dict[str, Any]]:
         current_run = self.store.get_run(run.id) or run
         self.guard.check_replan(current_run)
         next_count = current_run.replan_count + 1
-        failed = outcome.failed_outcome
-        failed_step = outcome.failed_step
-        reasons = list(state.get("previous_replan_reasons", []))
+        failed = failed_outcome
+        error_message = (
+            failed.result.error.message
+            if failed.result.error
+            else "；".join(failed.verification_problems)
+            or failed.rationale
+            or "当前执行失败，需要重新规划。"
+        )
+        reasons = list(session.previous_replan_reasons)
         reasons.append(_replan_reason(failed_step, failed))
         current_memory = self.store.get_working_memory(run.task_id) if run.task_id else None
         current_dataset_ids = list(
-            dict.fromkeys([*(current_memory.active_dataset_ids if current_memory else []), *outcome.output_ids])
+            dict.fromkeys([*(current_memory.active_dataset_ids if current_memory else []), *session.dataset_ids])
         )
         current_artifact_ids = list(
-            dict.fromkeys([*(current_memory.active_artifact_ids if current_memory else []), *outcome.artifacts])
+            dict.fromkeys([*(current_memory.active_artifact_ids if current_memory else []), *session.artifact_ids])
         )
         context = ReplanContext(
             goal=current_plan.goal,
             original_plan=original_plan,
             current_plan=current_plan,
             current_revision=current_plan.revision,
-            completed_steps=sorted(outcome.completed_steps),
-            step_outputs=_compact_replan_step_outputs(outcome.step_outputs),
+            completed_steps=sorted(session.completed_steps),
+            step_outputs=_compact_replan_step_outputs(session.step_outputs),
             failed_step=failed_step,
             failed_tool_name=failed_step.tool_name if failed_step else None,
             failed_arguments=dict(failed_step.arguments) if failed_step else {},
@@ -699,7 +654,7 @@ class RuntimeActionHandlers:
             error_message=failed.result.error.message if failed and failed.result.error else None,
             verification_problems=list(failed.verification_problems) if failed else [],
             recovery_action=failed.recovery_action if failed else None,
-            directive=outcome.directive,
+            directive=LoopDirective.REPLAN,
             attempts=failed.attempts if failed else 1,
             current_dataset_ids=current_dataset_ids,
             current_artifact_ids=current_artifact_ids,
@@ -718,12 +673,12 @@ class RuntimeActionHandlers:
                 "original_plan": original_plan.model_dump(mode="json"),
                 "replan_context": context.model_dump(mode="json"),
                 "replan_count": next_count,
-                **_plan_state_from_outcome(outcome, reasons),
+                **_plan_state_from_session(session, reasons, error_message),
             },
         )
         revised = self._replanner().replan(context, request_frame or RequestFrame(mode="new_task", goal=context.goal), datasets)
         self.store.save_run(replanning_run.model_copy(update={"status": RunStatus.RUNNING}))
-        next_state = _plan_state_from_outcome(outcome, reasons)
+        next_state = _plan_state_from_session(session, reasons, error_message)
         next_state["errors"] = []
         await self._checkpoint_writer()(
             run.id,
@@ -817,12 +772,6 @@ def _checkpoint_state(request, plan, datasets, request_frame):
     }
 
 
-def _set_plan_step_status(plan: Plan, step_id: str, status: TaskStatus) -> None:
-    step = next((item for item in plan.steps if item.id == step_id), None)
-    if step is not None:
-        step.status = status
-
-
 def _execution_observation(outcome: ExecutionOutcome) -> dict[str, Any]:
     observation = outcome.result.model_dump(mode="json")
     observation.update(
@@ -877,14 +826,14 @@ def _failure_from_outcome(outcome: ExecutionOutcome, tool_name: str, *, determin
     }
 
 
-def _plan_state_from_outcome(outcome: PlanLoopOutcome, reasons: list[str]) -> dict[str, Any]:
+def _plan_state_from_session(session: AgentRuntimeSession, reasons: list[str], error_message: str) -> dict[str, Any]:
     return {
-        "completed_steps": sorted(outcome.completed_steps),
-        "findings": list(outcome.findings),
-        "output_ids": list(outcome.output_ids),
-        "artifacts": list(outcome.artifacts),
-        "errors": list(outcome.errors),
-        "step_outputs": dict(outcome.step_outputs),
+        "completed_steps": sorted(session.completed_steps),
+        "findings": list(session.findings),
+        "output_ids": sorted(session.dataset_ids),
+        "artifacts": sorted(session.artifact_ids),
+        "errors": [error_message],
+        "step_outputs": dict(session.step_outputs),
         "previous_replan_reasons": reasons,
     }
 

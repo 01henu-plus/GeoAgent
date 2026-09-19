@@ -12,7 +12,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def new_id(prefix: str) -> str:
@@ -678,13 +678,6 @@ class RunBudget(StrictModel):
     max_execution_seconds: int = Field(default=300, ge=1)
 
 
-class IntentResult(StrictModel):
-    intent: IntentType
-    confidence: float = Field(ge=0, le=1)
-    entities: dict[str, Any] = Field(default_factory=dict)
-    rationale: str = ""
-
-
 class PlanStep(StrictModel):
     id: str = Field(default_factory=lambda: new_id("step"))
     title: str
@@ -705,6 +698,13 @@ class Plan(StrictModel):
     revision: int = 1
     clarification: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def executable_steps_have_tools(self) -> Plan:
+        invalid = [step.id for step in self.steps if not step.tool_name]
+        if invalid:
+            raise ValueError(f"计划包含不可执行步骤：{', '.join(invalid)}")
+        return self
 
 
 class ReplanContext(StrictModel):

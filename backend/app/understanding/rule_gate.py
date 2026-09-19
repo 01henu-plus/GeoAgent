@@ -87,16 +87,15 @@ def _is_result_query(text: str) -> bool:
     return any(term in text for term in ("生成了哪些文件", "有哪些文件", "结果在哪里", "运行状态", "查看结果", "刚才生成了什么"))
 
 
-def infer_capabilities(text: str, *, legacy=None, references: list[ResolvedReference] | None = None) -> list[str]:
+def infer_capabilities(text: str, *, operations: list[str] | None = None, references: list[ResolvedReference] | None = None) -> list[str]:
     lowered = text.casefold()
     capabilities = [name for name, terms in _CAPABILITY_TERMS if any(term.casefold() in lowered for term in terms)]
-    entities = getattr(legacy, "entities", {}) if legacy is not None else {}
-    operations = set(entities.get("operations", []))
-    if operations.intersection({"slope", "zonal_statistics", "clip"}) and "raster_analysis" not in capabilities:
+    operation_set = set(operations or [])
+    if operation_set.intersection({"slope", "zonal_statistics", "clip"}) and "raster_analysis" not in capabilities:
         capabilities.append("raster_analysis")
-    if operations.intersection({"buffer", "intersection", "spatial_join", "distance", "dissolve", "repair"}) and "vector_analysis" not in capabilities:
+    if operation_set.intersection({"buffer", "intersection", "spatial_join", "distance", "dissolve", "repair"}) and "vector_analysis" not in capabilities:
         capabilities.append("vector_analysis")
-    if "reproject" in operations and "crs_transform" not in capabilities:
+    if "reproject" in operation_set and "crs_transform" not in capabilities:
         capabilities.append("crs_transform")
     if references and "artifact_read" not in capabilities:
         capabilities.append("artifact_read")

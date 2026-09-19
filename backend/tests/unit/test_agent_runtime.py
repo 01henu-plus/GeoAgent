@@ -155,7 +155,7 @@ def test_agent_runtime_dispatches_final_ask_user_and_abort():
 
 
 def test_agent_runtime_plan_fast_path_executes_one_transition_before_decision():
-    plan = Plan(goal="执行计划", intent="DATA_INSPECTION", steps=[PlanStep(id="step-1", title="检查", action="inspect")])
+    plan = Plan(goal="执行计划", intent="DATA_INSPECTION", steps=[PlanStep(id="step-1", title="检查", action="inspect", tool_name="dataset.inspect")])
     state = _state().model_copy(update={"current_plan": plan})
     calls: list[str] = []
 

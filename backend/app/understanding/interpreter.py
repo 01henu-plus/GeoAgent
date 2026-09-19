@@ -6,9 +6,9 @@ import json
 import logging
 import re
 
-from app.core.models import AgentRequest, Dataset, InteractionMode, RequestFrame, StateSnapshot
-from app.decision.intent import IntentResolver
+from app.core.models import Dataset, InteractionMode, RequestFrame, StateSnapshot
 from app.models import ModelAdapter, ModelRequest
+from app.understanding.deterministic import extract_request_hints
 from app.understanding.models import ReferenceResolution
 from app.understanding.patterns import (
     is_cancel_request,
@@ -33,9 +33,6 @@ target_task_id 和 target_run_id 只能从状态中选择，不能编造；
 
 class RequestInterpreter:
     """优先使用模型结构化输出，失败或离线时使用有限确定性兼容解析。"""
-
-    def __init__(self, legacy_resolver: IntentResolver | None = None) -> None:
-        self.legacy_resolver = legacy_resolver or IntentResolver()
 
     async def interpret(
         self,
@@ -101,16 +98,15 @@ class RequestInterpreter:
         resolution: ReferenceResolution,
         datasets: list[Dataset],
     ) -> RequestFrame:
-        request = AgentRequest(user_input=message, conversation_id=state.conversation_id)
-        legacy = self.legacy_resolver.resolve(request, datasets)
+        hints = extract_request_hints(message, datasets)
         lowered = message.casefold()
         mode = InteractionMode.NEW_TASK
-        confidence = max(0.35, legacy.confidence)
+        confidence = 0.9 if hints.operations else 0.55
         target_task_id = None
         target_run_id = None
         goal = message
 
-        if legacy.entities.get("is_greeting"):
+        if hints.is_greeting:
             mode = InteractionMode.CHAT
             target_task_id = None
             target_run_id = None
@@ -135,13 +131,13 @@ class RequestInterpreter:
             target_task_id = state.active_task_id
             target_run_id = state.active_run_id
             confidence = 0.78
-        elif legacy.intent.value in {"KNOWLEDGE_QUERY", "RESULT_INTERPRETATION", "RUN_DIAGNOSIS"} or legacy.entities.get("is_question"):
+        elif not hints.operations and (hints.is_knowledge_query or hints.is_diagnosis or hints.result_reference_requested or hints.is_question):
             mode = InteractionMode.QUERY
             target_task_id = state.active_task_id
             target_run_id = state.active_run_id
             confidence = max(confidence, 0.7)
 
-        capabilities = infer_capabilities(message, legacy=legacy, references=resolution.references)
+        capabilities = infer_capabilities(message, operations=hints.operations, references=resolution.references)
         if mode is InteractionMode.CHAT:
             capabilities = ["conversation"]
         if mode is InteractionMode.QUERY and not capabilities:

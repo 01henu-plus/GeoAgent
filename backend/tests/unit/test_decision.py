@@ -1,5 +1,8 @@
-from app.core.models import AgentRequest, Dataset, DatasetKind, RequestFrame
-from app.decision import IntentResolver, ParallelismAnalyzer, Planner, TaskDecomposer
+import pytest
+
+from app.core.models import AgentRequest, Dataset, DatasetKind, Plan, PlanStep, RequestFrame
+from app.decision import ParallelismAnalyzer, Planner, TaskDecomposer
+from app.understanding.deterministic import extract_request_hints
 
 
 def test_intent_extracts_meter_distance_and_topics():
@@ -9,19 +12,18 @@ def test_intent_extracts_meter_distance_and_topics():
         Dataset(name="population", kind=DatasetKind.VECTOR, path="population.geojson", format="geojson"),
         Dataset(name="dem", kind=DatasetKind.RASTER, path="dem.tif", format="tif"),
     ]
-    result = IntentResolver().resolve(request, datasets)
-    assert result.entities["distance"] == 500
-    assert result.entities["terrain_requested"] is True
-    assert result.intent.value == "SPATIAL_ANALYSIS"
+    hints = extract_request_hints(request.user_input, datasets)
+    assert hints.distance == 500
+    assert hints.terrain_requested is True
+    assert hints.operations == []
 
 
 def test_distance_analysis_is_not_classified_as_buffer():
     request = AgentRequest(user_input="计算 roads 和 population 的 500 米距离分布")
 
-    result = IntentResolver().resolve(request)
+    hints = extract_request_hints(request.user_input)
 
-    assert result.entities["distance_analysis_requested"] is True
-    assert result.entities["buffer_requested"] is False
+    assert hints.operations == ["distance"]
 
 
 def test_parallelism_groups_dependency_levels():
@@ -50,12 +52,12 @@ def test_decomposer_creates_thematic_tasks():
 def test_planner_composes_reprojection_before_buffer():
     request = AgentRequest(user_input="先将 roads 重投影到 EPSG:3857，再生成 500 米缓冲区")
     roads = Dataset(name="roads", kind=DatasetKind.VECTOR, path="roads.geojson", format="geojson")
-    intent = IntentResolver().resolve(request, [roads])
+    hints = extract_request_hints(request.user_input, [roads])
 
     frame = RequestFrame(mode="new_task", goal=request.user_input, capabilities=["vector_analysis", "crs_transform"], needs_planning=True, needs_tool=True)
     plan = Planner().build(frame, [roads])
 
-    assert intent.entities["operations"] == ["reproject", "buffer"]
+    assert hints.operations == ["reproject", "buffer"]
     assert [step.tool_name for step in plan.steps] == [
         "dataset.inspect",
         "crs.reproject",
@@ -75,3 +77,40 @@ def test_planner_asks_for_missing_required_parameter():
 
     assert plan.clarification is not None
     assert not any(step.tool_name for step in plan.steps)
+
+
+def test_delegation_is_a_decision_not_fake_plan_steps():
+    datasets = [
+        Dataset(name="roads", kind=DatasetKind.VECTOR, path="roads.geojson", format="geojson"),
+        Dataset(name="population", kind=DatasetKind.VECTOR, path="population.geojson", format="geojson"),
+        Dataset(name="dem", kind=DatasetKind.RASTER, path="dem.tif", format="tif"),
+    ]
+    frame = RequestFrame(
+        mode="new_task",
+        goal="综合道路、人口和 DEM 分析当前区域",
+        capabilities=["vector_analysis", "raster_analysis"],
+        needs_planning=True,
+        needs_tool=True,
+    )
+
+    plan = Planner().build(frame, datasets)
+
+    assert plan.steps == []
+    assert plan.clarification is None
+
+
+def test_unknown_request_does_not_create_context_prepare_step():
+    frame = RequestFrame(mode="new_task", goal="帮我看看这个问题", capabilities=[], needs_planning=True)
+
+    plan = Planner().build(frame, [])
+
+    assert plan.steps == []
+
+
+def test_plan_rejects_non_executable_step():
+    with pytest.raises(ValueError, match="不可执行步骤"):
+        Plan(
+            goal="非法计划",
+            intent="UNKNOWN",
+            steps=[PlanStep(id="invalid", title="控制步骤", action="delegate")],
+        )

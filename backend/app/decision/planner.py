@@ -41,16 +41,6 @@ class Planner:
         if plan_intent in {IntentType.UNKNOWN, IntentType.KNOWLEDGE_QUERY, IntentType.RESULT_INTERPRETATION, IntentType.RUN_DIAGNOSIS}:
             return Plan(goal=goal, intent=plan_intent, metadata=metadata)
 
-        if self._should_delegate(request_frame, entities, selected):
-            roles = [role for role in ("road", "population", "terrain") if entities.get(f"{role}_requested")]
-            steps = [
-                PlanStep(id="decompose", title="拆分主题任务", action="decompose", description=f"按 {'、'.join(roles)} 分配独立空间分析", tool_name=None),
-                PlanStep(id="parallel", title="并行执行主题分析", action="delegate", depends_on=["decompose"], description="为每个独立主题创建一个临时智能体", tool_name=None),
-                PlanStep(id="synthesize", title="验证并汇总主题结果", action="synthesize", depends_on=["parallel"], description="检查子任务结果并形成统一结论", tool_name=None),
-            ]
-            metadata["delegated_roles"] = roles
-            return Plan(goal=goal, intent=plan_intent, steps=steps, metadata=metadata)
-
         if not selected and entities.get("requires_dataset"):
             return Plan(goal=goal, intent=plan_intent, clarification=_missing_dataset_message(operation), metadata=metadata)
 
@@ -88,7 +78,6 @@ class Planner:
         return Plan(
             goal=goal,
             intent=plan_intent,
-            steps=[PlanStep(id="understand", title="整理任务上下文", action="context.prepare", description="等待模型或后续决策器补充具体操作")],
             metadata=metadata,
         )
 
@@ -204,11 +193,6 @@ class Planner:
             metadata.update({"operation": "buffer", "output_policy": "derived_dataset", "distance": float(distance)})
             return Plan(goal=goal, intent=plan_intent, steps=steps, metadata=metadata)
         return None
-
-    @staticmethod
-    def _should_delegate(request_frame: RequestFrame, entities: dict[str, object], datasets: list[Dataset]) -> bool:
-        roles = sum(bool(entities.get(key)) for key in ("road_requested", "population_requested", "terrain_requested"))
-        return _plan_intent(request_frame, entities) is IntentType.SPATIAL_ANALYSIS and roles >= 2 and len(datasets) >= 2
 
     def _buffer_plan(self, goal: str, request_frame: RequestFrame, datasets: list[Dataset], metadata: dict[str, object]) -> Plan:
         plan_intent = _plan_intent(request_frame)
@@ -345,7 +329,7 @@ def _frame_entities(request_frame: RequestFrame) -> dict[str, object]:
 
     这里不重新判断交互模式、引用是否有效或任务生命周期；这些事实已经由
     Request Understanding 和 Validator 负责。Planner 只从已确认的目标文本和
-    引用中提取执行参数，以保持旧 Plan 编译能力而不回退到 IntentResult。
+    引用中提取执行参数，保持离线 Plan 编译能力。
     """
 
     raw = request_frame.goal.strip()

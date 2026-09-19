@@ -24,11 +24,11 @@ from app.decision.model_provider import ModelDecisionProvider
 from app.decision.offline_provider import OfflineDecisionProvider
 from app.models import ModelAdapter
 from app.runtime.action_dispatcher import RuntimeActionDispatcher
-from app.runtime.agent_loop import AgentLoop
 from app.runtime.agent_runtime import AgentRuntime, RuntimeOutcome, RuntimeTransition
 from app.runtime.agent_state import AgentStateBuilder
 from app.runtime.budget import BudgetGuard
 from app.runtime.checkpoint_codec import RuntimeCheckpointCodec
+from app.runtime.plan_execution import next_executable_step
 from app.runtime.session import AgentRuntimeSession, RuntimeResumeState
 from app.state import StateStore
 
@@ -48,7 +48,6 @@ class AgentRuntimeController:
         model_provider: ModelDecisionProvider,
         offline_provider: OfflineDecisionProvider,
         dispatcher: RuntimeActionDispatcher,
-        plan_loop: AgentLoop,
         model_adapter_for: Callable[[AgentRequest], ModelAdapter | None],
         trace_decision: Callable[..., Awaitable[None]],
         checkpoint: Callable[[str, str, dict[str, Any]], Awaitable[None]],
@@ -64,7 +63,6 @@ class AgentRuntimeController:
         self.model_provider = model_provider
         self.offline_provider = offline_provider
         self.dispatcher = dispatcher
-        self.plan_loop = plan_loop
         self.model_adapter_for = model_adapter_for
         self.trace_decision = trace_decision
         self.checkpoint = checkpoint
@@ -191,10 +189,7 @@ class AgentRuntimeController:
         async def fast_path(state):
             if not session.fast_path_enabled or session.current_plan is None:
                 return None
-            if session.decision_provider == "offline" and session.current_plan.metadata.get("delegated_roles") and not session.subagent_results:
-                session.fast_path_enabled = False
-                return None
-            step = self.plan_loop.next_executable_step(session.current_plan, session.completed_steps)
+            step = next_executable_step(session.current_plan, session.completed_steps)
             if step is None:
                 session.fast_path_enabled = False
                 return None

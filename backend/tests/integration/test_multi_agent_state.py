@@ -3,12 +3,14 @@ import json
 
 from app.agent.manager import AgentManager
 from app.core.models import (
+    AgentDecision,
     AgentRequest,
     AgentResult,
     AgentResultStatus,
     CRSInfo,
     Dataset,
     DatasetKind,
+    DecisionType,
     ErrorCategory,
     LoopDirective,
     Run,
@@ -23,6 +25,7 @@ from app.core.models import (
 )
 from app.demo import seed_demo
 from app.models import ModelAdapter, ModelRequest, ModelResponse
+from app.runtime.session import AgentRuntimeSession
 from app.runtime.tool_execution_cycle import ExecutionOutcome
 from app.state import WorkingMemoryUpdater
 
@@ -192,25 +195,24 @@ def test_optional_subagent_abort_remains_partial_observation(application):
 
     application.main_agent.agent_manager = FakeManager()
     try:
-        delegation = asyncio.run(
-            application.main_agent.runtime_action_handlers.execute_delegation(
-                request,
-                run,
-                task,
-                [],
-                [subtask],
-                    plan=None,
+        session = AgentRuntimeSession(run=run, datasets=[])
+        transition = asyncio.run(
+            application.main_agent.runtime_action_handlers.handle_delegate(
+                AgentDecision(type=DecisionType.DELEGATE, reasoning_summary="委派", subtasks=[subtask]),
+                None,
+                request=request,
+                run=run,
+                task=task,
                 request_frame=None,
-                working_memory=None,
-                fingerprint="optional-delegation",
+                session=session,
             )
         )
     finally:
         application.main_agent.agent_manager = original_manager
 
-    assert delegation.directive is LoopDirective.CONTINUE
-    assert delegation.latest_failure is None
-    assert delegation.observation["results"][0]["directive"] == LoopDirective.ABORT.value
+    assert transition.directive is LoopDirective.CONTINUE
+    assert transition.latest_failure is None
+    assert transition.observation["results"][0]["directive"] == LoopDirective.ABORT.value
 
 
 def test_subagent_receives_deep_working_memory_snapshot_without_writing_parent_memory(application):
@@ -574,16 +576,15 @@ def test_mainagent_delegation_aggregates_required_directives(application):
 
         application.main_agent.agent_manager = FakeManager()
         try:
-            return await application.main_agent.runtime_action_handlers.execute_delegation(
-                request,
-                parent_run,
-                task,
-                [],
-                [subtask],
-                    plan=None,
+            session = AgentRuntimeSession(run=parent_run, datasets=[])
+            return await application.main_agent.runtime_action_handlers.handle_delegate(
+                AgentDecision(type=DecisionType.DELEGATE, reasoning_summary="委派", subtasks=[subtask]),
+                None,
+                request=request,
+                run=parent_run,
+                task=task,
                 request_frame=None,
-                working_memory=None,
-                fingerprint=f"directive-{value.directive.value}",
+                session=session,
             )
         finally:
             application.main_agent.agent_manager = original_manager
